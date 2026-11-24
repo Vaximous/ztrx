@@ -2233,6 +2233,25 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Diagnostics: which read of title memory waited for flights, and the
+/// range flights declared written that it touched (the first 40, then one
+/// in 500): whether the declared ranges are much wider than what is read.
+#[cfg(feature = "diagnostics")]
+fn note_read_block(what: &str, written: &[(usize, usize)], src: usize, len: usize) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 && !n.is_multiple_of(500) {
+        return;
+    }
+    let at = written.partition_point(|r| r.1 <= src);
+    if let Some(&(a, b)) = written.get(at) {
+        tracing::info!(
+            "a submission waits for flights (read {n}): {what} reads {src:#x}+{len:#x}, inside {a:#x}..{b:#x} ({} MB) that flights may write",
+            (b - a) >> 20
+        );
+    }
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -2287,6 +2306,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_read_block("a buffer copy", written, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2295,6 +2316,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            note_read_block("a fill of upload memory", written, src, len);
                         }
                         return Some(WHY_READ);
                     }

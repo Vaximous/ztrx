@@ -2352,6 +2352,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// At most this many changed runs of title bytes go up to copies in the
+/// card's memory beside flights' writes in one submission
+/// (`VICTORY_MERGE_RUNS`, default 4096; it was 512, which left about one
+/// settle a frame for "title memory changed under shader writes" once
+/// constants were read from such copies). Each is a small copy of its own.
+fn merge_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -2379,7 +2389,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = merge_runs();
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -2777,10 +2787,13 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [unwatched, unasked, many, unsnapped] = crate::shadow::merge_failed_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; not put in (a settle) as the copy is not watched {unwatched:.1}, \
+             nothing knew the range's writes {unasked:.1}, more runs than {} {many:.1}, no snapshot {unsnapped:.1}",
+            bytes / (1 << 20) as f64,
+            merge_runs()
         );
     }
 }

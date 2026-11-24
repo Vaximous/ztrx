@@ -260,13 +260,6 @@ pub(crate) fn bound(
     })
 }
 
-/// Whether the clamp first waits for every earlier shader write: only if
-/// shaders recorded since the list's last such wait may have written
-/// buffers (`HostList::writes_unwaited`). Each indirect call had that wait
-/// (4,942 a frame in the world, run fxgt2, about 17 microseconds of the
-/// card's time each with the clamp): between draws that store to no
-/// buffer it waited for nothing they wrote, and kept the card from
-/// overlapping them. `VICTORY_CLAMP_ALWAYS_WAITS=1` waits every time.
 /// Whether the scratch buffer's barriers around the clamp are enhanced
 /// ones (`ID3D12GraphicsCommandList7::Barrier`), which say what waits for
 /// what: the clamp waits only for the last indirect call's reading of the
@@ -337,6 +330,13 @@ unsafe fn buffer_barrier(
     unsafe { l.Barrier(&[group]) };
 }
 
+/// Whether the clamp first waits for every earlier shader write: only if
+/// shaders recorded since the list's last such wait may have written
+/// buffers (`HostList::writes_unwaited`). Each indirect call had that wait
+/// (4,942 a frame in the world, run fxgt2, about 17 microseconds of the
+/// card's time each with the clamp): between draws that store to no
+/// buffer it waited for nothing they wrote, and kept the card from
+/// overlapping them. `VICTORY_CLAMP_ALWAYS_WAITS=1` waits every time.
 fn clamp_waits(list: &HostList) -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_CLAMP_ALWAYS_WAITS").is_some_and(|v| v == "1"))

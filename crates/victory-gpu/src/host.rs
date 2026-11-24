@@ -1707,7 +1707,7 @@ mod push_ring_tests {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (`VICTORY_CARD_REHASH_RUNS=1`; see below for the default), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -1717,9 +1717,17 @@ mod push_ring_tests {
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
 /// a fetch that finds nothing and loses no shader write.
+///
+/// With [`relay`] it is on unless `VICTORY_CARD_REHASH_RUNS=0`: it was
+/// part of the switches that took the world from 288 to about 215 ms a
+/// frame there (runs fxab5 and fxab2; most of that is the copies of 1 MiB
+/// and more, `crate::shadow`'s card limits).
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_REHASH_RUNS") {
+        Some(v) => v == "1",
+        None => relay(),
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the

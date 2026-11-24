@@ -145,13 +145,22 @@ pub(crate) fn cards() -> bool {
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+///
+/// With [`relay`] the defaults are 1 and 1024: copies of 1-16 MiB then
+/// leave the CPU's snapshots and compares (350 MB snapshotted a frame in
+/// the world, the process at 1,216 ms of user time a frame against 495),
+/// and 97 copies, 941 MB, go to the card. In the world that was about 215
+/// ms a frame against 288 with the relay alone (runs fxab2 and fxab5,
+/// 2026-11-24). Without the relay the same switches cost the card about 70
+/// ms a frame more (run fxab1).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let (least, most) = if relay() { (1, 1024) } else { (16, 512) };
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", least).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", most))
     })
 }
 

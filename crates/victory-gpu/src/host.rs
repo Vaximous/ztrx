@@ -1571,12 +1571,19 @@ pub(crate) const PUSH_STRIDE: usize = 65600;
 /// flagged pieces are fetched as before.
 const PUSH_PLAN_MOST: u32 = 512;
 
-/// The slots of [`CARD_PUSH`]'s ring (`VICTORY_CARD_PUSH_MB`, 256; 0
-/// fetches every flagged piece after the flight landed, as before).
+/// The slots of [`CARD_PUSH`]'s ring (`VICTORY_CARD_PUSH_MB`; 0, the
+/// default, fetches every flagged piece after the flight landed, as
+/// before).
+///
+/// Off by default: in the world (run fxpush1, 256 MB) the card took about
+/// 600 ms a frame against 110. Every flight pushed its own flagged pieces,
+/// 4,800 a frame (311 MB), where the fetch took each piece once per
+/// landing (1,100 a frame, 72 MB), and shaders storing to PC memory piece
+/// by piece were far slower than the copy engine's fetch.
 fn card_push_slots() -> u32 {
     static SLOTS: OnceLock<u32> = OnceLock::new();
     *SLOTS.get_or_init(|| {
-        let mb: u64 = std::env::var("VICTORY_CARD_PUSH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+        let mb: u64 = std::env::var("VICTORY_CARD_PUSH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         ((mb << 20) / PUSH_STRIDE as u64).min(u64::from(u32::MAX / PUSH_STRIDE as u32)) as u32
     })
 }

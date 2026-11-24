@@ -1232,11 +1232,45 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// What bound a range shaders may write ([`Shadow::gpu_writes`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Declarer {
+    /// A root unordered-access view: it has no size, so all that is left
+    /// of the buffer from its address.
+    Root = 0,
+    /// A view in a table, as large as the view.
+    View = 1,
+    /// A title address the shader stores through (`crate::memory`): the
+    /// whole copy.
+    Address = 2,
+}
+
+/// Since the last frame-rate line, per [`Declarer`]: ranges declared
+/// written, their bytes, and those over 16 MiB.
+static DECLARED_BY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    {
+        let d: Vec<f64> = DECLARED_BY.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let mb = |v: f64| v / (1 << 20) as f64;
+        tracing::info!(
+            "ranges declared written by shaders per frame: by root views {:.0} ({:.0} MB, {:.0} over 16 MiB), by table views \
+             {:.0} ({:.0} MB, {:.0} over 16 MiB), by title addresses {:.0} ({:.0} MB, {:.0} over 16 MiB)",
+            d[0],
+            mb(d[1]),
+            d[2],
+            d[3],
+            mb(d[4]),
+            d[5],
+            d[6],
+            mb(d[7]),
+            d[8],
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -1774,7 +1808,9 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    /// `from` says what bound the range, for the statistics
+    /// ([`DECLARED_BY`]).
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, from: Declarer) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -1784,6 +1820,12 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        let at = from as usize * 3;
+        DECLARED_BY[at].fetch_add(1, Ordering::Relaxed);
+        DECLARED_BY[at + 1].fetch_add(len, Ordering::Relaxed);
+        if len > 16 << 20 {
+            DECLARED_BY[at + 2].fetch_add(1, Ordering::Relaxed);
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 

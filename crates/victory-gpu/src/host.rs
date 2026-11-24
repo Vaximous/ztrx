@@ -1730,7 +1730,8 @@ pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
+/// The relay's first stage (`VICTORY_RELAY=1`; the default is the second
+/// stage, `VICTORY_RELAY=0` turns it off; it turns
 /// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
 /// and is off with it, in the timing run and with kept snapshots).
 ///
@@ -1775,7 +1776,7 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    *ON.get_or_init(|| relay() && crate::shadow::relay_stage() == 2)
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights

@@ -1434,9 +1434,13 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
-    /// The dwords of `differs` taken by plans whose results were not read
-    /// yet.
-    taken: u32,
+    /// The dwords of `differs` held by plans whose results were not read
+    /// yet. A ring: with flights always in the air the area never empties,
+    /// and a straight area that started again only when no plan was out
+    /// settled every flight about three times a frame in the world (run
+    /// fxpush0: most of the 102 ms a frame "settled for 128 lists in the
+    /// air").
+    results: RunRing,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
     /// With [`relay`]: the pieces a flight's compare flags go down in the
@@ -1453,7 +1457,7 @@ struct CardPush {
     ring: (ID3D12Resource, usize, u32),
     counters: ID3D12Resource,
     next_counter: u32,
-    slots: PushRing,
+    slots: RunRing,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -1602,16 +1606,17 @@ const PUSH_COUNTERS: u32 = 4096;
 /// already, and plans that got fewer slots than they compared pieces.
 static PUSH_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Which slots of [`CARD_PUSH`]'s ring plans hold: runs given out in
-/// order, from where the last ended and around, given back in any order
-/// and reused once every run before them is back.
-struct PushRing {
+/// Which slots of a ring plans hold ([`CARD_PUSH`]'s slots, the compare's
+/// result dwords): runs given out in order, from where the last ended and
+/// around, given back in any order and reused once every run before them
+/// is back.
+struct RunRing {
     slots: u32,
     /// (first slot, slots, given back), oldest first.
     held: std::collections::VecDeque<(u32, u32, bool)>,
 }
 
-impl PushRing {
+impl RunRing {
     fn new(slots: u32) -> Self {
         Self {
             slots,
@@ -1664,12 +1669,12 @@ impl PushRing {
 
 #[cfg(test)]
 mod push_ring_tests {
-    use super::PushRing;
+    use super::RunRing;
 
     /// Runs never overlap one still held, and come back to use.
     #[test]
     fn runs_never_overlap_and_are_reused() {
-        let mut ring = PushRing::new(100);
+        let mut ring = RunRing::new(100);
         let a = ring.take(40).unwrap();
         let b = ring.take(40).unwrap();
         assert_eq!((a, b), ((0, 40), (40, 40)));
@@ -1699,7 +1704,7 @@ mod push_ring_tests {
     /// another.
     #[test]
     fn held_runs_stay_apart() {
-        let mut ring = PushRing::new(37);
+        let mut ring = RunRing::new(37);
         let mut held: Vec<(u32, u32)> = Vec::new();
         let mut seed = 12345u32;
         for _ in 0..2000 {
@@ -1786,6 +1791,8 @@ struct CardPlan {
     lists: Vec<(bool, Prelude)>,
     /// [`CARD_PUSH`]'s slots for the flight (first, count).
     push: Option<(u32, u32)>,
+    /// The dwords of the compare's results the plan holds (first, count).
+    results: Option<(u32, u32)>,
     /// With [`relay`]: the flight's place in [`QUEUE_ORDER`] (its lists go
     /// to the queue under it): what the pushed pieces hold is what the
     /// card held after every send numbered below it and before every one
@@ -3207,9 +3214,9 @@ impl Host {
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
+        // Four megabytes of results: 1,048,576 pieces, 64 GB of declared
+        // ranges among the plans in the air.
+        const RESULTS: u64 = 4 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
@@ -3233,7 +3240,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
-                taken: 0,
+                results: RunRing::new((RESULTS / 4) as u32),
                 out: 0,
                 push: if relay() { self.make_card_push() } else { None },
             })
@@ -3293,7 +3300,7 @@ impl Host {
                     ring: (ring, data as usize, slots),
                     counters,
                     next_counter: 0,
-                    slots: PushRing::new(slots),
+                    slots: RunRing::new(slots),
                 })
             }
         })();
@@ -3446,11 +3453,13 @@ impl Host {
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             push: None,
+            results: None,
             sent_as: 0,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
-        // results go behind those of plans still in the air.
-        let mut at = work.taken;
+        // results go in a run of the ring of their own (as many pieces as
+        // fit there are compared; the rest are fetched whole).
+        let mut wanted: Vec<(std::sync::Arc<crate::shadow::Shadow>, (usize, usize), crate::shadow::CardSpan, bool)> = Vec::new();
         for (shadow, ranges) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
@@ -3463,23 +3472,28 @@ impl Host {
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at,
-                    compared,
-                });
-                if compared {
-                    at += span.pieces;
+                if let Some(span) = shadow.card_span(from, to) {
+                    wanted.push((shadow.clone(), (from, to), span, twin));
                 }
             }
         }
-        work.taken = at;
+        let pieces: u32 = wanted.iter().filter(|w| w.3).map(|w| w.2.pieces).sum();
+        plan.results = work.results.take(pieces);
+        let (mut at, end) = plan.results.map_or((0, 0), |(first, n)| (first, first + n));
+        for (shadow, declared, span, twin) in wanted {
+            let compared = twin && at + span.pieces <= end;
+            let pieces = span.pieces;
+            plan.ranges.push(CardRange {
+                shadow,
+                declared,
+                span,
+                at,
+                compared,
+            });
+            if compared {
+                at += pieces;
+            }
+        }
         // The flight's flagged pieces come down in it (`CARD_PUSH`), as far
         // as its slots go.
         let mut counter = 0u32;
@@ -3582,19 +3596,13 @@ impl Host {
         {
             push.slots.give_back(first);
         }
+        if !plan.ranges.iter().any(|r| r.compared)
+            && let Some((first, _)) = plan.results.take()
+        {
+            work.results.give_back(first);
+        }
         work.out += 1;
         Some(plan)
-    }
-
-    /// With [`relay`]: whether the compare's result area is half taken by
-    /// plans in the air. It starts from the beginning only when no plan is
-    /// out, so the caller lets the flights land first.
-    fn card_results_low(&self) -> bool {
-        CARD_WORK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
     }
 
     /// The plan's submission has run and its results were read
@@ -3612,12 +3620,10 @@ impl Host {
         if let (Some((first, _)), Some(push)) = (plan.push, work.push.as_mut()) {
             push.slots.give_back(first);
         }
-        work.out = work.out.saturating_sub(1);
-        // With the relay other plans may be on the card, their results
-        // not read yet: the area starts again only when none is out.
-        if !relay() || work.out == 0 {
-            work.taken = 0;
+        if let Some((first, _)) = plan.results {
+            work.results.give_back(first);
         }
+        work.out = work.out.saturating_sub(1);
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
@@ -4472,11 +4478,6 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
-        if flown && self.card_results_low() {
-            let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_MOST);
-            settled += settling.elapsed();
-        }
         let mut card = self.card_before(runs, flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));

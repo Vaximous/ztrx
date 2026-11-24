@@ -23,7 +23,7 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
@@ -253,7 +253,8 @@ pub(crate) fn bound(
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
-    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait).then(|| {
+    let fresh = enhanced(list, &dst);
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh).then(|| {
         list.waited();
         dst
     })
@@ -266,6 +267,76 @@ pub(crate) fn bound(
 /// card's time each with the clamp): between draws that store to no
 /// buffer it waited for nothing they wrote, and kept the card from
 /// overlapping them. `VICTORY_CLAMP_ALWAYS_WAITS=1` waits every time.
+/// Whether the scratch buffer's barriers around the clamp are enhanced
+/// ones (`ID3D12GraphicsCommandList7::Barrier`), which say what waits for
+/// what: the clamp waits only for the last indirect call's reading of the
+/// arguments, and the indirect call only for the clamp, where a change of
+/// the buffer's state waited for all the card's earlier work, the draws
+/// before included. Where the card and its driver have them (and not with
+/// `VICTORY_CLAMP_ENHANCED=0`).
+pub(crate) fn enhanced_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("VICTORY_CLAMP_ENHANCED").is_some_and(|v| v == "0") {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a plain query into a struct of the asked size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+            )
+        };
+        let on = asked.is_ok() && options.EnhancedBarriersSupported.as_bool();
+        tracing::info!("indirect arguments' clamp: enhanced barriers {}", if on { "on" } else { "not supported" });
+        on
+    })
+}
+
+/// With [`enhanced_barriers`]: `None` without them; else whether this is
+/// the scratch buffer's first use in the list since its reset (its state
+/// before is then the common one).
+fn enhanced(list: &HostList, dst: &ID3D12Resource) -> Option<bool> {
+    const CLAMP_USE: usize = 0x5ca7_c4a3;
+    enhanced_barriers().then(|| list.first_use(dst.as_raw() as usize ^ CLAMP_USE))
+}
+
+/// An enhanced barrier on all of buffer `resource`.
+///
+/// # Safety
+/// An open list and a live buffer.
+unsafe fn buffer_barrier(
+    l: &ID3D12GraphicsCommandList7,
+    resource: &ID3D12Resource,
+    before: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+    after: (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+) {
+    let barrier = D3D12_BUFFER_BARRIER {
+        SyncBefore: before.0,
+        SyncAfter: after.0,
+        AccessBefore: before.1,
+        AccessAfter: after.1,
+        // SAFETY: borrowed for the call; never released through this copy.
+        pResource: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(resource) })),
+        Offset: 0,
+        Size: u64::MAX,
+    };
+    let group = D3D12_BARRIER_GROUP {
+        Type: D3D12_BARRIER_TYPE_BUFFER,
+        NumBarriers: 1,
+        Anonymous: D3D12_BARRIER_GROUP_0 {
+            pBufferBarriers: &raw const barrier,
+        },
+    };
+    // SAFETY: the caller's.
+    unsafe { l.Barrier(&[group]) };
+}
+
 fn clamp_waits(list: &HostList) -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALWAYS.get_or_init(|| std::env::var_os("VICTORY_CLAMP_ALWAYS_WAITS").is_some_and(|v| v == "1"))
@@ -290,7 +361,8 @@ pub(crate) fn bound_ahead(
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait).then(|| {
+    let fresh = enhanced(list, &dst);
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh).then(|| {
         list.waited();
         dst
     })
@@ -306,12 +378,13 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false, true)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, true, None)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
 /// their draws ([`bound_ahead`]); `wait`: first a wait for every earlier
-/// shader write ([`clamp_waits`]).
+/// shader write ([`clamp_waits`]); `fresh`: with [`enhanced_barriers`],
+/// whether `dst` is used for the first time in the list.
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -323,6 +396,7 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
     wait: bool,
+    fresh: Option<bool>,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -397,6 +471,35 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    if let Some(fresh) = fresh
+        && let Ok(l7) = l.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let before = if fresh {
+            (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON)
+        } else {
+            (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT)
+        };
+        let written = (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        // SAFETY: as above.
+        unsafe {
+            if waits && wait {
+                l.ResourceBarrier(&first[..1]);
+            }
+            buffer_barrier(&l7, dst, before, written);
+            if records > 0 {
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootShaderResourceView(2, count_gpu);
+                l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+                l.SetComputeRootUnorderedAccessView(4, budget);
+                l.Dispatch(records.div_ceil(64), 1, 1);
+            }
+            buffer_barrier(&l7, dst, written, (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT));
+        }
+        return true;
+    }
     // SAFETY: as above.
     unsafe {
         // Earlier shader writes (the title's argument and count passes)
@@ -420,6 +523,11 @@ fn record_clamp_as(
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    // With enhanced barriers the buffer stays as the indirect call reads
+    // it; the next clamp's barrier starts from there.
+    if enhanced_barriers() {
+        return;
+    }
     done_on(&list.list, scratch);
 }
 
@@ -1097,6 +1205,72 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
+    /// The clamp with enhanced barriers on the scratch buffer (where the
+    /// software adapter has them), twice in one list, the second from the
+    /// state the first left: the records come out as with the old barriers.
+    #[test]
+    fn warp_clamp_with_enhanced_barriers() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a plain query into a struct of the asked size.
+        let asked = unsafe {
+            warp.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+            )
+        };
+        if asked.is_err() || !options.EnhancedBarriersSupported.as_bool() {
+            return;
+        }
+        const KIND_MESH: u32 = 10;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 4;
+        let total = (STRIDE * RECORDS) as usize;
+        let records: [[u32; 4]; 4] = [[7, 1, 1, 0xA0], [70_000, 1, 1, 0xA1], [0, 1, 1, 0xA2], [3, 9, 9, 0xA3]];
+        let src: Vec<u8> = records.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        let l7: ID3D12GraphicsCommandList7 = warp.list.cast().expect("a list with enhanced barriers");
+        for fresh in [true, false] {
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_MESH, STRIDE, RECORDS),
+                false,
+                fresh,
+                Some(fresh),
+            ));
+        }
+        // SAFETY: an open list; live buffers.
+        unsafe {
+            buffer_barrier(
+                &l7,
+                &dst_buf,
+                (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT),
+                (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE),
+            );
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let out = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec() };
+        assert_eq!(out, [7, 1, 1, 0xA0, 65_535, 1, 1, 0xA1, 0, 1, 1, 0xA2, 3, 1, 1, 0xA3]);
+    }
+
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
     /// wraparound across >64 huge indexed-draw records (`count = None`), while
     /// preserving `StartIndexLocation`, `BaseVertexLocation`,
@@ -1145,6 +1319,7 @@ void main() {
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
                 true,
+                None,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

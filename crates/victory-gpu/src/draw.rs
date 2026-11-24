@@ -146,6 +146,22 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_CLAMP=0`, for measurement only: indirect calls read the
+/// title's arguments as they are, with no clamp pass (`crate::indirect`)
+/// before them, only a wait for earlier shader writes where there may be
+/// some. What the clamp costs the card is what this saves; arguments the
+/// clamp would have cut can hang the card.
+fn unclamped() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let off = std::env::var_os("VICTORY_CLAMP").is_some_and(|v| v == "0");
+        if off {
+            tracing::warn!("indirect arguments are not clamped (VICTORY_CLAMP=0): for measurement only");
+        }
+        off
+    })
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -2416,8 +2432,33 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let unclamped = unclamped();
+        if unclamped {
+            self.window = None;
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
+            None if unclamped => {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                if list.writes_unwaited() {
+                    let barrier = D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    };
+                    // SAFETY: an open list.
+                    unsafe { list.list.ResourceBarrier(&[barrier]) };
+                    list.waited();
+                }
+                (args.buffer.clone(), offset)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -2481,7 +2522,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !unclamped {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2510,7 +2553,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !unclamped {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

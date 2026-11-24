@@ -397,6 +397,34 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// A table's constant buffer in a copy in the card's memory
+/// (`crate::shadow::cards`), 256-byte aligned there with room for its view:
+/// the view shows the copy itself, brought up to date as a root view's,
+/// and no fill of upload memory reads title memory for it at submission.
+///
+/// Such fills waited for every flight in the air whose shaders may write
+/// the copy: a title heap of 174 MB is declared written whole, and the
+/// world's constant reads in it made a submission wait for the card about
+/// 17 ms a frame (143 ms with more lists in the air, run fxab6). On the
+/// card the copy holds, in queue order, the title's bytes sent up before
+/// the submission and what earlier flights' shaders wrote, which is what
+/// the console's draw would read. `VICTORY_CARD_CONSTANTS=0` fills them as
+/// before.
+fn constant_in_card_copy(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_CARD_CONSTANTS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let size = u64::from(size);
+    let shadow = crate::shadow::find(address, size.max(1))?;
+    let gpu = shadow.gpu(address);
+    if !shadow.carded() || gpu % 256 != 0 || shadow.left(address) < size.next_multiple_of(256) {
+        return None;
+    }
+    shadow.refresh(list, address, size);
+    Some(gpu)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2006,6 +2034,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = constant_in_card_copy(list, address, size) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

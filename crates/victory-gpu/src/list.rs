@@ -754,6 +754,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            list.waited();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -1954,6 +1955,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        list.waited();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

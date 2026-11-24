@@ -740,6 +740,12 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Whether shaders recorded in the list may have written buffers since
+    /// its last wait for every earlier shader write (a barrier on all
+    /// unordered access): `crate::indirect` waits for those writes before
+    /// it clamps arguments only when there may be some. True at the start
+    /// (an earlier list of the same submission may have written).
+    unwaited_writes: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3096,6 +3102,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                unwaited_writes: std::sync::atomic::AtomicBool::new(true),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4920,6 +4927,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        self.unwaited_writes.store(true, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5469,6 +5477,24 @@ impl HostList {
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         scratch.chunks.iter().map(|c| c.1).sum()
+    }
+
+    /// Shaders that may write buffers were recorded ([`HostList`]'s
+    /// `unwaited_writes`).
+    pub(crate) fn wrote(&self) {
+        self.unwaited_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// A wait for every earlier shader write was recorded.
+    pub(crate) fn waited(&self) {
+        self.unwaited_writes.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether shaders may have written buffers since the last [`waited`].
+    ///
+    /// [`waited`]: HostList::waited
+    pub(crate) fn writes_unwaited(&self) -> bool {
+        self.unwaited_writes.load(Ordering::Relaxed)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each

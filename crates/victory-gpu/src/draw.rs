@@ -198,6 +198,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Whether a shader of the pipeline last bound can store to buffers
+    /// (`HostList::wrote` after its draws).
+    stores: bool,
 }
 
 impl Drop for State {
@@ -924,6 +927,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        self.stores = p.stages.iter().any(|stage| stage.translated().stores);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1741,6 +1745,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.wrote();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1840,6 +1845,9 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if self.stores {
+                        list.wrote();
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2176,6 +2184,9 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if self.stores {
+                list.wrote();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2277,6 +2288,9 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if self.stores {
+                list.wrote();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2490,6 +2504,9 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if kind == DISPATCH || self.stores {
+            list.wrote();
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }

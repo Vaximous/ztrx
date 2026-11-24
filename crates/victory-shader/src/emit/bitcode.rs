@@ -415,6 +415,29 @@ impl Module {
         pre
     }
 
+    /// Whether `block` has its terminator.
+    pub fn ended(&self, block: usize) -> bool {
+        self.blocks[block].term.is_some()
+    }
+
+    /// Gives `block`'s terminator to a new block, which every phi now names where it named
+    /// `block` as a predecessor; `block` is left without a terminator, its body kept, for code
+    /// to go at its end before the new block. Returns the new block.
+    pub fn split_after(&mut self, block: usize) -> usize {
+        let post = self.new_block();
+        self.blocks[post].term = self.blocks[block].term.take();
+        for i in &mut self.insts {
+            if let Op::Phi(incoming) = &mut i.op {
+                for (_, from) in incoming.iter_mut() {
+                    if *from == block {
+                        *from = post;
+                    }
+                }
+            }
+        }
+        post
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -1217,6 +1240,33 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// A block split before keeps its place after the code it held, which moves to a block
+    /// that takes the edges into it; one split after keeps its code, and the new block after
+    /// it takes its terminator and its place in the phis of its successors.
+    #[test]
+    fn blocks_split_before_and_after() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (a, b, c) = (m.new_block(), m.new_block(), m.new_block());
+        let one = m.i32(1);
+        m.terminate(a, Term::Br(b));
+        let x = m.bin(b, Bin::Add, one, one);
+        let phi = m.phi(b, i32t);
+        let pre = m.split_before(b);
+        assert_eq!(&*successors(m.blocks[a].term), &[pre]);
+        assert_eq!((m.blocks[pre].body.len(), m.blocks[pre].phis.len()), (1, 1));
+        assert!(m.blocks[b].body.is_empty() && m.blocks[b].phis.is_empty() && !m.ended(b));
+        m.terminate(b, Term::Br(c));
+        let y = m.phi(c, i32t);
+        m.set_phi(y, vec![(x, b)]);
+        let _ = phi;
+        let post = m.split_after(b);
+        assert!(!m.ended(b) && m.ended(post));
+        assert_eq!(&*successors(m.blocks[post].term), &[c]);
+        let V::Inst(i) = y else { unreachable!() };
+        assert!(matches!(&m.insts[i as usize].op, Op::Phi(inc) if inc == &vec![(x, post)]));
     }
 
     #[test]

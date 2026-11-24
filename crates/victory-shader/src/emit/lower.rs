@@ -3609,7 +3609,9 @@ impl<'a> Lower<'a> {
             self.group_sync(at);
             return at;
         };
-        if at != self.cur || at == self.s.entry {
+        // (a block not ended that is not the one being lowered would be ended later, over
+        // the wait; the entry block stays first and whole while it is being lowered)
+        if at == self.cur && at == self.s.entry || at != self.cur && !self.s.m.ended(at) {
             self.meet_bad = true;
             self.group_sync(at);
             return at;
@@ -3620,16 +3622,36 @@ impl<'a> Lower<'a> {
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
         let base = self.s.m.i32(pc);
         let slot = self.s.m.bin(e, Bin::Add, base, wave);
-        // What the block holds so far moves to a block of its own, which takes the edges
-        // into it and ends in the wait; the block itself follows the wait. Values already
-        // made and blocks already named stay as they are.
-        let c = self.cur;
-        let pre = self.s.m.split_before(c);
-        for b in self.block.iter_mut() {
-            if *b == Some(c) {
-                *b = Some(pre);
+        // In the block being lowered: what it holds so far moves to a block of its own,
+        // which takes the edges into it and ends in the wait; the block itself follows the
+        // wait. Values already made and blocks already named stay as they are.
+        // In a block lowered earlier (where a lane mask was made): the wait goes at its end,
+        // and a new block after the wait takes its terminator and its place as a predecessor.
+        let (pre, c) = if at == self.cur {
+            let c = self.cur;
+            let pre = self.s.m.split_before(c);
+            for b in self.block.iter_mut() {
+                if *b == Some(c) {
+                    *b = Some(pre);
+                }
             }
-        }
+            (pre, c)
+        } else {
+            let post = self.s.m.split_after(at);
+            for t in self.tail.iter_mut() {
+                if *t == Some(at) {
+                    *t = Some(post);
+                }
+            }
+            for (_, incoming) in self.counters.values_mut() {
+                for (_, from) in incoming.iter_mut() {
+                    if *from == at {
+                        *from = post;
+                    }
+                }
+            }
+            (at, post)
+        };
         let void = self.s.t.void;
         let fence = self.s.m.i32(meeting_mode() & !1);
         self.s.op(pre, "barrier", Attr::NoDuplicate, void, 80, &[fence]);

@@ -6061,6 +6061,7 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
                 && hwnd.0 as usize != OWN_WINDOW.load(Ordering::Relaxed)
+                && hwnd != windows::Win32::System::Console::GetConsoleWindow()
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();

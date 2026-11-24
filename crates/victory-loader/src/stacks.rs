@@ -115,7 +115,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -159,7 +159,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     (frames, (info.priority, info.base_priority))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -174,7 +174,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

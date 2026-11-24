@@ -96,6 +96,14 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// With [`windows_by_writes`]: the title memory its records came from;
+    /// the list's count of storing calls when it was clamped
+    /// (`HostList::write_count`); whether a range the list declared
+    /// written overlaps it, as far as the list's steps were looked at.
+    title: (usize, usize),
+    writes: u64,
+    overlap: bool,
+    looked: usize,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -153,11 +161,27 @@ fn windows() -> bool {
 /// of their own clamped; alone, for being a dispatch, asking for more than
 /// one record, having a count buffer, drawn by shaders that store to
 /// buffers, or (none of those) not a step on from the last window.
-static WINDOWED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Last: windows clamped again for a storing call whose declared writes
+/// overlap them ([`windows_by_writes`]).
+static WINDOWED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// [`WINDOWED`], taken.
-pub(crate) fn take_windowed() -> [u64; 7] {
+pub(crate) fn take_windowed() -> [u64; 8] {
     std::array::from_fn(|i| WINDOWED[i].swap(0, Ordering::Relaxed))
+}
+
+/// `VICTORY_WINDOW_BY_WRITES=1` (off by default): a window of clamped
+/// records ([`windows`]) lasts past calls whose shaders may store, and is
+/// clamped again only when such a call came after it and a range the
+/// list's shaders were declared to write (root views, table views, title
+/// addresses) overlaps its records. Indirect dispatches and draws by
+/// storing shaders take windows too: without it every one is clamped
+/// alone (965 dispatches a frame in the world, run fxprof2). A window's
+/// dispatch records are left empty, and not charged, where a group count
+/// is over what a dispatch runs, as for mesh records.
+fn windows_by_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| windows() && std::env::var_os("VICTORY_WINDOW_BY_WRITES").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_CLAMP=0`, for measurement only: indirect calls read the
@@ -1727,8 +1751,11 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped.
-        self.window = None;
+        // It may write the arguments a window holds clamped (looked at
+        // when the window is next used, with `windows_by_writes`).
+        if !windows_by_writes() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1862,7 +1889,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        if !windows_by_writes() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2192,7 +2221,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if !windows_by_writes() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2300,7 +2331,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        if !windows_by_writes() {
+            self.window = None;
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2429,15 +2462,28 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        let by_writes = windows_by_writes();
         let windowed = windows()
-            && kind != DISPATCH
             && max == 1
             && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+            && (by_writes || (kind != DISPATCH && !p.stages.iter().any(|stage| stage.translated().stores)));
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
+        }
+        // A call that may store came after the window: clamped again if
+        // what the list's shaders write can reach its records.
+        if by_writes && let Some(w) = self.window.as_mut() {
+            if !w.overlap {
+                let (hit, looked) = list.declared_writes_overlap(w.looked, w.title.0, w.title.1);
+                w.overlap = hit;
+                w.looked = looked;
+            }
+            if w.overlap && list.write_count() > w.writes {
+                self.window = None;
+                WINDOWED[7].fetch_add(1, Ordering::Relaxed);
+            }
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
@@ -2544,6 +2590,10 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    title: (arguments as usize, arguments as usize + step as usize * records as usize),
+                    writes: list.write_count(),
+                    overlap: false,
+                    looked: 0,
                 });
                 (bounded, 0)
             }

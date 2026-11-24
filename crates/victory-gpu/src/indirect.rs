@@ -74,7 +74,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 asked = src_args.Load3(src_at);
+        // Ahead of its dispatch, a record over the most a dispatch runs
+        // is a slot not filled: empty, and not charged.
+        if (ahead && any(asked > uint3(65535u, 65535u, 65535u))) {
+            asked = uint3(0, 0, 0);
+        }
+        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -1363,6 +1369,72 @@ void main() {
                 assert_eq!(largest, u32::MAX);
             }
         }
+    }
+
+    /// A window of dispatch records clamped ahead: filled records come out
+    /// as they are and are charged; slots of all ones come out empty and
+    /// charge nothing.
+    #[test]
+    fn warp_dispatch_window_leaves_unfilled_slots_empty_and_uncharged() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 6;
+        let filled = [[3u32, 2, 1], [1, 1, 1]];
+        let total = (STRIDE * RECORDS) as usize;
+        let mut src = vec![0xffu8; total];
+        for (i, groups) in filled.into_iter().enumerate() {
+            for (w, word) in groups.into_iter().chain([0xCD00 + i as u32]).enumerate() {
+                let at = i * STRIDE as usize + w * 4;
+                src[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(readback_ptr, 0, total);
+        }
+        assert!(record_clamp_as(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DISPATCH, STRIDE, RECORDS),
+            true,
+            true,
+            None,
+        ));
+        done_on(&warp.list, &dst_buf);
+        // SAFETY: an open list; the scratch buffer is copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4).to_vec(),
+            )
+        };
+        for (i, groups) in filled.into_iter().enumerate() {
+            assert_eq!(out[i * 4..i * 4 + 4], [groups[0], groups[1], groups[2], 0xCD00 + i as u32], "filled record {i}");
+        }
+        for i in filled.len()..RECORDS as usize {
+            assert_eq!(out[i * 4..i * 4 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
+        }
+        assert_eq!(spent, (6 + 1) * 64, "unfilled slots charge nothing");
     }
 
     #[test]

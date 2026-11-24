@@ -6257,6 +6257,13 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        {
+            let w = crate::draw::take_windowed().map(|n| n as f64 / frames);
+            tracing::info!(
+                "indirect calls per frame by their clamp: {:.0} read a window clamped before, {:.0} clamped a window,                  alone: {:.0} dispatches, {:.0} of more records, {:.0} with a count buffer, {:.0} drawn by storing shaders,                  {:.0} not a step on",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

@@ -148,6 +148,18 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+/// Since the last frame-rate line, indirect calls by how their records
+/// were clamped ([`windows`]): read from a window clamped before; a window
+/// of their own clamped; alone, for being a dispatch, asking for more than
+/// one record, having a count buffer, drawn by shaders that store to
+/// buffers, or (none of those) not a step on from the last window.
+static WINDOWED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// [`WINDOWED`], taken.
+pub(crate) fn take_windowed() -> [u64; 7] {
+    std::array::from_fn(|i| WINDOWED[i].swap(0, Ordering::Relaxed))
+}
+
 /// `VICTORY_CLAMP=0`, for measurement only: indirect calls read the
 /// title's arguments as they are, with no clamp pass (`crate::indirect`)
 /// before them, only a wait for earlier shader writes where there may be
@@ -2438,6 +2450,21 @@ impl State {
         if unclamped {
             self.window = None;
         }
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let how = if hit.is_some() {
+            0
+        } else if kind == DISPATCH {
+            2
+        } else if max != 1 {
+            3
+        } else if count.is_some() {
+            4
+        } else if stores {
+            5
+        } else {
+            6
+        };
+        WINDOWED[how].fetch_add(1, Ordering::Relaxed);
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None if unclamped => {
@@ -2493,6 +2520,10 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                if windowed && records > 1 {
+                    WINDOWED[6].fetch_sub(1, Ordering::Relaxed);
+                    WINDOWED[1].fetch_add(1, Ordering::Relaxed);
+                }
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {

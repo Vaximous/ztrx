@@ -6260,7 +6260,9 @@ impl Meter {
         {
             let w = crate::draw::take_windowed().map(|n| n as f64 / frames);
             tracing::info!(
-                "indirect calls per frame by their clamp: {:.0} read a window clamped before, {:.0} clamped a window,                  alone: {:.0} dispatches, {:.0} of more records, {:.0} with a count buffer, {:.0} drawn by storing shaders,                  {:.0} not a step on",
+                "indirect calls per frame by their clamp: {:.0} read a window clamped before, {:.0} clamped a window, \
+                 alone: {:.0} dispatches, {:.0} of more records, {:.0} with a count buffer, {:.0} drawn by storing shaders, \
+                 {:.0} not a step on",
                 w[0], w[1], w[2], w[3], w[4], w[5], w[6]
             );
         }

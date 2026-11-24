@@ -5887,6 +5887,29 @@ impl Host {
                 }
             };
         }
+        // Presenting into our own window because the title's was not shown
+        // yet: move to the title's once it is (checked now and then).
+        if presenter.as_ref().is_some_and(|p| p.hwnd.0 as usize == OWN_WINDOW.load(Ordering::Relaxed))
+            && frame.is_multiple_of(30)
+            && let Some(hwnd) = title_window()
+        {
+            // Presents sent ahead hold back buffers until they have run.
+            settle_now(WHY_SYNC);
+            let old = presenter.take();
+            match self.presenter(width, height, format) {
+                Ok(p) => {
+                    tracing::info!("presenting to the title's window now");
+                    *presenter = Some(p);
+                    drop(old);
+                    // SAFETY: our own window; hiding it never waits on the title.
+                    let _ = unsafe { ShowWindow(HWND(OWN_WINDOW.load(Ordering::Relaxed) as *mut _), SW_HIDE) };
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, ?hwnd, "no swap chain for the title's window");
+                    *presenter = old;
+                }
+            }
+        }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
@@ -6037,6 +6060,7 @@ fn title_window() -> Option<HWND> {
             GetWindowThreadProcessId(hwnd, Some(&mut process));
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
+                && hwnd.0 as usize != OWN_WINDOW.load(Ordering::Relaxed)
             {
                 *(found.0 as *mut Option<HWND>) = Some(hwnd);
                 return false.into();
@@ -6300,8 +6324,13 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let hwnd = receiver
         .recv()
         .map_err(|_| windows::core::Error::empty())??;
+    OWN_WINDOW.store(hwnd, Ordering::Relaxed);
     Ok(HWND(hwnd as *mut _))
 }
+
+/// The window [`window`] made, when the title had shown none yet: frames
+/// move to the title's window once it is shown.
+static OWN_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "system" fn window_proc(
     hwnd: HWND,

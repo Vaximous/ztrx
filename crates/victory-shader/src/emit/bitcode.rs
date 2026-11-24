@@ -387,6 +387,34 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Moves what `block` holds so far (its phis and body) to a new block, which takes every
+    /// edge into `block`; `block`, still without a terminator, is left empty to follow it.
+    /// Returns the new block, which the caller ends.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert!(self.blocks[block].term.is_none(), "a split of an ended block");
+        let pre = self.new_block();
+        let phis = std::mem::take(&mut self.blocks[block].phis);
+        let body = std::mem::take(&mut self.blocks[block].body);
+        self.blocks[pre].phis = phis;
+        self.blocks[pre].body = body;
+        for b in &mut self.blocks {
+            match &mut b.term {
+                Some(Term::Br(t)) if *t == block => *t = pre,
+                Some(Term::CondBr(_, t, f)) => {
+                    if *t == block {
+                        *t = pre;
+                    }
+                    if *f == block {
+                        *f = pre;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // (no phi names `block` as a predecessor: it has no terminator yet)
+        pre
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

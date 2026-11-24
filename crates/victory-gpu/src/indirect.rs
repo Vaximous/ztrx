@@ -720,6 +720,110 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The push of flagged pieces (`crate::host::CARD_PUSH`) after the
+    /// compare, on the software adapter: its first pass zeroes the plan's
+    /// counter; then each flagged piece takes a slot of the plan's while
+    /// they last, its bytes go there and its dword in `differs` becomes the
+    /// slot plus 2; pieces past the last slot keep their 1, others their 0.
+    #[test]
+    fn warp_card_push_puts_flagged_pieces_in_slots() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let push = compile_cs(&warp.device, crate::host::CARD_PUSH).expect("the card push must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        const STRIDE: usize = crate::host::PUSH_STRIDE;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer((STRIDE * 8) as u64);
+        let (_counters, counters_ptr, counters_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let uav_barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // Hashes stored, then (counter 1, a stale count in it) zeroed,
+        // compared with mode 2, pushed to slots `base..base + cap`.
+        let run = |warp: &mut WarpHarness, mode: u32, base: u32, cap: u32| -> [u32; 3] {
+            // SAFETY: our open list, live buffers, each pass's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                counters_ptr.cast::<u32>().add(1).write_volatile(99);
+                warp.list.SetComputeRootSignature(&push.root);
+                warp.list.SetPipelineState(&push.pso);
+                let zero = [0u32, 0, 0, 0, 0, 0, 0, 4];
+                warp.list.SetComputeRoot32BitConstants(0, 8, zero.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, ring_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, counters_gpu);
+                warp.list.Dispatch(1, 1, 1);
+                warp.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                if mode != 0 {
+                    warp.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+                    warp.list.SetComputeRootSignature(&push.root);
+                    warp.list.SetPipelineState(&push.pso);
+                    let constants = [0u32, 0, size as u32, PIECES, 0, base, cap, 4];
+                    warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, ring_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(4, counters_gpu);
+                    warp.list.Dispatch(PIECES, 1, 1);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mappings.
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let slot = |n: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(n as usize * STRIDE), PIECE) };
+        let piece = |p: usize| unsafe { std::slice::from_raw_parts(now_ptr.add(p * PIECE), PIECE) };
+        run(&mut warp, 0, 0, 0);
+        // Nothing changed: nothing pushed, the counter zeroed.
+        assert_eq!(run(&mut warp, 2, 3, 2), [0, 0, 0]);
+        // SAFETY: inside the mapping.
+        assert_eq!(unsafe { counters_ptr.cast::<u32>().add(1).read_volatile() }, 0);
+        // Pieces 1 and 2 changed, one slot: one of them takes it.
+        set(PIECE + 77, content[PIECE + 77] ^ 1);
+        set(2 * PIECE + 5, content[2 * PIECE + 5] ^ 1);
+        let d = run(&mut warp, 2, 3, 1);
+        assert_eq!(d[0], 0);
+        let (took, left) = if d[1] == 5 { (1, 2) } else { (2, 1) };
+        assert_eq!((d[took], d[left]), (5, 1), "{d:?}");
+        assert_eq!(slot(3), piece(took));
+        // Both changed again, two slots from 6: both pushed.
+        set(PIECE + 78, content[PIECE + 78] ^ 1);
+        set(2 * PIECE + 6, content[2 * PIECE + 6] ^ 1);
+        let d = run(&mut warp, 2, 6, 2);
+        assert_eq!(d[0], 0);
+        let mut got = [d[1], d[2]];
+        got.sort_unstable();
+        assert_eq!(got, [8, 9], "{d:?}");
+        assert_eq!(slot(d[1] - 2), piece(1));
+        assert_eq!(slot(d[2] - 2), piece(2));
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

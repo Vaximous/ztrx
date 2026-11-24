@@ -451,10 +451,19 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// One harness at a time: WARP tests on parallel test threads
+        /// crashed the test process now and then (an access violation in
+        /// about one full run in five once a fifth WARP test was added).
+        /// Last, so the device and its objects go first.
+        _alone: std::sync::MutexGuard<'static, ()>,
     }
+
+    /// Held by the [`WarpHarness`] alive.
+    static WARP_ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let alone = WARP_ALONE.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -493,6 +502,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _alone: alone,
                 })
             }
         }

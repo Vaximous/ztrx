@@ -2317,6 +2317,43 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Reads that waited for flights ([`relay_exact`]), by where the newest
+/// flight that declared what is read stands in the line: waits, the newest
+/// flight in the air was it, an older one was (or one being landed), the
+/// flights in the air after it (not waited for), the flights in the air,
+/// microseconds waited when it was the newest, when an older one.
+static READ_PLACE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// For [`READ_PLACE`], before a read waits for flights: whether the newest
+/// flight whose declared ranges `runs` read is the newest in the air (None
+/// when none is found, as when they landed meanwhile).
+fn read_place(runs: &[&HostList]) -> Option<bool> {
+    let flights: Vec<Vec<(usize, usize)>> = {
+        let line = line();
+        let mut flights = Vec::new();
+        if !line.in_hand.is_empty() || line.settling {
+            // The flights being landed: older than everything in the line,
+            // their ranges still in `written`.
+            flights.push(line.written.clone());
+        }
+        for item in &line.line {
+            if let Late::Run(flight) = item {
+                let mut ranges = Vec::new();
+                join_ranges(&mut ranges, flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                flights.push(ranges);
+            }
+        }
+        flights
+    };
+    let last = flights.iter().rposition(|ranges| blocked_by(ranges, runs, false).is_some())?;
+    let newest = last + 1 == flights.len();
+    READ_PLACE[0].fetch_add(1, Ordering::Relaxed);
+    READ_PLACE[if newest { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+    READ_PLACE[3].fetch_add((flights.len() - last - 1) as u64, Ordering::Relaxed);
+    READ_PLACE[4].fetch_add(flights.len() as u64, Ordering::Relaxed);
+    Some(newest)
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2807,6 +2844,19 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    if relay_exact() {
+        let p: Vec<f64> = READ_PLACE.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "reads that waited for flights per frame: {:.1}, the newest flight that declared what is read the newest              in the air {:.1} ({:.1} ms waited), an older one {:.1} ({:.1} ms waited); flights in the air {:.1}, after              the one read and not waited for {:.1}",
+            p[0],
+            p[1],
+            p[5] / 1000.0,
+            p[2],
+            p[6] / 1000.0,
+            p[4],
+            p[3],
         );
     }
     if late_exact() {
@@ -4405,7 +4455,13 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
+                let place = read_place(runs);
+                let waiting = std::time::Instant::now();
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                if let Some(newest) = place {
+                    READ_PLACE[if newest { 5 } else { 6 }]
+                        .fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
             } else {
                 self.settle(&mut submitted, why);
             }

@@ -72,6 +72,8 @@ fn build() -> &'static [u8; 32] {
                     // Which lanes the translation takes for alike.
                     "VICTORY_UNIFORM_PRECISE",
                     "VICTORY_UNIFORM_LOADS",
+                    // How scalar loads of raw views are read.
+                    "VICTORY_SMEM_VECTOR",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

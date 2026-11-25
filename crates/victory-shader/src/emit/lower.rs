@@ -491,6 +491,16 @@ fn uniform_loads() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_some_and(|v| v == "1"))
 }
 
+/// Whether a scalar load of several dwords from a raw view (`s_buffer_load_dwordx2` to `x16` of
+/// an SRV) reads them four at a time, one `rawBufferLoad` per run of up to four dwords, instead
+/// of one per dword (`VICTORY_SMEM_VECTOR=0`): the heavy mesh and pixel shaders read a few
+/// hundred dwords this way (94d28115: 463 loads, 267 four at a time; ef540905: 247, 125), and
+/// the title's shaders 377,542 one-dword loads in all. Both forms pass the validator.
+pub(super) fn smem_vector() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SMEM_VECTOR").is_none_or(|v| v != "0"))
+}
+
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
@@ -5937,25 +5947,8 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
-            }
+            let b = self.cur;
+            let raw: Vec<(V, V)> = self.raw_dwords(b, h, addr, count).into_iter().map(|x| (x, zero)).collect();
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
@@ -5976,21 +5969,7 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+            for (k, x) in self.raw_dwords(c, h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6036,6 +6015,37 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// `count` dwords of raw view `h` from byte `addr` on, read in block `b` as integers: one
+    /// `rawBufferLoad` each, or with [`smem_vector`] one per run of up to four.
+    // shortcut: a run that ends past the view reads as the host reads such a load (most
+    // hosts give 0 for each dword outside, as the console does).
+    fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32) -> Vec<V> {
+        let per = if smem_vector() { 4 } else { 1 };
+        let mut out = Vec::with_capacity(count as usize);
+        let mut k = 0;
+        while k < count {
+            let n = per.min(count - k);
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(b, Bin::Add, addr, off);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                b,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for j in 0..n {
+                let x = self.s.m.extract(b, r, j);
+                out.push(self.as_int(x));
+            }
+            k += n;
+        }
+        out
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords

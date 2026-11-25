@@ -1935,7 +1935,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            moved();
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2018,6 +2022,11 @@ impl Shadow {
     /// The title address the copy starts at.
     pub(crate) fn title_start(&self) -> u64 {
         self.start
+    }
+
+    /// The title bytes the copy holds.
+    pub(crate) fn title_len(&self) -> u64 {
+        self.len
     }
 
     /// The copy's own number (see the field).
@@ -2768,10 +2777,10 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             #[cfg(feature = "diagnostics")]
-            let asking = std::time::Instant::now();
+            let asking = crate::copystat::detail().then(std::time::Instant::now);
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 #[cfg(feature = "diagnostics")]
-                let (watch_us, copying) = (asking.elapsed().as_micros() as u64, std::time::Instant::now());
+                let timed = asking.map(|asking| (asking.elapsed().as_micros() as u64, std::time::Instant::now()));
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
@@ -2780,10 +2789,12 @@ impl Shadow {
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                     let changed = COPY_CHANGED.take();
-                    crate::copystat::refresh(
-                        (self.start, self.len, self.window),
-                        [(to - from) as u64, copied as u64, changed, watch_us, copying.elapsed().as_micros() as u64],
-                    );
+                    if let Some((watch_us, copying)) = timed {
+                        crate::copystat::refresh(
+                            (self.start, self.len, self.window),
+                            [(to - from) as u64, copied as u64, changed, watch_us, copying.elapsed().as_micros() as u64],
+                        );
+                    }
                 }
                 return copied;
             }
@@ -3126,12 +3137,28 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+/// Bumped whenever what [`find`] answers for an ask may change: a title
+/// buffer registered or let go, a window or an in-place copy made or let
+/// go. A caller that keeps what `find` answered (`crate::draw`'s readable
+/// memo) asks again once it moves.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// [`EPOCH`] now.
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(Ordering::Acquire)
+}
+
+fn moved() {
+    EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    moved();
     buffers().insert(
         (start, resource),
         Entry {
@@ -3144,6 +3171,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+    moved();
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3184,6 +3212,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        moved();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3230,6 +3261,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let _timer = crate::draw::PhaseTimer::new(11);
     lookup(address, len, false)
 }
 
@@ -3506,6 +3538,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        moved();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -3543,6 +3576,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    moved();
     Some(shadow)
 }
 

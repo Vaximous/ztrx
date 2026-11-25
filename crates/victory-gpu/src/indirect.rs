@@ -30,7 +30,7 @@ use crate::host::{HostList, host, transition};
 /// The most groups along each axis a clamped indirect dispatch record runs
 /// (the clamp's `min(asked, 65535)` per axis, kept in step by a test): what
 /// store extents bound the group ids of such dispatches with.
-pub(crate) const MOST_GROUPS: [u32; 3] = [65535; 3];
+pub(crate) const MOST_GROUPS: [u32; 3] = [MAX_GROUPS_PER_AXIS; 3];
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -229,7 +229,6 @@ fn group_charge() -> bool {
 /// passes on ([`SOURCE`]: `min(asked, 65535u)`; mesh records also at most
 /// 1 in y and z). Others may rely on it as an upper bound of the group ids
 /// of clamped indirect dispatches; kept in step with the shader by a test.
-#[allow(dead_code, reason = "a bound for store extents of indirect dispatches")]
 pub(crate) const MAX_GROUPS_PER_AXIS: u32 = 65535;
 
 /// The most groups of one clamped indirect dispatch in all (x * y * z;
@@ -914,7 +913,7 @@ void main() {
     #[test]
     fn clamp_bounds_match_the_shader() {
         assert_eq!(MAX_GROUPS_PER_AXIS, 65535);
-        assert!(SOURCE.contains("uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));"));
+        assert!(SOURCE.contains("uint3 g = min(asked, uint3(65535u, 65535u, 65535u));"));
         assert!(SOURCE.contains("g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));"));
         assert_eq!(MAX_DISPATCH_GROUPS, 1 << 20);
         assert!(SOURCE.contains("static const uint GROUPS = 1u << 20;"));

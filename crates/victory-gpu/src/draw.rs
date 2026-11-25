@@ -1019,6 +1019,12 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        crate::meshprobe::binding(if compute {
+            p.stages.first().map_or(0, |s| u64::from_str_radix(s.shader.hash.get(..16).unwrap_or(""), 16).unwrap_or(0))
+        } else {
+            0
+        });
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -2650,6 +2656,11 @@ impl State {
             6
         };
         WINDOWED[how].fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let probed = (kind == MESH && !unclamped && crate::meshprobe::now()).then(|| {
+            let since = hit.as_ref().and(self.window.as_ref()).map(|w| list.write_count().saturating_sub(w.writes));
+            (since, list.writes_unwaited())
+        });
         // Timing notes: the copies of the arguments to the card first, then
         // the clamp (`crate::indirect`'s own note), then the call's state,
         // then the call: each its own line of the card's time.
@@ -2803,6 +2814,19 @@ impl State {
         }
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some((since, unwaited)) = probed {
+            let call = crate::meshprobe::Call {
+                pipeline: p.name.clone(),
+                how,
+                since,
+                unwaited,
+                arguments,
+                records: max,
+                stride,
+            };
+            crate::meshprobe::probe(list, call, &bounded, at, (&args.buffer, offset));
         }
         if !unclamped {
             crate::indirect::done(list, &bounded);

@@ -1900,6 +1900,8 @@ impl Shadow {
     /// `from` says what bound the range, for the statistics
     /// ([`DECLARED_BY`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, from: Declarer) {
+        #[cfg(feature = "diagnostics")]
+        crate::meshprobe::wrote(list, address, len);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer

@@ -52,6 +52,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod meshprobe;
 #[cfg(windows)]
 mod extent;
 #[cfg(windows)]

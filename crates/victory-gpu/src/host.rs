@@ -1952,6 +1952,9 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Diagnostics: work once the list has run (`crate::meshprobe`).
+    #[cfg(feature = "diagnostics")]
+    probes: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 impl Deferred {
@@ -3326,6 +3329,11 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let probes = std::mem::take(&mut list.deferred().probes);
+        probes.into_iter().for_each(|p| p());
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -6092,6 +6100,12 @@ impl HostList {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
+    /// Diagnostics: `work` once the list has run.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_probe(&self, work: Box<dyn FnOnce() + Send>) {
+        self.deferred().probes.push(work);
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -6986,6 +7000,8 @@ impl Meter {
                 most as f64 * 100.0 / f64::from(crate::indirect::BUDGET)
             );
         }
+        #[cfg(feature = "diagnostics")]
+        crate::meshprobe::report();
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"

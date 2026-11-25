@@ -754,6 +754,48 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
     done_on(&list.list, scratch);
 }
 
+/// Diagnostics (`crate::meshprobe`): after an indirect call that read
+/// `len` bytes of `scratch` at `at`, a copy of them and of the title's
+/// records (`source`, as they are by then) into a mapped buffer: the
+/// clamped records at 0, the title's at `len`. The scratch buffer is left
+/// as the call left it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_args_out(
+    list: &HostList,
+    scratch: &ID3D12Resource,
+    at: u64,
+    (src, src_at): (&ID3D12Resource, u64),
+    len: u64,
+) -> Option<(ID3D12Resource, *mut u8)> {
+    let (buffer, data) = host()?.shared_buffer(2 * len)?;
+    let l = &list.list;
+    let enhanced = enhanced_barriers().then(|| l.cast::<ID3D12GraphicsCommandList7>().ok()).flatten();
+    let indirect = (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT);
+    let copying = (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE);
+    // SAFETY: an open list; the scratch buffer in the state the indirect
+    // call read it in; live buffers; ranges inside them (the call read
+    // them).
+    unsafe {
+        // The title's records as every shader recorded before wrote them.
+        l.ResourceBarrier(&[uav_barrier()]);
+        match &enhanced {
+            Some(l7) => {
+                buffer_barrier(l7, scratch, indirect, copying);
+                buffer_barrier(l7, &buffer, (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS), (D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_DEST));
+            }
+            None => l.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]),
+        }
+        l.CopyBufferRegion(&buffer, 0, scratch, at, len);
+        l.CopyBufferRegion(&buffer, len, src, src_at, len);
+        match &enhanced {
+            Some(l7) => buffer_barrier(l7, scratch, copying, indirect),
+            None => l.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)]),
+        }
+    }
+    list.keep(&buffer);
+    Some((buffer, data))
+}
+
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {

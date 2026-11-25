@@ -2290,8 +2290,9 @@ pub(crate) fn templates_on() -> bool {
 
 /// A slot of a [`Template`].
 pub(crate) enum TemplateSlot {
-    /// A constant buffer view (address, bytes): written per list.
-    Constant(u64, u32),
+    /// A constant buffer view: written per list, from the title's slot as
+    /// it holds it then (its place changes each frame).
+    Constant,
     /// A view; the host object it showed when made ([`host_identity`]), and
     /// what the slot holds ([`make`]'s).
     View(View, Option<ID3D12Resource>, Option<ID3D12Resource>),
@@ -2399,9 +2400,9 @@ pub(crate) fn make_template(key: (u64, u32, u64), views: &[Option<View>]) {
         .iter()
         .enumerate()
         .map(|(k, view)| match view {
-            Some(View::Constant(address, size)) => {
+            Some(View::Constant(..)) => {
                 null_view(at(k as u32));
-                TemplateSlot::Constant(*address, *size)
+                TemplateSlot::Constant
             }
             Some(view) => {
                 let shown = host_identity(view);

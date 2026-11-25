@@ -566,18 +566,73 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     own: bool,
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, fresh) = scratch_place(list, bytes)?;
     let wait = clamp_waits(list);
-    let fresh = enhanced(list, &dst);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| clamp_note("clamp", spec, wait));
     let scoped = own && clamp_scoped();
-    record_clamp_scoped(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, clamped_as_draw(spec.0, spec.2), scoped).then(|| {
-        list.waited();
-        dst
+    record_clamp_scoped(c, &list.list, (&dst, at), budget, src, count, spec, false, wait, fresh, clamped_as_draw(spec.0, spec.2), scoped).then(|| {
+        clamp_waited(list, wait, scoped);
+        (dst, at)
     })
+}
+
+/// `VICTORY_CLAMP_RING=1` (off by default; with [`enhanced_barriers`]
+/// only): each clamp in a list writes its records after the last one's in
+/// the list's scratch buffer (`HostList::indirect_ring`), not at its start,
+/// so it need not wait for the indirect call before it to have read its
+/// records there: the barrier that waited for that is left out, and the
+/// clamp may run beside the call before it. When the ring goes round the
+/// wait is made, for every place used before.
+pub(crate) fn clamp_ring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_RING").is_some_and(|v| v == "1") && enhanced_barriers())
+}
+
+/// Where a clamp of `bytes` writes in the list's scratch: the buffer, the
+/// place, and its first barrier ([`Pre`]; `None` without enhanced
+/// barriers).
+fn scratch_place(list: &HostList, bytes: u64) -> Option<(ID3D12Resource, u64, Option<Pre>)> {
+    if clamp_ring() {
+        let (dst, at, round) = list.indirect_ring(bytes)?;
+        let pre = if list.first_use(dst.as_raw() as usize ^ CLAMP_USE) {
+            Pre::First
+        } else if round {
+            Pre::AfterCalls
+        } else {
+            crate::list::barrier_count(crate::list::B_CLAMP_RING, 1);
+            Pre::None
+        };
+        return Some((dst, at, Some(pre)));
+    }
+    let dst = list.indirect_scratch(bytes)?;
+    let fresh = enhanced(list, &dst);
+    Some((dst, 0, fresh.map(|first| if first { Pre::First } else { Pre::AfterCalls })))
+}
+
+/// A clamp was recorded: its wait, if it waited for everything, is the
+/// list's wait for every earlier shader write.
+fn clamp_waited(list: &HostList, wait: bool, scoped: bool) {
+    list.waited();
+    if wait && !scoped {
+        list.all_waited();
+    }
+}
+
+/// With [`enhanced_barriers`]: the barrier on a clamp's scratch before it
+/// writes there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Pre {
+    /// The buffer's first use in the list since its reset (from the common
+    /// state, after everything).
+    First,
+    /// After the indirect calls before it read their records.
+    AfterCalls,
+    /// None: no call read the place since the list's last wait for them.
+    None,
 }
 
 /// `VICTORY_CLAMP_SCOPED` (on by default, `=0` off): a clamp's wait for earlier
@@ -629,9 +684,11 @@ pub(crate) fn enhanced_barriers() -> bool {
 /// the scratch buffer's first use in the list since its reset (its state
 /// before is then the common one).
 fn enhanced(list: &HostList, dst: &ID3D12Resource) -> Option<bool> {
-    const CLAMP_USE: usize = 0x5ca7_c4a3;
     enhanced_barriers().then(|| list.first_use(dst.as_raw() as usize ^ CLAMP_USE))
 }
+
+/// [`enhanced`]'s key of a scratch buffer's first use in a list.
+const CLAMP_USE: usize = 0x5ca7_c4a3;
 
 /// An enhanced barrier on all of buffer `resource`.
 ///
@@ -692,17 +749,17 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
     own: bool,
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (dst, at, fresh) = scratch_place(list, bytes)?;
     let wait = clamp_waits(list);
-    let fresh = enhanced(list, &dst);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| clamp_note("clamp-window", spec, wait));
     let scoped = own && clamp_scoped();
-    record_clamp_scoped(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, clamped_as_draw(spec.0, spec.2), scoped).then(|| {
-        list.waited();
-        dst
+    record_clamp_scoped(c, &list.list, (&dst, at), budget, src, None, spec, true, wait, fresh, clamped_as_draw(spec.0, spec.2), scoped).then(|| {
+        clamp_waited(list, wait, scoped);
+        (dst, at)
     })
 }
 
@@ -1023,7 +1080,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_scoped(c, l, dst, budget, src, count, spec, false, true, None, false, false)
+    record_clamp_scoped(c, l, (dst, 0), budget, src, count, spec, false, true, None, false, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -1046,7 +1103,8 @@ fn record_clamp_as(
     fresh: Option<bool>,
     as_draw: bool,
 ) -> bool {
-    record_clamp_scoped(c, l, dst, budget, src, count, spec, ahead, wait, fresh, as_draw, false)
+    let fresh = fresh.map(|first| if first { Pre::First } else { Pre::AfterCalls });
+    record_clamp_scoped(c, l, (dst, 0), budget, src, count, spec, ahead, wait, fresh, as_draw, false)
 }
 
 /// The clamp's inputs for `spec`'s records at `src` (bounded by `count`)
@@ -1094,19 +1152,19 @@ fn clamp_inputs(
 fn record_clamp_scoped(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, dst_at): (&ID3D12Resource, u64),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
     wait: bool,
-    fresh: Option<bool>,
+    fresh: Option<Pre>,
     as_draw: bool,
     scoped: bool,
 ) -> bool {
     // SAFETY: a live D3D12 buffer resource.
-    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + dst_at;
     let Some((constants, src_gpu, count_gpu)) =
         clamp_inputs((src, src_offset), count, (kind, stride, records), ahead, dst_gpu, budget)
     else {
@@ -1190,23 +1248,27 @@ fn record_clamp_scoped(
     if let Some(fresh) = fresh
         && let Ok(l7) = l.cast::<ID3D12GraphicsCommandList7>()
     {
-        let before = if fresh {
-            (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON)
-        } else {
-            (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT)
+        let before = match fresh {
+            Pre::First => Some((D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON)),
+            Pre::AfterCalls => Some((D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT)),
+            Pre::None => None,
         };
         let written = (shading, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        count_clamp_barriers(waits && wait, scoped);
         // SAFETY: as above.
         unsafe {
             if waits && wait {
                 l.ResourceBarrier(&first[..waited]);
             }
-            buffer_barrier(&l7, dst, before, written);
+            if let Some(before) = before {
+                buffer_barrier(&l7, dst, before, written);
+            }
             run();
             buffer_barrier(&l7, dst, written, (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT));
         }
         return true;
     }
+    count_clamp_barriers(waits && wait, scoped);
     // SAFETY: as above.
     unsafe {
         // Earlier shader writes (the title's argument and count passes)
@@ -1216,6 +1278,17 @@ fn record_clamp_scoped(
         l.ResourceBarrier(&second[skip..]);
     }
     true
+}
+
+/// For the barrier census (`crate::list::BARRIERS`): a clamp's wait for
+/// earlier writes, if made, on everything or on its records alone, and its
+/// pair of barriers on its scratch.
+fn count_clamp_barriers(waited: bool, scoped: bool) {
+    use crate::list::{B_CLAMP_PAIR, B_CLAMP_SCOPED, B_CLAMP_WAIT, barrier_count};
+    if waited {
+        barrier_count(if scoped { B_CLAMP_SCOPED } else { B_CLAMP_WAIT }, 1);
+    }
+    barrier_count(B_CLAMP_PAIR, 1);
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
@@ -1974,14 +2047,14 @@ void main() {
             assert!(record_clamp_scoped(
                 &warp.clamp,
                 &warp.list,
-                &dst,
+                (&dst, 0),
                 budget_gpu,
                 (&src, 0),
                 None,
                 (2, 12, 1),
                 false,
                 true,
-                enhanced.then_some(true),
+                enhanced.then_some(Pre::First),
                 false,
                 true,
             ));
@@ -2764,6 +2837,33 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
+    /// `HostList::indirect_ring` (`VICTORY_CLAMP_RING`): clamps take places
+    /// one after another, 256-byte aligned, in one buffer; at the end the
+    /// ring goes round to the start and says so; a reset starts it again.
+    #[test]
+    fn indirect_ring_places_follow_and_go_round() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let (a, at_a, round_a) = list.indirect_ring(100).unwrap();
+        let (b, at_b, round_b) = list.indirect_ring(300).unwrap();
+        assert_eq!((at_a, round_a, at_b, round_b), (0, false, 256, false));
+        assert_eq!(a.as_raw(), b.as_raw());
+        // SAFETY: a live buffer.
+        let cap = unsafe { a.GetDesc() }.Width;
+        let (_, at_c, round_c) = list.indirect_ring(cap - 512).unwrap();
+        assert_eq!((at_c, round_c), (0, true));
+        let (_, at_d, round_d) = list.indirect_ring(16).unwrap();
+        assert_eq!((at_d, round_d), (cap - 512, false));
+        list.close();
+        list.reset();
+        let (_, at_e, round_e) = list.indirect_ring(16).unwrap();
+        assert_eq!((at_e, round_e), (0, false));
+    }
+
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
@@ -2788,9 +2888,9 @@ void main() {
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), true).unwrap();
+        let (b1, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), true).unwrap();
         done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), true).unwrap();
+        let (b2, _) = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), true).unwrap();
         done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
@@ -2800,7 +2900,7 @@ void main() {
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), true).unwrap();
+        let (b3, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), true).unwrap();
         done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
@@ -2814,7 +2914,7 @@ void main() {
 
         // After reset, requests up to the grown high-water mark reuse `b3` with
         // zero new allocations.
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), true).unwrap();
+        let (b4, _) = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), true).unwrap();
         done(&list, &b4);
         assert_eq!(
             b4.as_raw(),

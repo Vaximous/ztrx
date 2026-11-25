@@ -774,6 +774,89 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     }
 }
 
+/// `VICTORY_BARRIER_ELIDE`: the title's waits for every earlier unordered
+/// access (its barrier groups, and its barriers on buffers, which the host
+/// makes one such wait) left out where they cannot order anything: 1, when
+/// nothing was recorded in the list since the last such wait (consecutive
+/// barriers, as the title records them around passes); 2, also when what
+/// was recorded since stores nothing (raster passes): then a write after
+/// the barrier is not kept from overlapping a read before it, which the
+/// title's barrier would order (for trying; not exact). 0 (the default)
+/// keeps every one. The texture state changes are kept either way.
+#[cfg(windows)]
+pub(crate) fn barrier_elide() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_BARRIER_ELIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Barriers recorded per frame, by kind (for the frame line,
+/// [`barrier_line`]): see `BARRIER_NAMES`.
+pub(crate) static BARRIERS: [std::sync::atomic::AtomicU64; BARRIER_KINDS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; BARRIER_KINDS];
+pub(crate) const BARRIER_KINDS: usize = 14;
+pub(crate) const B_GROUP_WAIT: usize = 0;
+pub(crate) const B_BUFFER_WAIT: usize = 1;
+pub(crate) const B_TITLE_MOVE: usize = 2;
+pub(crate) const B_TITLE_ALIAS: usize = 3;
+pub(crate) const B_TITLE_UAV_ON: usize = 4;
+pub(crate) const B_IDLE_WAIT: usize = 5;
+pub(crate) const B_STORELESS_WAIT: usize = 6;
+pub(crate) const B_DROPPED: usize = 7;
+pub(crate) const B_CLAMP_WAIT: usize = 8;
+pub(crate) const B_CLAMP_SCOPED: usize = 9;
+pub(crate) const B_CLAMP_PAIR: usize = 10;
+pub(crate) const B_CLAMP_RING: usize = 11;
+pub(crate) const B_ENSURE: usize = 12;
+pub(crate) const B_INDIRECT_WAIT: usize = 13;
+const BARRIER_NAMES: [&str; BARRIER_KINDS] = [
+    "title barrier groups (a wait on all unordered access each)",
+    "title barriers on buffers (made one such wait)",
+    "title state changes",
+    "title aliasing barriers",
+    "title waits on one resource",
+    "of the title's waits: nothing recorded since the last such wait",
+    "after work that stores nothing",
+    "left out (VICTORY_BARRIER_ELIDE)",
+    "clamps' waits on all unordered access",
+    "clamps' waits on their records alone",
+    "clamps' barrier pairs on their scratch",
+    "clamps' first barriers left out (VICTORY_CLAMP_RING)",
+    "state changes of textures before a use",
+    "waits before unclamped indirect calls",
+];
+
+pub(crate) fn barrier_count(kind: usize, n: u64) {
+    BARRIERS[kind].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// For the frame-rate line: [`BARRIERS`] per frame.
+pub(crate) fn barrier_line(frames: f64) {
+    let text: Vec<String> = BARRIERS
+        .iter()
+        .zip(BARRIER_NAMES)
+        .map(|(n, name)| format!("{name} {:.0}", n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames))
+        .collect();
+    tracing::info!("barriers per frame (VICTORY_BARRIER_ELIDE={}): {}", barrier_elide(), text.join(", "));
+}
+
+/// A wait for every earlier unordered access the title asked for: whether
+/// it is recorded ([`barrier_elide`]); counted.
+#[cfg(windows)]
+fn title_wait(list: &crate::host::HostList) -> bool {
+    let since = list.since_wait();
+    if since & 1 == 0 {
+        barrier_count(B_IDLE_WAIT, 1);
+    } else if since & 2 == 0 {
+        barrier_count(B_STORELESS_WAIT, 1);
+    }
+    let elide = barrier_elide();
+    let drop = (elide >= 1 && since & 1 == 0) || (elide >= 2 && since & 2 == 0);
+    if drop {
+        barrier_count(B_DROPPED, 1);
+    }
+    !drop
+}
+
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
 const UAV_BARRIER: Barrier = Barrier {
@@ -796,13 +879,30 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
+        for b in &host {
+            match b.kind {
+                0 => barrier_count(B_TITLE_MOVE, 1),
+                1 => barrier_count(B_TITLE_ALIAS, 1),
+                _ if b.first.is_null() => barrier_count(B_GROUP_WAIT, 1),
+                _ => barrier_count(B_TITLE_UAV_ON, 1),
+            }
+        }
+        // A wait on all unordered access among them.
+        if host.iter().any(|b| b.kind == 2 && b.first.is_null()) {
+            list.waited();
+            list.all_waited();
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
-            list.waited();
+            barrier_count(B_BUFFER_WAIT, 1);
+            if title_wait(list) {
+                host.push(UAV_BARRIER);
+                list.waited();
+                list.all_waited();
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -829,6 +929,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
+        barrier_count(B_ENSURE, 1);
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -2001,12 +2102,17 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        barrier_count(B_GROUP_WAIT, 1);
+        if !title_wait(list) {
+            return;
+        }
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         list.waited();
+        list.all_waited();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

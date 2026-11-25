@@ -126,6 +126,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to images ([`image_stores`]); true when its
+    /// code is not known.
+    pub(crate) image_stores: bool,
     /// Whether every buffer store's address depends on nothing worse than
     /// the lane's place in the dispatch (`victory_shader::stores`): false
     /// when its code is not known or it has no stores.
@@ -200,6 +203,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let image_stores = programs.is_empty() || programs.iter().any(image_stores);
     let bounded = stores
         && !programs.is_empty()
         && programs.iter().all(|p| {
@@ -230,7 +234,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, bounded, extents, extents_why })
+    Ok(Translated { host, used, stores, image_stores, bounded, extents, extents_why })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -374,6 +378,18 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether `program` can store to images (image stores and atomics).
+#[cfg(windows)]
+fn image_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        i.encoding == Encoding::Mimg && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
     })
 }
 

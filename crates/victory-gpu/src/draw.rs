@@ -430,6 +430,8 @@ pub(crate) struct State {
     /// Whether a shader of the pipeline last bound can store to buffers
     /// (`HostList::wrote` after its draws).
     stores: bool,
+    /// Whether one can store to buffers or images (`HostList::worked`).
+    memory_stores: bool,
 }
 
 impl Drop for State {
@@ -1439,6 +1441,10 @@ impl State {
             list.keep(&p.root);
         }
         self.stores = p.stages.iter().any(|stage| stage.translated().stores);
+        self.memory_stores = p.stages.iter().any(|stage| {
+            let t = stage.translated();
+            t.stores || t.image_stores
+        });
         lap.at(0);
         for stage in &p.stages {
             let t = stage.translated();
@@ -2207,6 +2213,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // (our passes recorded for it are work too, whether it runs or not)
+        list.worked(false);
         // It may write the arguments a window holds clamped (looked at
         // when the window is next used, with `windows_by_writes`).
         if !windows_by_writes() {
@@ -2327,6 +2335,7 @@ impl State {
             }
         }
         list.wrote();
+        list.worked(true);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(pending) = pending {
             crate::extent::check_after(list, pending);
@@ -2430,6 +2439,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        // (our passes recorded for it are work too, whether it runs or not)
+        list.worked(false);
         if !windows_by_writes() {
             self.window = None;
         }
@@ -2448,6 +2459,7 @@ impl State {
                     if self.stores {
                         list.wrote();
                     }
+                    list.worked(self.memory_stores);
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2668,12 +2680,25 @@ impl State {
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
             // Its views made once for every list, copied in at once
             // (`crate::descriptor::host::templates_on`).
+            //
+            // Keyed by what the views are, not by the table's place and its
+            // slots' record words: the title writes its tables anew each
+            // frame, at other places, with new records of the same views
+            // (zall20t: 28 copied against 8,742 made a frame). Constant
+            // buffers' places change each frame too: the key names only
+            // that a slot holds one, and its place is read again here.
             let templates = crate::descriptor::host::templates_on();
+            let decoded: Vec<Option<View>> = if templates {
+                // (timed as views decoded, in `view_at`)
+                (0..n).map(|k| crate::descriptor::view(table + u64::from(k) * 32)).collect()
+            } else {
+                Vec::new()
+            };
             let template = templates
                 .then(|| {
                     let _timer = PhaseTimer::new(15);
-                    crate::descriptor::host::template(key)
-                        .filter(|t| t.slots.len() == n as usize && host.copy_template(t, first))
+                    crate::descriptor::host::template(template_key(&decoded))
+                        .filter(|t| t.slots.len() == n as usize && template_fits(t, &decoded) && host.copy_template(t, first))
                 })
                 .flatten();
             let mut views: Vec<Option<View>> = Vec::new();
@@ -2683,18 +2708,16 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let (view, kept) = match template.as_ref().map(|t| &t.slots[k as usize]) {
-                    Some(crate::descriptor::host::TemplateSlot::Constant(address, size)) => {
-                        (Some(View::Constant(*address, *size)), None)
-                    }
+                    // (as the title's slot holds it now)
+                    Some(crate::descriptor::host::TemplateSlot::Constant) => (decoded[k as usize].clone(), None),
                     Some(crate::descriptor::host::TemplateSlot::View(view, _, kept)) => (Some(view.clone()), Some(kept.clone())),
                     Some(crate::descriptor::host::TemplateSlot::Null) => (None, Some(None)),
-                    None => {
-                        let view = crate::descriptor::view(table + u64::from(k) * 32);
-                        if templates {
-                            views.push(view.clone());
-                        }
+                    None if templates => {
+                        let view = decoded[k as usize].clone();
+                        views.push(view.clone());
                         (view, None)
                     }
+                    None => (crate::descriptor::view(table + u64::from(k) * 32), None),
                 };
                 match view {
                     Some(View::Constant(address, size)) => {
@@ -2760,7 +2783,7 @@ impl State {
             }
             if templates && template.is_none() && views.len() == n as usize {
                 let _timer = PhaseTimer::new(21);
-                crate::descriptor::host::make_template(key, &views);
+                crate::descriptor::host::make_template(template_key(&views), &views);
             }
             self.fresh_tables.insert(key, (first, constants));
             made.push((slot, first * 32));
@@ -2842,6 +2865,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.worked(false);
         if !windows_by_writes() {
             self.window = None;
         }
@@ -2869,6 +2893,7 @@ impl State {
             if self.stores {
                 list.wrote();
             }
+            list.worked(self.memory_stores);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2952,6 +2977,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.worked(false);
         if !windows_by_writes() {
             self.window = None;
         }
@@ -2975,6 +3001,7 @@ impl State {
             if self.stores {
                 list.wrote();
             }
+            list.worked(self.memory_stores);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2999,6 +3026,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        list.worked(false);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3164,6 +3192,8 @@ impl State {
                     // SAFETY: an open list.
                     unsafe { list.list.ResourceBarrier(&[barrier]) };
                     list.waited();
+                    list.all_waited();
+                    crate::list::barrier_count(crate::list::B_INDIRECT_WAIT, 1);
                 }
                 (args.buffer.clone(), offset, false)
             }
@@ -3223,12 +3253,12 @@ impl State {
                     None
                 };
                 let hoisted_call = hoisted.is_some();
-                let (bounded, bounded_at) = match hoisted {
-                    Some((buffer, at)) => (Some(buffer), at),
-                    None if ahead => (crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own), 0),
-                    None => (crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own), 0),
+                let placed = match hoisted {
+                    Some(placed) => Some(placed),
+                    None if ahead => crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own),
+                    None => crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own),
                 };
-                let Some(bounded) = bounded else {
+                let Some((bounded, bounded_at)) = placed else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
@@ -3313,6 +3343,7 @@ impl State {
         if kind == DISPATCH || self.stores {
             list.wrote();
         }
+        list.worked(kind == DISPATCH || self.memory_stores);
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3341,6 +3372,37 @@ impl State {
         }
         true
     }
+}
+
+/// The key of a table's template (`crate::descriptor::host::templates_on`):
+/// its length and, per slot, its view; of a constant buffer only that it is
+/// one (its place is the title's of this frame).
+fn template_key(views: &[Option<View>]) -> (u64, u32, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for view in views {
+        match view {
+            None => 0u8.hash(&mut h),
+            Some(View::Constant(..)) => 1u8.hash(&mut h),
+            Some(view) => {
+                2u8.hash(&mut h);
+                view.hash(&mut h);
+            }
+        }
+    }
+    (0, views.len() as u32, h.finish())
+}
+
+/// Whether template `t`'s slots are `views` (past the key's hash): its
+/// views the same, a constant buffer where they hold one, null where null.
+fn template_fits(t: &crate::descriptor::host::Template, views: &[Option<View>]) -> bool {
+    use crate::descriptor::host::TemplateSlot;
+    t.slots.len() == views.len()
+        && t.slots.iter().zip(views).all(|(slot, view)| match (slot, view) {
+            (TemplateSlot::Constant, Some(View::Constant(..))) | (TemplateSlot::Null, None) => true,
+            (TemplateSlot::View(made, ..), Some(view)) => made == view,
+            _ => false,
+        })
 }
 
 /// The host command signature for one argument of `kind` with records

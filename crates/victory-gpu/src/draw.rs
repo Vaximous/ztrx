@@ -2712,7 +2712,16 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                // Clamped records run at most this many groups: store
+                // extents bound group ids with it.
+                if !unclamped {
+                    GROUPS.set(Some(crate::indirect::MOST_GROUPS));
+                }
+                let bound = self.bind(list, p, true);
+                GROUPS.set(None);
+                bound
+            }
             _ => false,
         };
         if !ran {

@@ -27,6 +27,11 @@ use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
+/// The most groups along each axis a clamped indirect dispatch record runs
+/// (the clamp's `min(asked, 65535)` per axis, kept in step by a test): what
+/// store extents bound the group ids of such dispatches with.
+pub(crate) const MOST_GROUPS: [u32; 3] = [65535; 3];
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -557,6 +562,17 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
             }),
         },
+    }
+}
+
+#[cfg(test)]
+mod most_groups {
+    /// [`super::MOST_GROUPS`] is what the clamp lets a dispatch record ask.
+    #[test]
+    fn the_clamp_caps_dispatch_groups_at_most_groups() {
+        let [x, y, z] = super::MOST_GROUPS;
+        let cap = format!("min(asked, uint3({x}u, {y}u, {z}u))");
+        assert!(super::SOURCE.contains(&cap), "the clamp no longer caps dispatch groups with {cap}");
     }
 }
 

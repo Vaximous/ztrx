@@ -112,6 +112,10 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where the window's records start in `scratch`; whether they were
+    /// clamped ahead of the list (`crate::indirect::hoist_clamps`).
+    scratch_at: u64,
+    hoisted: bool,
     /// With [`windows_by_writes`]: the title memory its records came from;
     /// the list's count of storing calls when it was clamped
     /// (`HostList::write_count`); whether a range the list declared
@@ -2948,7 +2952,7 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .map(|w| (w.scratch.clone(), w.scratch_at + offset - w.base, w.hoisted));
         let unclamped = unclamped();
         if unclamped {
             self.window = None;
@@ -2980,7 +2984,7 @@ impl State {
         if hit.is_none() {
             list.note_op(|| format!("ifetch kind {kind}"));
         }
-        let (bounded, at) = match hit {
+        let (bounded, at, hoisted_call) = match hit {
             Some(hit) => hit,
             None if unclamped => {
                 args.refresh(list, arguments, len);
@@ -3001,7 +3005,7 @@ impl State {
                     unsafe { list.list.ResourceBarrier(&[barrier]) };
                     list.waited();
                 }
-                (args.buffer.clone(), offset)
+                (args.buffer.clone(), offset, false)
             }
             None => {
                 // A record a short step after the last window's last one
@@ -3043,19 +3047,38 @@ impl State {
                 // other buffers alias): the clamp may wait on them alone
                 // (`crate::indirect::clamp_scoped`).
                 let own = !args.in_place() && counter.as_ref().is_none_or(|(s, _)| !s.in_place());
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own)
+                let ahead = windowed && records > 1;
+                // Ahead of the list (`crate::indirect::hoist_clamps`): if
+                // nothing the list did before may write the records or
+                // the count.
+                let hoist = crate::indirect::hoist_clamps();
+                let hoistable = hoist != 0
+                    && own
+                    && (hoist == 1 || list.write_count() == 0)
+                    && !list.gpu_written(arguments as usize, len.max(u64::from(step) * u64::from(records)) as usize)
+                    && counter.as_ref().is_none_or(|(_, at)| !list.gpu_written(*at as usize, 4));
+                let hoisted = if hoistable {
+                    crate::indirect::hoisted(list, (&args.buffer, offset), if ahead { None } else { count_arg }, (kind, step, records), ahead)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own)
+                    None
+                };
+                let hoisted_call = hoisted.is_some();
+                let (bounded, bounded_at) = match hoisted {
+                    Some((buffer, at)) => (Some(buffer), at),
+                    None if ahead => (crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own), 0),
+                    None => (crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own), 0),
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
-                self.host_pipeline = 0;
-                self.lose_roots(&[1]);
-                if crate::indirect::clamped_as_draw(kind, records) {
+                // A clamp in the list bound a pipeline and roots of its own.
+                if !hoisted_call {
+                    self.host_pipeline = 0;
+                    self.lose_roots(&[1]);
+                }
+                if !hoisted_call && crate::indirect::clamped_as_draw(kind, records) {
                     // The clamp was a draw of ours, with no targets.
                     self.lose_roots(&[0]);
                     if self.topology_set {
@@ -3074,12 +3097,14 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    scratch_at: bounded_at,
+                    hoisted: hoisted_call,
                     title: (arguments as usize, arguments as usize + step as usize * records as usize),
                     writes: list.write_count(),
                     overlap: false,
                     looked: 0,
                 });
-                (bounded, 0)
+                (bounded, bounded_at, hoisted_call)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -3100,7 +3125,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if !unclamped {
+            if !unclamped && !hoisted_call {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3132,7 +3157,7 @@ impl State {
             self.mesh_scissor(list, false);
         }
         #[cfg(feature = "diagnostics")]
-        if let Some((since, unwaited)) = probed {
+        if let Some((since, unwaited)) = probed.filter(|_| !hoisted_call) {
             let call = crate::meshprobe::Call {
                 pipeline: p.name.clone(),
                 how,
@@ -3144,7 +3169,9 @@ impl State {
             };
             crate::meshprobe::probe(list, call, &bounded, at, (&args.buffer, offset));
         }
-        if !unclamped {
+        // A hoisted clamp's buffer stays as the calls read it until the
+        // submission ends.
+        if !unclamped && !hoisted_call {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {

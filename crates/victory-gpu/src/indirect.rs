@@ -578,6 +578,196 @@ pub(crate) fn bound_ahead(
     })
 }
 
+/// `VICTORY_HOIST_CLAMPS=1` (off by default): the clamp of an indirect
+/// call whose records (and count) no work recorded before it in the list
+/// may write is recorded ahead of the list, in its prelude
+/// (`HostList::prelude`), with the list's other such clamps: one wait for
+/// earlier writes, the clamps' dispatches back to back, one wait, then the
+/// list. Each clamp in the list cost a switch to compute and two waits
+/// (about 13 microseconds of the card's time each, 64 ms a frame over 5k
+/// calls). After Belobug's `VICTORY_HOIST_CLAMPS`, written anew.
+///
+/// What it keeps: the records a hoisted clamp reads are those the inline
+/// clamp would read. Ahead of the list are the CPU's steps (all of them
+/// run at submission either way), earlier lists and flights (ahead of the
+/// prelude in the queue); the list's own card writes before the call are
+/// in what it declared written (`HostList::gpu_written`, the ranges
+/// `VICTORY_CLAMP_SCOPED`'s window reuse and the copy-back go by), and a
+/// call any of them may reach is clamped in the list as before. Each
+/// hoisted clamp has its own place in the list's hoist buffer, so the
+/// clamped records stay until the call. What differs: the budget is
+/// charged by the hoisted clamps first, side by side (the dispatches are
+/// not ordered among themselves), then by the list's own in order; it
+/// only decides which records run empty past 2^27 of work in one list.
+///
+/// `VICTORY_HOIST_CLAMPS=2`: only before the list's first call whose
+/// shaders may store (`HostList::write_count`), for a run that does not
+/// trust the declarations (as `VICTORY_WINDOW_BY_WRITES`, off by default,
+/// does). Only calls whose records are host copies of their own (where
+/// `VICTORY_CLAMP_SCOPED` waits on them alone) are hoisted.
+pub(crate) fn hoist_clamps() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_HOIST_CLAMPS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// A clamp recorded ahead of its list ([`hoist_clamps`]).
+#[derive(Clone)]
+pub(crate) struct Hoisted {
+    constants: [u32; 6],
+    src_gpu: u64,
+    count_gpu: u64,
+    dst_gpu: u64,
+    budget: u64,
+    records: u32,
+}
+
+/// A list's clamps recorded ahead of it ([`hoist_clamps`]) and the buffer
+/// their records go to.
+#[derive(Default)]
+pub(crate) struct Hoist {
+    /// The buffer clamps go to now and its bytes; how many are taken.
+    buffer: Option<(ID3D12Resource, u64)>,
+    used: u64,
+    /// The buffers written since the reset (the last is `buffer`'s).
+    written: Vec<ID3D12Resource>,
+    clamps: Vec<Hoisted>,
+}
+
+impl Hoist {
+    /// Room for `bytes` of clamped records: the buffer and the place. A
+    /// buffer outgrown is returned too, to be kept until the reset.
+    fn take(&mut self, bytes: u64) -> Option<(ID3D12Resource, u64, Option<ID3D12Resource>)> {
+        const ALIGN: u64 = 256;
+        let bytes = bytes.max(4).next_multiple_of(ALIGN);
+        if let Some((buffer, cap)) = &self.buffer
+            && self.used + bytes <= *cap
+        {
+            let at = self.used;
+            self.used += bytes;
+            if self.written.last() != Some(buffer) {
+                self.written.push(buffer.clone());
+            }
+            return Some((buffer.clone(), at, None));
+        }
+        let prev = self.buffer.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev.saturating_mul(2).max(bytes).max(256 << 10).next_multiple_of(64 << 10);
+        let buffer = host()?.uav_buffer(alloc)?;
+        let old = self.buffer.replace((buffer.clone(), alloc)).map(|(b, _)| b);
+        self.used = bytes;
+        self.written.push(buffer.clone());
+        Some((buffer, 0, old))
+    }
+
+    /// The list was reset: its clamps are gone (the buffer is kept).
+    pub(crate) fn clear(&mut self) {
+        self.used = 0;
+        self.written.clear();
+        self.clamps.clear();
+    }
+
+    /// For the prelude: the clamps and the buffers they write. Kept: a
+    /// list run again clamps again.
+    pub(crate) fn to_record(&self) -> (Vec<Hoisted>, Vec<ID3D12Resource>) {
+        (self.clamps.clone(), self.written.clone())
+    }
+}
+
+/// [`hoist_clamps`]: the clamp of `spec`'s records at `src` (bounded by
+/// `count`) recorded ahead of `list`; the buffer and place its records
+/// will be at for the call. `ahead`: a window ([`bound_ahead`]). The
+/// caller has made sure no work of the list before the call may write the
+/// records or the count. `None`: clamp it in the list.
+pub(crate) fn hoisted(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    if hoist_clamps() == 0 || spec.2 == 0 {
+        return None;
+    }
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    clamp()?;
+    let budget = list.budget()?;
+    let (buffer, at, old) = list.hoist().take(bytes)?;
+    if let Some(old) = old {
+        list.keep(&old);
+    }
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+    let (constants, src_gpu, count_gpu) = clamp_inputs(src, count, spec, ahead, dst_gpu, budget)?;
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| clamp_note("clamp-hoisted", spec, false));
+    list.hoist().clamps.push(Hoisted { constants, src_gpu, count_gpu, dst_gpu, budget, records: spec.2 });
+    HOISTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((buffer, at))
+}
+
+/// Clamps hoisted ahead of their lists ([`hoist_clamps`]), since the last
+/// look ([`hoist_line`]).
+static HOISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The frame-rate line's part of [`hoist_clamps`]: clamps hoisted a frame.
+pub(crate) fn hoist_line(frames: f64) {
+    if hoist_clamps() != 0 {
+        let hoisted = HOISTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
+        tracing::info!("indirect clamps hoisted ahead of their lists per frame: {hoisted:.1} (VICTORY_HOIST_CLAMPS)");
+    }
+}
+
+/// Records a list's hoisted clamps into its prelude `l` ([`hoist_clamps`]):
+/// one wait for every earlier write (the lists and flights ahead), the
+/// buffers to unordered access, the clamps, one wait, the buffers to
+/// indirect arguments (as the list's calls read them; they return to the
+/// common state at the end of the submission, as buffers do).
+///
+/// # Safety
+/// An open list; live buffers (the list holds them until its reset).
+pub(crate) unsafe fn record_hoisted(l: &ID3D12GraphicsCommandList, clamps: &[Hoisted], buffers: &[ID3D12Resource]) {
+    if let Some(c) = clamp() {
+        // SAFETY: the caller's.
+        unsafe { record_hoisted_with(c, l, clamps, buffers) };
+    }
+}
+
+/// [`record_hoisted`] with clamp `c`.
+///
+/// # Safety
+/// As [`record_hoisted`].
+unsafe fn record_hoisted_with(c: &Clamp, l: &ID3D12GraphicsCommandList, clamps: &[Hoisted], buffers: &[ID3D12Resource]) {
+    if clamps.is_empty() {
+        return;
+    }
+    let mut first = vec![uav_barrier()];
+    first.extend(buffers.iter().map(|b| transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
+    let mut last = vec![uav_barrier()];
+    last.extend(
+        buffers
+            .iter()
+            .map(|b| transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)),
+    );
+    // SAFETY: the caller's; our root signature and pipeline.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        for h in clamps {
+            l.SetComputeRoot32BitConstants(0, 6, h.constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, h.src_gpu);
+            l.SetComputeRootShaderResourceView(2, h.count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, h.dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, h.budget);
+            l.Dispatch(h.records.div_ceil(64), 1, 1);
+        }
+        l.ResourceBarrier(&last);
+    }
+}
+
 /// For timing notes: a clamp's own line, so the card's time of its waits
 /// and pass is told apart from the indirect call after it.
 #[cfg(feature = "diagnostics")]
@@ -623,6 +813,45 @@ fn record_clamp_as(
     record_clamp_scoped(c, l, dst, budget, src, count, spec, ahead, wait, fresh, as_draw, false)
 }
 
+/// The clamp's inputs for `spec`'s records at `src` (bounded by `count`)
+/// into `dst_gpu`: its root constants and the source's and count's
+/// addresses. `None` if misaligned.
+fn clamp_inputs(
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+    dst_gpu: u64,
+    budget: u64,
+) -> Option<([u32; 6], u64, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    // SAFETY: a live D3D12 buffer resource.
+    let src_base = unsafe { src.GetGPUVirtualAddress() };
+    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (src_gpu, args_offset) = match src_offset.checked_add(bytes).filter(|&end| end <= u64::from(u32::MAX)) {
+        Some(_) => (src_base, src_offset as u32),
+        None => (src_base.checked_add(src_offset)?, 0),
+    };
+    let (count_gpu, has_count, count_offset) = match count {
+        Some((buf, off)) => {
+            // SAFETY: a live D3D12 buffer resource.
+            let base = unsafe { buf.GetGPUVirtualAddress() };
+            if !base.is_multiple_of(4) {
+                return None;
+            }
+            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
+                Some(_) => (base, 1u32, off as u32),
+                None => (base.checked_add(off)?, 1u32, 0u32),
+            }
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(!group_charge()) << 2);
+    Some(([kind, stride, records, args_offset, flags, count_offset], src_gpu, count_gpu))
+}
+
 /// [`record_clamp_as`]; `scoped`: the wait for earlier shader writes is on
 /// the argument and count buffers alone ([`clamp_scoped`]).
 #[allow(clippy::too_many_arguments)]
@@ -640,51 +869,13 @@ fn record_clamp_scoped(
     as_draw: bool,
     scoped: bool,
 ) -> bool {
-    let Some(bytes) = validate_layout(
-        (kind, stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
+    // SAFETY: a live D3D12 buffer resource.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+    let Some((constants, src_gpu, count_gpu)) =
+        clamp_inputs((src, src_offset), count, (kind, stride, records), ahead, dst_gpu, budget)
+    else {
         return false;
     };
-    // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
-    }
-    let (src_gpu, args_offset) = match src_offset
-        .checked_add(bytes)
-        .filter(|&end| end <= u64::from(u32::MAX))
-    {
-        Some(_) => (src_base, src_offset as u32),
-        None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
-            (rebased, 0)
-        }
-    };
-    let (count_gpu, has_count, count_offset) = match count {
-        Some((buf, off)) => {
-            // SAFETY: a live D3D12 buffer resource.
-            let base = unsafe { buf.GetGPUVirtualAddress() };
-            if !base.is_multiple_of(4) {
-                return false;
-            }
-            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
-                Some(_) => (base, 1u32, off as u32),
-                None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
-                    (rebased, 1u32, 0u32)
-                }
-            }
-        }
-        None => (src_gpu, 0u32, 0u32),
-    };
-    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(!group_charge()) << 2);
-    let constants = [kind, stride, records, args_offset, flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -1573,6 +1764,60 @@ void main() {
             let hits = unsafe { hits_ptr.cast::<u32>().read_volatile() };
             assert_eq!(hits, 5, "the scoped clamp must see the write before it (enhanced: {enhanced})");
         }
+    }
+
+    #[test]
+    fn warp_hoisted_clamps_run_ahead_into_their_own_places() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let (src, src_ptr, _) = warp.shared_buffer(64);
+        let (dst, dst_ptr, dst_gpu) = warp.shared_buffer(1024);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(64);
+        let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(64);
+        // Three dispatch records: two that run, one past what a dispatch
+        // runs (a window's unfilled slot: empty).
+        let records: [[u32; 3]; 3] = [[3, 1, 1], [4, 1, 1], [0x1_0000, 1, 1]];
+        // SAFETY: mappings of the sizes made.
+        unsafe {
+            for (i, r) in records.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(r.as_ptr(), src_ptr.cast::<u32>().add(i * 4), 3);
+            }
+            std::ptr::write_bytes(dst_ptr, 0xff, 1024);
+            std::ptr::write_bytes(budget_ptr, 0, 64);
+            std::ptr::write_bytes(hits_ptr, 0, 64);
+        }
+        let hoisted: Vec<Hoisted> = (0..3u64)
+            .map(|i| {
+                let dst_gpu = dst_gpu + 256 * i;
+                let (constants, src_gpu, count_gpu) =
+                    clamp_inputs((&src, 16 * i), None, (2, 12, 1), i == 2, dst_gpu, budget_gpu).unwrap();
+                Hoisted { constants, src_gpu, count_gpu, dst_gpu, budget: budget_gpu, records: 1 }
+            })
+            .collect();
+        // The prelude: its own submission ahead of the list.
+        // SAFETY: an open list; live buffers.
+        unsafe { record_hoisted_with(&warp.clamp, &warp.list, &hoisted, std::slice::from_ref(&dst)) };
+        warp.submit_and_wait();
+        let clamped: Vec<[u32; 3]> = (0..3)
+            // SAFETY: the run is over; inside the mapping.
+            .map(|i| unsafe { dst_ptr.add(i * 256).cast::<[u32; 3]>().read_volatile() })
+            .collect();
+        assert_eq!(clamped, [[3, 1, 1], [4, 1, 1], [0, 0, 0]]);
+        let signature = dispatch_signature(&warp.device);
+        // SAFETY: an open list; the clamped records for indirect reading.
+        unsafe {
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            for i in 0..3 {
+                warp.list.ExecuteIndirect(&signature, 1, &dst, 256 * i, None, 0);
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the run is over; a mapping of 64 bytes.
+        let hits = unsafe { hits_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(hits, 7, "each call reads its own hoisted place");
     }
 
     fn dispatch_signature(device: &ID3D12Device) -> ID3D12CommandSignature {

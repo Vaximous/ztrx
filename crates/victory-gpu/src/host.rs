@@ -744,6 +744,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Indirect calls' clamps recorded ahead of the list (`crate::indirect::hoist_clamps`).
+    hoist: Mutex<crate::indirect::Hoist>,
     /// Device-local chunks for constants the card copies out of title
     /// buffers' card copies (`crate::cardcopy::try_fill`): the chunks, the
     /// one in use and the bytes used of it; given back at the reset
@@ -2629,7 +2631,7 @@ fn fix_up_reads(runs: &[&HostList]) -> bool {
         let Some(shadow) = crate::shadow::find(src as u64, len as u64) else {
             return false;
         };
-        if shadow.left(src as u64) < len as u64 || shadow.in_place() || shadow.carded() {
+        if shadow.left(src as u64) < len as u64 {
             return false;
         }
         let Some((to, at)) = runs[l].scratch_place(dst) else {
@@ -3943,6 +3945,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                hoist: Mutex::default(),
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
@@ -6209,6 +6212,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.hoist().clear();
         #[cfg(feature = "diagnostics")]
         self.declared.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6543,7 +6547,8 @@ impl HostList {
         // Kept until the list is reset: run again, the list's fills (now
         // steps that do nothing) are made again here.
         let fixups = self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if barriers.is_empty() && syncs.is_empty() && fixups.is_empty() {
+        let (hoisted, hoisted_into) = self.hoist().to_record();
+        if barriers.is_empty() && syncs.is_empty() && fixups.is_empty() && hoisted.is_empty() {
             return None;
         }
         // The fills sent to the card ([`read_fixup`]): copies from the host
@@ -6586,6 +6591,7 @@ impl HostList {
                 if !readable.is_empty() {
                     list.ResourceBarrier(&readable);
                 }
+                crate::indirect::record_hoisted(list, &hoisted, &hoisted_into);
                 list.Close()
             })
         };
@@ -7009,6 +7015,11 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// The list's clamps recorded ahead of it (`crate::indirect::hoist_clamps`).
+    pub(crate) fn hoist(&self) -> std::sync::MutexGuard<'_, crate::indirect::Hoist> {
+        self.hoist.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps `object` alive until the list is reset.

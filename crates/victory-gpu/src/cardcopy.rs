@@ -31,8 +31,8 @@ pub(crate) fn on() -> bool {
 }
 
 /// The range learned when a read of `[src, src + len)` made a submission
-/// wait: the whole title buffer holding it (`VICTORY_CARD_LEARN_WHOLE`, on;
-/// `=0` the range read, as before). The title reads what flights wrote from
+/// wait: the range read (`VICTORY_CARD_LEARN_WHOLE=1`: the whole title
+/// buffer holding it; off by default). The title reads what flights wrote from
 /// another place of the same buffers every frame (ring buffers): learned
 /// by the range read, fills went on learning about 7 new sources a frame
 /// and waiting for each (run zall8cc: still 1.0 settle a frame, 55-69 ms),
@@ -45,13 +45,19 @@ pub(crate) fn on() -> bool {
 /// the whole buffer) learns the range read widened to blocks of that many
 /// KB, aligned in title memory and cut to the buffer: a ring buffer's next
 /// reads nearby are caught, the rest of a big buffer is not.
+///
+/// Off by default for speed: learned by the range read, frames ran 132-136
+/// ms (runs zall11lw, zall12lw0) against 185-190 ms learned whole (zall11a,
+/// zall11fb), one settle of about 64 ms a frame left. Learned narrowly,
+/// frame 2400 mostly shows blue blocks along its bottom edge (zall11blk,
+/// zall12lw0; zall11lw did not), not seen learned whole (zall9b).
 fn learned_range(src: usize, len: usize) -> (usize, usize) {
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let block = *BLOCK.get_or_init(|| {
         std::env::var("VICTORY_CARD_LEARN_BLOCK").ok().and_then(|v| v.parse::<usize>().ok()).map_or(0, |kb| kb << 10)
     });
-    let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_LEARN_WHOLE").is_none_or(|v| v != "0"));
+    let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_LEARN_WHOLE").is_some_and(|v| v == "1"));
     if (whole || block != 0)
         && let Some(copy) = crate::shadow::find(src as u64, len as u64)
     {

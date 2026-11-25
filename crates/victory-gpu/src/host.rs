@@ -7014,6 +7014,8 @@ impl HostList {
         // steps that do nothing) are made again here.
         let fixups = self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (hoisted, hoisted_into) = self.hoist().to_record();
+        let table_bytes = crate::indirect::merged_table_bytes(&hoisted);
+        let hoist_table = if table_bytes > 0 { self.hoist().table(table_bytes) } else { None };
         if barriers.is_empty() && syncs.is_empty() && fixups.is_empty() && hoisted.is_empty() {
             return None;
         }
@@ -7068,7 +7070,7 @@ impl HostList {
                 if !readable.is_empty() {
                     list.ResourceBarrier(&readable);
                 }
-                crate::indirect::record_hoisted(list, &hoisted, &hoisted_into);
+                crate::indirect::record_hoisted(list, &hoisted, &hoisted_into, hoist_table);
                 list.Close()
             })
         };
@@ -8550,6 +8552,15 @@ impl Meter {
                     .collect();
                 if !waits.is_empty() {
                     tracing::info!("waits for the submission lock per frame by the place asking: {}", waits.join(", "));
+                }
+                let [used, built, stale] = crate::descriptor::host::clear_templates();
+                if crate::descriptor::host::templates_on() {
+                    tracing::info!(
+                        "fresh tables per frame from templates: {:.0} copied, {:.0} templates made, {:.0} found stale (VICTORY_TABLE_TEMPLATES)",
+                        used as f64 / bind_frames,
+                        built as f64 / bind_frames,
+                        stale as f64 / bind_frames,
+                    );
                 }
                 let [passed, made] = crate::draw::take_readable_memo();
                 tracing::info!(

@@ -574,11 +574,16 @@ pub(crate) static BIND_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// slots mirrored (without their readable), fresh tables' keys hashed,
 /// fresh tables reused from earlier in the list (with their readable),
 /// fresh tables' host views made, their dynamic slots taken; and views
-/// decoded from title records (`crate::descriptor::view`, all callers).
-pub(crate) static BIND_PHASE_NS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+/// decoded from title records (`crate::descriptor::view`, all callers);
+/// then inside the tables: the views made readable (also in "views made
+/// readable"), fresh tables' constant buffer slots, the title's texture
+/// slots of fresh tables, templates made
+/// (`crate::descriptor::host::templates_on`), and the look for which
+/// tables are fresh.
+pub(crate) static BIND_PHASE_NS: [AtomicU64; 23] = [const { AtomicU64::new(0) }; 23];
 
 /// [`BIND_PHASE_NS`]'s phases.
-pub(crate) const BIND_PHASES: [&str; 18] = [
+pub(crate) const BIND_PHASES: [&str; 23] = [
     "heaps, root signature, pipeline",
     "store extents",
     "descriptor tables",
@@ -591,16 +596,21 @@ pub(crate) const BIND_PHASES: [&str; 18] = [
     "views made readable",
     "constant buffers filled",
     "host copies looked up",
-    "tables: title slots mirrored",
+    "tables: title slots looked up and mirrored",
     "tables: fresh keys hashed",
     "tables: fresh reused",
     "tables: fresh views made",
     "tables: dynamic slots taken",
     "views decoded",
+    "tables: readable (in the above)",
+    "tables: fresh constant slots",
+    "tables: title texture slots of fresh tables",
+    "tables: templates made",
+    "tables: fresh tables found",
 ];
 
 /// [`BIND_PHASE_NS`] since the last call.
-pub(crate) fn take_bind_phases() -> [u64; 18] {
+pub(crate) fn take_bind_phases() -> [u64; 23] {
     std::array::from_fn(|i| BIND_PHASE_NS[i].swap(0, Ordering::Relaxed))
 }
 
@@ -2460,6 +2470,7 @@ impl State {
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+        let looked = PhaseTimer::new(12);
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -2470,11 +2481,10 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        let mirrored = {
-            let _timer = PhaseTimer::new(12);
-            host.mirror(index, handle, true)
-        };
+        let mirrored = host.mirror(index, handle, true);
+        drop(looked);
         if let Some(view) = mirrored {
+            let _timer = PhaseTimer::new(18);
             readable(list, u.kind, &view, Some((u.slot, u.table_offset_dwords)));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2502,6 +2512,7 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let found = PhaseTimer::new(22);
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
@@ -2531,6 +2542,7 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        drop(found);
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
@@ -2538,6 +2550,7 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
+            let found = PhaseTimer::new(22);
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -2585,6 +2598,7 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            drop(found);
             // The table and what its entries hold (record words).
             let key = {
                 let _timer = PhaseTimer::new(13);
@@ -2652,13 +2666,39 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // Its views made once for every list, copied in at once
+            // (`crate::descriptor::host::templates_on`).
+            let templates = crate::descriptor::host::templates_on();
+            let template = templates
+                .then(|| {
+                    let _timer = PhaseTimer::new(15);
+                    crate::descriptor::host::template(key)
+                        .filter(|t| t.slots.len() == n as usize && host.copy_template(t, first))
+                })
+                .flatten();
+            let mut views: Vec<Option<View>> = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let (view, kept) = match template.as_ref().map(|t| &t.slots[k as usize]) {
+                    Some(crate::descriptor::host::TemplateSlot::Constant(address, size)) => {
+                        (Some(View::Constant(*address, *size)), None)
+                    }
+                    Some(crate::descriptor::host::TemplateSlot::View(view, _, kept)) => (Some(view.clone()), Some(kept.clone())),
+                    Some(crate::descriptor::host::TemplateSlot::Null) => (None, Some(None)),
+                    None => {
+                        let view = crate::descriptor::view(table + u64::from(k) * 32);
+                        if templates {
+                            views.push(view.clone());
+                        }
+                        (view, None)
+                    }
+                };
+                match view {
                     Some(View::Constant(address, size)) => {
+                        let _constants = PhaseTimer::new(19);
                         let _timer = PhaseTimer::new(10);
                         crate::skip::note_constant(list, address, u64::from(size));
                         constants.push((address, u64::from(size)));
@@ -2680,12 +2720,16 @@ impl State {
                     Some(view) => {
                         {
                             let _timer = PhaseTimer::new(15);
-                            host.make_at(index, &view);
+                            match kept {
+                                Some(kept) => host.keep_at(index, kept),
+                                None => host.make_at(index, &view),
+                            }
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            let _timer = PhaseTimer::new(18);
                             readable(list, kind, &view, Some((slot, k * 8)));
                         }
                         // The title's slot is a table's: out of the queue
@@ -2696,6 +2740,7 @@ impl State {
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
+                            let _timer = PhaseTimer::new(20);
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
@@ -2703,12 +2748,19 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        match kept {
+                            Some(_) => host.keep_at(index, None),
+                            None => host.make_null(index),
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
+            }
+            if templates && template.is_none() && views.len() == n as usize {
+                let _timer = PhaseTimer::new(21);
+                crate::descriptor::host::make_template(key, &views);
             }
             self.fresh_tables.insert(key, (first, constants));
             made.push((slot, first * 32));

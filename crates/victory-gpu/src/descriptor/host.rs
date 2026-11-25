@@ -2270,6 +2270,235 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Whether fresh descriptor tables (`crate::draw`'s tables holding constant
+/// buffers, made afresh per list) are made from a template kept across
+/// lists: the table's views made once in memory of our own that shaders do
+/// not see, copied into the list's dynamic slots with one
+/// `CopyDescriptorsSimple`, and only the constant buffer slots written
+/// again (their data is the list's own). A template is used only while each
+/// of its views would still show the same host object (a texture's host
+/// copy, a buffer's host copy: [`host_identity`]); the key is the table's
+/// record words, which change with the views. Templates hold their host
+/// objects, so they are all let go at each frame-rate line
+/// ([`clear_templates`]) for the sweeps that let idle copies go.
+/// zall19d: "fresh views made" 62 ms a frame over the threads.
+/// `VICTORY_TABLE_TEMPLATES=1` (off by default until a run shows it).
+pub(crate) fn templates_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_TEMPLATES").is_some_and(|v| v == "1"))
+}
+
+/// A slot of a [`Template`].
+pub(crate) enum TemplateSlot {
+    /// A constant buffer view (address, bytes): written per list.
+    Constant(u64, u32),
+    /// A view; the host object it showed when made ([`host_identity`]), and
+    /// what the slot holds ([`make`]'s).
+    View(View, Option<ID3D12Resource>, Option<ID3D12Resource>),
+    /// No view: a null one.
+    Null,
+}
+
+/// A fresh table's views, made once ([`templates_on`]).
+pub(crate) struct Template {
+    epoch: u64,
+    base: u32,
+    pub(crate) slots: Vec<TemplateSlot>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Template {}
+unsafe impl Sync for Template {}
+
+/// Templates by (table, slots, hash of its record words): in a heap of our
+/// own that shaders do not see, filled from its start; when full, every
+/// template goes and it is filled again (`epoch` counts the times).
+struct Templates {
+    heap: Option<(ID3D12DescriptorHeap, usize, u32)>,
+    next: u32,
+    epoch: u64,
+    map: std::collections::BTreeMap<(u64, u32, u64), std::sync::Arc<Template>>,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Templates {}
+
+static TEMPLATES: Mutex<Templates> =
+    Mutex::new(Templates { heap: None, next: 0, epoch: 0, map: std::collections::BTreeMap::new() });
+
+/// Slots of the templates' heap.
+const TEMPLATE_SLOTS: u32 = 1 << 16;
+
+/// Templates used, made, and found stale, since the last frame-rate line
+/// ([`clear_templates`]).
+static TEMPLATE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The template of a table, if one is kept and its views still show the
+/// same host objects.
+pub(crate) fn template(key: (u64, u32, u64)) -> Option<std::sync::Arc<Template>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = TEMPLATES.lock().unwrap_or_else(|e| e.into_inner()).map.get(&key).cloned()?;
+    let same = t.slots.iter().all(|slot| match slot {
+        TemplateSlot::View(view, shown, _) => {
+            let now = host_identity(view);
+            now.as_ref().map(windows::core::Interface::as_raw) == shown.as_ref().map(windows::core::Interface::as_raw)
+        }
+        _ => true,
+    });
+    if !same {
+        TEMPLATE_STATS[2].fetch_add(1, Relaxed);
+        TEMPLATES.lock().unwrap_or_else(|e| e.into_inner()).map.remove(&key);
+        return None;
+    }
+    Some(t)
+}
+
+/// Makes and keeps the template of a table whose slots are `views` (the
+/// table's record decoded, one per slot).
+pub(crate) fn make_template(key: (u64, u32, u64), views: &[Option<View>]) {
+    let n = views.len() as u32;
+    if n == 0 || n > TEMPLATE_SLOTS {
+        return;
+    }
+    let mut t = TEMPLATES.lock().unwrap_or_else(|e| e.into_inner());
+    if t.heap.is_none() {
+        let Some(host) = host() else { return };
+        // SAFETY: plain object creation.
+        let heap: Option<ID3D12DescriptorHeap> = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: TEMPLATE_SLOTS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .ok()
+        };
+        let Some(heap) = heap else { return };
+        // SAFETY: a live heap and device.
+        let (cpu, step) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            )
+        };
+        t.heap = Some((heap, cpu, step));
+    }
+    if t.next + n > TEMPLATE_SLOTS {
+        t.map.clear();
+        t.next = 0;
+        t.epoch += 1;
+    }
+    let Some((_, cpu, step)) = t.heap.as_ref().map(|(h, c, s)| (h.clone(), *c, *s)) else {
+        return;
+    };
+    let base = t.next;
+    t.next += n;
+    let at = |k: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (base + k) as usize * step as usize };
+    let slots = views
+        .iter()
+        .enumerate()
+        .map(|(k, view)| match view {
+            Some(View::Constant(address, size)) => {
+                null_view(at(k as u32));
+                TemplateSlot::Constant(*address, *size)
+            }
+            Some(view) => {
+                let shown = host_identity(view);
+                let kept = make(view, at(k as u32));
+                if kept.is_none() {
+                    null_for(view, at(k as u32));
+                }
+                TemplateSlot::View(view.clone(), shown, kept.flatten())
+            }
+            None => {
+                null_view(at(k as u32));
+                TemplateSlot::Null
+            }
+        })
+        .collect();
+    let epoch = t.epoch;
+    t.map.insert(key, std::sync::Arc::new(Template { epoch, base, slots }));
+    TEMPLATE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every template goes (they hold host objects the sweeps may let go);
+/// returns the templates used, made and found stale since the last call.
+pub(crate) fn clear_templates() -> [u64; 3] {
+    let mut t = TEMPLATES.lock().unwrap_or_else(|e| e.into_inner());
+    if !t.map.is_empty() {
+        t.map.clear();
+        t.next = 0;
+        t.epoch += 1;
+    }
+    std::array::from_fn(|i| TEMPLATE_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The host object [`make`] would show for `view` (a texture's host copy
+/// or its twin, a buffer's host copy), without making anything: a
+/// template's view is used again only while this is the same.
+fn host_identity(view: &View) -> Option<ID3D12Resource> {
+    let buffer = |address: u64, len: u64| crate::shadow::find(address, len).map(|s| s.buffer.clone());
+    match view {
+        View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_) => None,
+        View::Shader(resource, _) => {
+            let resource = *resource as crate::object::This;
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                return Some(texture.clone());
+            }
+            let (data, len) = crate::resource::buffer_bytes(resource)?;
+            buffer(data as u64, len)
+        }
+        View::Unordered(resource, _, _) => {
+            let resource = *resource as crate::object::This;
+            if let Some(twin) = crate::resource::twin_resource(resource).or_else(|| crate::resource::twin_plane_resource(resource)) {
+                return Some(twin.clone());
+            }
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                return Some(texture.clone());
+            }
+            let (data, len) = crate::resource::buffer_bytes(resource)?;
+            buffer(data as u64, len)
+        }
+        View::Placed(_, resource, desc) => {
+            if let Some(view) = placed_texture(view) {
+                return host_identity(&view);
+            }
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            buffer(address, len)
+        }
+    }
+}
+
+impl HostHeap {
+    /// Copies template `t` into the dynamic slots from `first` on: whether
+    /// it was still there to copy.
+    pub(crate) fn copy_template(&self, t: &Template, first: u32) -> bool {
+        let n = t.slots.len() as u32;
+        let templates = TEMPLATES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, cpu, step)) = templates.heap.as_ref() else {
+            return false;
+        };
+        if templates.epoch != t.epoch {
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let src = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + t.base as usize * *step as usize };
+        // SAFETY: slots of our heaps: the template's (kept until the epoch
+        // moves, which needs this lock) and the dynamic ones taken.
+        unsafe { host.device.CopyDescriptorsSimple(n, self.cpu(first), src, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        drop(templates);
+        TEMPLATE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Slot `index` (a dynamic one, made by a copy) holds `resource`.
+    pub(crate) fn keep_at(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep(index, resource);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

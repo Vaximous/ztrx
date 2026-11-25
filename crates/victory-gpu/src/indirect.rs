@@ -258,6 +258,8 @@ struct Clamp {
     /// The clamp as a draw of points ([`clamp_draws`]): no targets, no
     /// pixel program. `None` if it did not compile.
     draw: Option<ID3D12PipelineState>,
+    /// Many clamps in one pass ([`merged_source`]).
+    merged: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
 }
 
 /// Whether the clamp before an indirect draw (not a dispatch) is a draw of
@@ -307,7 +309,7 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let (root, pso) = make_stage(device, s!("main"), s!("cs_5_1"), |root, bytes| {
+    let (root, pso) = make_stage(device, SOURCE, s!("main"), s!("cs_5_1"), |root, bytes| {
         // SAFETY: the description points at live data and never releases
         // its pointer to the root signature.
         unsafe {
@@ -321,7 +323,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             })
         }
     })?;
-    let draw = make_stage(device, s!("vertex"), s!("vs_5_1"), |root, bytes| {
+    let draw = make_stage(device, SOURCE, s!("vertex"), s!("vs_5_1"), |root, bytes| {
         // SAFETY: as above.
         unsafe {
             device.CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
@@ -346,13 +348,139 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     if let Err(e) = &draw {
         tracing::warn!(error = %e, "no argument clamp as a draw: compute passes only");
     }
-    Ok(Clamp { root, pso, draw: draw.ok().map(|(_, pso)| pso) })
+    let merged = make_stage(device, &merged_source(), s!("main"), s!("cs_5_1"), |root, bytes| {
+        // SAFETY: as above.
+        unsafe {
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+        }
+    });
+    if let Err(e) = &merged {
+        tracing::warn!(error = %e, "no merged argument clamp: one pass a clamp");
+    }
+    Ok(Clamp { root, pso, draw: draw.ok().map(|(_, pso)| pso), merged: merged.ok() })
 }
+
+/// [`SOURCE`]'s compute pass over many clamps at once ([`clamp_merge`]):
+/// the record words become per-thread values read from a table of clamps
+/// (`jobs` entries of 8 words: kind, stride, records, records' offset,
+/// flags, count's offset, destination's offset, first group), whose
+/// buffers are one source, one count, one destination and the budget.
+/// A group clamps up to 64 records of one clamp, charged to the budget as
+/// [`SOURCE`]'s groups are.
+fn merged_source() -> String {
+    let start = SOURCE.find("ByteAddressBuffer src_args").expect("the clamp's buffers");
+    let end = SOURCE.find("// The same as a draw of one point").expect("the clamp's vertex program");
+    let body = SOURCE[start..end]
+        .replace("r.dst_at = i * stride;", "r.dst_at = dst_offset + i * stride;")
+        .replace(
+            "void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {",
+            "void main(uint3 gid : SV_GroupID, uint at : SV_GroupIndex) {
+    uint g = gid.y * 65535u + gid.x;
+    if (g >= group_count) {
+        return;
+    }
+    // The clamp whose groups hold `g`: the last one starting at or before it.
+    uint lo = 0;
+    uint hi = jobs;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (table.Load(mid * 32u + 28u) <= g) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    uint4 a = table.Load4(lo * 32u);
+    uint4 b = table.Load4(lo * 32u + 16u);
+    kind = a.x;
+    stride = a.y;
+    records = a.z;
+    args_offset = a.w;
+    has_count = b.x;
+    count_offset = b.y;
+    dst_offset = b.z;
+    uint3 id = uint3((g - b.w) * 64u + at, 0u, 0u);",
+        );
+    format!(
+        "#define RS \"RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1), SRV(t2)\"
+cbuffer Jobs : register(b0) {{
+    uint jobs;
+    uint group_count;
+}};
+ByteAddressBuffer table : register(t2);
+static uint kind;
+static uint stride;
+static uint records;
+static uint args_offset;
+static uint has_count;
+static uint count_offset;
+static uint dst_offset;
+{body}"
+    )
+}
+
+/// Whether a list's hoisted clamps ([`hoist_clamps`]) that share their
+/// buffers run as one pass ([`merged_source`]) instead of one pass each
+/// (`VICTORY_CLAMP_MERGE=1`; off by default until a run shows it).
+fn clamp_merge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// Bytes of a merged clamp's table entry ([`merged_source`]).
+const JOB: u64 = 32;
+
+/// The table bytes [`record_hoisted`] needs for `clamps` merged, if
+/// [`clamp_merge`]: none without.
+pub(crate) fn merged_table_bytes(clamps: &[Hoisted]) -> u64 {
+    if clamp_merge() && clamps.len() > 1 { clamps.len() as u64 * JOB } else { 0 }
+}
+
+/// `clamps` in runs that one merged pass can clamp: the same source,
+/// count, destination buffers and budget, offsets within 4 GiB of their
+/// buffers, in order within each run. Each run: its clamps' places in
+/// `clamps`, and its table entries.
+fn merged_runs(clamps: &[Hoisted]) -> Vec<(Vec<usize>, Vec<[u32; 8]>)> {
+    let mut runs: Vec<((u64, u64, u64, u64), Vec<usize>, Vec<[u32; 8]>, u32)> = Vec::new();
+    for (i, h) in clamps.iter().enumerate() {
+        let src = (h.src_gpu + u64::from(h.constants[3])).checked_sub(h.src_base);
+        let count = (h.count_gpu + u64::from(h.constants[5])).checked_sub(h.count_base);
+        let dst = h.dst_gpu.checked_sub(h.dst_base);
+        let fits = |v: Option<u64>| v.and_then(|v| u32::try_from(v).ok());
+        let (Some(src), Some(count), Some(dst)) = (fits(src), fits(count), fits(dst)) else {
+            runs.push(((u64::MAX, i as u64, 0, 0), vec![i], Vec::new(), 0));
+            continue;
+        };
+        let key = (h.src_base, h.count_base, h.dst_base, h.budget);
+        let at = match runs.iter().position(|r| r.0 == key) {
+            Some(at) => at,
+            None => {
+                runs.push((key, Vec::new(), Vec::new(), 0));
+                runs.len() - 1
+            }
+        };
+        let run = &mut runs[at];
+        let c = h.constants;
+        run.2.push([c[0], c[1], c[2], src, c[4], count, dst, run.3]);
+        run.3 += h.records.div_ceil(64);
+        run.1.push(i);
+    }
+    runs.into_iter().map(|(_, places, entries, _)| (places, entries)).collect()
+}
+
 
 /// The clamp's `entry` compiled for `target`, its root signature and the
 /// pipeline `make` makes of them.
 fn make_stage(
     device: &ID3D12Device,
+    source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
     make: impl FnOnce(&ID3D12RootSignature, &[u8]) -> windows::core::Result<ID3D12PipelineState>,
@@ -362,8 +490,8 @@ fn make_stage(
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -623,6 +751,11 @@ pub(crate) struct Hoisted {
     dst_gpu: u64,
     budget: u64,
     records: u32,
+    /// The start of the source's, the count's and the destination's
+    /// buffers ([`merged_runs`]).
+    src_base: u64,
+    count_base: u64,
+    dst_base: u64,
 }
 
 /// A list's clamps recorded ahead of it ([`hoist_clamps`]) and the buffer
@@ -635,7 +768,13 @@ pub(crate) struct Hoist {
     /// The buffers written since the reset (the last is `buffer`'s).
     written: Vec<ID3D12Resource>,
     clamps: Vec<Hoisted>,
+    /// Merged clamps' tables ([`clamp_merge`]): upload memory, its
+    /// mapping and bytes, kept over resets.
+    table: Option<(ID3D12Resource, usize, u64)>,
 }
+
+// SAFETY: the mapping is a persistent one of upload memory the list holds.
+unsafe impl Send for Hoist {}
 
 impl Hoist {
     /// Room for `bytes` of clamped records: the buffer and the place. A
@@ -660,6 +799,20 @@ impl Hoist {
         self.used = bytes;
         self.written.push(buffer.clone());
         Some((buffer, 0, old))
+    }
+
+    /// Upload memory for `bytes` of merged clamps' tables (the list's
+    /// prelude is not running): its GPU address and mapping.
+    pub(crate) fn table(&mut self, bytes: u64) -> Option<(u64, *mut u8)> {
+        if !self.table.as_ref().is_some_and(|t| t.2 >= bytes) {
+            let size = bytes.next_power_of_two().max(4 << 10);
+            let (buffer, data) = host()?.upload_buffer(size)?;
+            // (A table outgrown was read by a run that is over.)
+            self.table = Some((buffer, data as usize, size));
+        }
+        let (buffer, data, _) = self.table.as_ref()?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() }, *data as *mut u8))
     }
 
     /// The list was reset: its clamps are gone (the buffer is kept).
@@ -703,7 +856,25 @@ pub(crate) fn hoisted(
     let (constants, src_gpu, count_gpu) = clamp_inputs(src, count, spec, ahead, dst_gpu, budget)?;
     #[cfg(feature = "diagnostics")]
     list.note_op(|| clamp_note("clamp-hoisted", spec, false));
-    list.hoist().clamps.push(Hoisted { constants, src_gpu, count_gpu, dst_gpu, budget, records: spec.2 });
+    // SAFETY: live buffers.
+    let (src_base, count_base, dst_base) = unsafe {
+        (
+            src.0.GetGPUVirtualAddress(),
+            count.map_or(src_gpu, |(c, _)| c.GetGPUVirtualAddress()),
+            buffer.GetGPUVirtualAddress(),
+        )
+    };
+    list.hoist().clamps.push(Hoisted {
+        constants,
+        src_gpu,
+        count_gpu,
+        dst_gpu,
+        budget,
+        records: spec.2,
+        src_base,
+        count_base,
+        dst_base,
+    });
     HOISTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some((buffer, at))
 }
@@ -717,6 +888,12 @@ pub(crate) fn hoist_line(frames: f64) {
     if hoist_clamps() != 0 {
         let hoisted = HOISTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
         tracing::info!("indirect clamps hoisted ahead of their lists per frame: {hoisted:.1} (VICTORY_HOIST_CLAMPS)");
+        if clamp_merge() {
+            let [alone, merged] = [0, 1].map(|i| MERGE_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "hoisted clamps per frame: {merged:.1} merged into shared passes, {alone:.1} in passes of their own (VICTORY_CLAMP_MERGE)"
+            );
+        }
     }
 }
 
@@ -728,21 +905,65 @@ pub(crate) fn hoist_line(frames: f64) {
 ///
 /// # Safety
 /// An open list; live buffers (the list holds them until its reset).
-pub(crate) unsafe fn record_hoisted(l: &ID3D12GraphicsCommandList, clamps: &[Hoisted], buffers: &[ID3D12Resource]) {
+/// `table`: upload memory of [`merged_table_bytes`] for merged clamps
+/// ([`clamp_merge`]; GPU address and mapping), not read by a run still
+/// going.
+pub(crate) unsafe fn record_hoisted(
+    l: &ID3D12GraphicsCommandList,
+    clamps: &[Hoisted],
+    buffers: &[ID3D12Resource],
+    table: Option<(u64, *mut u8)>,
+) {
     if let Some(c) = clamp() {
         // SAFETY: the caller's.
-        unsafe { record_hoisted_with(c, l, clamps, buffers) };
+        unsafe { record_hoisted_with(c, l, clamps, buffers, table) };
     }
 }
+
+/// Clamps run as passes of their own, and merged ([`clamp_merge`]): since
+/// the last look ([`hoist_line`]).
+static MERGE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// [`record_hoisted`] with clamp `c`.
 ///
 /// # Safety
 /// As [`record_hoisted`].
-unsafe fn record_hoisted_with(c: &Clamp, l: &ID3D12GraphicsCommandList, clamps: &[Hoisted], buffers: &[ID3D12Resource]) {
+unsafe fn record_hoisted_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    clamps: &[Hoisted],
+    buffers: &[ID3D12Resource],
+    table: Option<(u64, *mut u8)>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
     if clamps.is_empty() {
         return;
     }
+    // The runs merged and the clamps left to passes of their own.
+    let mut merged: Vec<(u64, u64, u64, u64, u64, u32, u32)> = Vec::new();
+    let mut alone: Vec<&Hoisted> = Vec::new();
+    match (table, c.merged.as_ref()) {
+        (Some((table_gpu, table_ptr)), Some(_)) => {
+            let mut at = 0u64;
+            for (places, entries) in merged_runs(clamps) {
+                let h = &clamps[places[0]];
+                if entries.len() < 2 {
+                    alone.extend(places.iter().map(|&i| &clamps[i]));
+                    continue;
+                }
+                let groups: u32 = places.iter().map(|&i| clamps[i].records.div_ceil(64)).sum();
+                // SAFETY: the caller's table holds a entry for each clamp.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), table_ptr.add(at as usize), entries.len() * JOB as usize);
+                }
+                merged.push((table_gpu + at, h.src_base, h.count_base, h.dst_base, h.budget, entries.len() as u32, groups));
+                at += entries.len() as u64 * JOB;
+            }
+        }
+        _ => alone.extend(clamps),
+    }
+    MERGE_STATS[0].fetch_add(alone.len() as u64, Relaxed);
+    MERGE_STATS[1].fetch_add((clamps.len() - alone.len()) as u64, Relaxed);
     let mut first = vec![uav_barrier()];
     first.extend(buffers.iter().map(|b| transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)));
     let mut last = vec![uav_barrier()];
@@ -754,15 +975,30 @@ unsafe fn record_hoisted_with(c: &Clamp, l: &ID3D12GraphicsCommandList, clamps: 
     // SAFETY: the caller's; our root signature and pipeline.
     unsafe {
         l.ResourceBarrier(&first);
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
-        for h in clamps {
+        if !alone.is_empty() {
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+        }
+        for h in alone {
             l.SetComputeRoot32BitConstants(0, 6, h.constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, h.src_gpu);
             l.SetComputeRootShaderResourceView(2, h.count_gpu);
             l.SetComputeRootUnorderedAccessView(3, h.dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, h.budget);
             l.Dispatch(h.records.div_ceil(64), 1, 1);
+        }
+        if let (Some((root, pso)), false) = (c.merged.as_ref(), merged.is_empty()) {
+            l.SetComputeRootSignature(root);
+            l.SetPipelineState(pso);
+            for (table, src, count, dst, budget, jobs, groups) in merged {
+                l.SetComputeRoot32BitConstants(0, 2, [jobs, groups].as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src);
+                l.SetComputeRootShaderResourceView(2, count);
+                l.SetComputeRootUnorderedAccessView(3, dst);
+                l.SetComputeRootUnorderedAccessView(4, budget);
+                l.SetComputeRootShaderResourceView(5, table);
+                l.Dispatch(groups.min(65535), groups.div_ceil(65535), 1);
+            }
         }
         l.ResourceBarrier(&last);
     }
@@ -1321,7 +1557,7 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso, draw: None })
+            Ok(Clamp { root, pso, draw: None, merged: None })
         }
     }
 
@@ -1802,6 +2038,80 @@ void main() {
     }
 
     #[test]
+    fn warp_merged_clamps_match_their_own_passes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        assert!(warp.clamp.merged.is_some(), "the merged clamp must compile on WARP");
+        // Four clamps of dispatch records from one source: 70 records (two
+        // groups), 1, 3 (one a window slot not filled), and 130 bounded by
+        // a count of 100. Each run alone, then all merged; the same records.
+        const SRC: usize = 4096;
+        let (src, src_ptr, _) = warp.shared_buffer(SRC as u64);
+        let (count, count_ptr, _) = warp.shared_buffer(64);
+        let specs: [(u64, u32, bool, bool); 4] = [(0, 70, false, false), (1024, 1, false, false), (1040, 3, true, false), (1088, 130, false, true)];
+        // SAFETY: mappings of the sizes made.
+        unsafe {
+            let words = src_ptr.cast::<u32>();
+            for i in 0..SRC / 12 {
+                let r = [(i as u32 * 7) % 70_000, 1 + (i as u32 % 3), 1];
+                std::ptr::copy_nonoverlapping(r.as_ptr(), words.add(i * 3), 3);
+            }
+            count_ptr.cast::<u32>().write(100);
+        }
+        let mut results: Vec<Vec<[u32; 3]>> = Vec::new();
+        for merge in [false, true] {
+            let (dst, dst_ptr, dst_gpu) = warp.shared_buffer(8192);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(64);
+            // SAFETY: mappings of the sizes made.
+            unsafe {
+                std::ptr::write_bytes(dst_ptr, 0xee, 8192);
+                std::ptr::write_bytes(budget_ptr, 0, 64);
+            }
+            let mut at = 0u64;
+            let hoisted: Vec<Hoisted> = specs
+                .iter()
+                .map(|&(offset, records, ahead, counted)| {
+                    let place = dst_gpu + at;
+                    at += (u64::from(records) * 12).next_multiple_of(256);
+                    let bound = counted.then_some((&count, 0u64));
+                    let (constants, src_gpu, count_gpu) =
+                        clamp_inputs((&src, offset), bound, (2, 12, records), ahead, place, budget_gpu).unwrap();
+                    // SAFETY: live buffers.
+                    let (src_base, count_base) = unsafe {
+                        (src.GetGPUVirtualAddress(), if counted { count.GetGPUVirtualAddress() } else { src_gpu })
+                    };
+                    Hoisted { constants, src_gpu, count_gpu, dst_gpu: place, budget: budget_gpu, records, src_base, count_base, dst_base: dst_gpu }
+                })
+                .collect();
+            let (_table, table_ptr, table_gpu) = warp.shared_buffer(4096);
+            let table = merge.then_some((table_gpu, table_ptr));
+            if merge {
+                // Two runs: the counted clamp reads another count buffer.
+                let runs = merged_runs(&hoisted);
+                assert_eq!(runs.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), vec![vec![0, 1, 2], vec![3]]);
+            }
+            // SAFETY: an open list; live buffers.
+            unsafe { record_hoisted_with(&warp.clamp, &warp.list, &hoisted, std::slice::from_ref(&dst), table) };
+            warp.submit_and_wait();
+            let mut at = 0usize;
+            let mut out = Vec::new();
+            for &(_, records, _, _) in &specs {
+                for r in 0..records as usize {
+                    // SAFETY: the run is over; inside the mapping.
+                    out.push(unsafe { dst_ptr.add(at + r * 12).cast::<[u32; 3]>().read_volatile() });
+                }
+                at += (records as usize * 12).next_multiple_of(256);
+            }
+            results.push(out);
+        }
+        assert_eq!(results[0], results[1]);
+        // The counted clamp's records past the count are left as they were.
+        assert_eq!(results[0][70 + 1 + 3 + 100], [0xeeee_eeee; 3]);
+        assert_ne!(results[0][0], [0xeeee_eeee; 3]);
+    }
+
+    #[test]
     fn warp_hoisted_clamps_run_ahead_into_their_own_places() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
@@ -1827,12 +2137,22 @@ void main() {
                 let dst_gpu = dst_gpu + 256 * i;
                 let (constants, src_gpu, count_gpu) =
                     clamp_inputs((&src, 16 * i), None, (2, 12, 1), i == 2, dst_gpu, budget_gpu).unwrap();
-                Hoisted { constants, src_gpu, count_gpu, dst_gpu, budget: budget_gpu, records: 1 }
+                Hoisted {
+                    constants,
+                    src_gpu,
+                    count_gpu,
+                    dst_gpu,
+                    budget: budget_gpu,
+                    records: 1,
+                    src_base: src_gpu,
+                    count_base: count_gpu,
+                    dst_base: dst_gpu - 256 * i,
+                }
             })
             .collect();
         // The prelude: its own submission ahead of the list.
         // SAFETY: an open list; live buffers.
-        unsafe { record_hoisted_with(&warp.clamp, &warp.list, &hoisted, std::slice::from_ref(&dst)) };
+        unsafe { record_hoisted_with(&warp.clamp, &warp.list, &hoisted, std::slice::from_ref(&dst), None) };
         warp.submit_and_wait();
         let clamped: Vec<[u32; 3]> = (0..3)
             // SAFETY: the run is over; inside the mapping.

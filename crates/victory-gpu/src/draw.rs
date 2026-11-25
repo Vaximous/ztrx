@@ -25,7 +25,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 enum Root {
     #[default]
     None,
@@ -605,15 +605,20 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let Some(shadow) = crate::shadow::find(address, 1) else {
+        crate::skip::note_bad("a root view of memory without a host copy");
+        return None;
+    };
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
+        crate::skip::note_buffer(&shadow, address, len, false);
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    crate::skip::note_constant(list, address, len);
     if let Some(gpu) = crate::cardcopy::try_fill(list, address, len) {
         return Some(gpu);
     }
@@ -1024,6 +1029,7 @@ impl State {
     /// ([`crate::memory`]): its directory, fault notes and view slots,
     /// with the pages of the root views the list has set made ready.
     fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+        crate::skip::note_bad("reads title memory by address");
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
@@ -1425,6 +1431,7 @@ impl State {
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
+            crate::skip::note_buffer(s, a, len, true);
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len, crate::shadow::Declarer::Root);
@@ -1571,6 +1578,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
+            crate::skip::note_buffer(s, *a, s.left(*a), false);
             s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
@@ -1597,6 +1605,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        crate::skip::note_bad("picks buffers from the view heap by index");
         let heap = self
             .heaps
             .iter()
@@ -2041,8 +2050,15 @@ impl State {
         if check {
             CHECK_VIEWS.with_borrow_mut(|v| *v = Some(Vec::new()));
         }
+        // Followed for `VICTORY_DISPATCH_SKIP`: what it binds, gathered.
+        let shader = p.stages.first().map_or("", |s| s.shader.hash.as_str());
+        let follow = !check && crate::skip::wanted(shader);
+        if follow {
+            crate::skip::start();
+        }
         GROUPS.set(Some([x, y, z]));
         let mut bound = self.bind(list, p, true);
+        let collected = crate::skip::take();
         let views = CHECK_VIEWS.with_borrow_mut(Option::take).unwrap_or_default();
         // Checked: the views' bytes hashed before and after, around the
         // dispatch bound again.
@@ -2052,7 +2068,26 @@ impl State {
         } else {
             None
         };
-        if pending.is_some() {
+        // Followed: the bytes it binds hashed and its groups chosen on the
+        // card, around the dispatch bound again.
+        let plan = match collected {
+            Some(c) if bound => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (self.pipeline, p.pso.as_raw() as usize, [x, y, z]).hash(&mut h);
+                // Root constants; tables and views by what they hold (the
+                // views' addresses are in the gathered key), not where.
+                for root in &self.compute {
+                    match root {
+                        Root::Constants(v) => v.hash(&mut h),
+                        other => std::mem::discriminant(other).hash(&mut h),
+                    }
+                }
+                crate::skip::before(list, c, h.finish(), [x, y, z], shader)
+            }
+            _ => None,
+        };
+        if pending.is_some() || plan.is_some() {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
             bound = self.bind(list, p, true);
@@ -2069,12 +2104,31 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        const DISPATCH: u32 = 2;
+        let direct = crate::skip::trying(1) && crate::skip::mode() == crate::skip::Mode::Check;
+        let indirect = plan
+            .as_ref()
+            .filter(|_| !direct)
+            .and_then(|plan| Some((plan.arguments(), host_signature(DISPATCH, 12)?)));
+        // SAFETY: an open list with everything set; the arguments' buffer is
+        // kept by the list.
+        unsafe {
+            match indirect {
+                Some(((arguments, at), signature)) => {
+                    list.list.ExecuteIndirect(&signature, 1, arguments, at, None, 0);
+                }
+                None => list.list.Dispatch(x, y, z),
+            }
+        }
         list.wrote();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(pending) = pending {
             crate::extent::check_after(list, pending);
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+        if let Some(plan) = plan {
+            crate::skip::after(list, plan);
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
@@ -2343,6 +2397,13 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                // Its constant buffers as the table made first holds them
+                // (the whole range, as there).
+                for k in 0..n {
+                    if let Some(View::Constant(address, size)) = crate::descriptor::view(table + u64::from(k) * 32) {
+                        crate::skip::note_constant(list, address, u64::from(size));
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2382,6 +2443,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        crate::skip::note_constant(list, address, u64::from(size));
                         if let Some(gpu) = constant_in_card_copy(list, address, size)
                             .or_else(|| crate::cardcopy::try_fill(list, address, u64::from(size)))
                         {
@@ -3065,7 +3127,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let copy = crate::descriptor::host::buffer_copy(view);
+    if copy.is_none() {
+        crate::skip::note_bad("a texture, or a view of a buffer without a host copy");
+    }
+    if let Some((shadow, address, len)) = copy {
+        crate::skip::note_buffer(&shadow, address, len, kind == ResourceType::Uav);
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

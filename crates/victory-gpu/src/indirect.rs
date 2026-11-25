@@ -199,6 +199,18 @@ void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {
     uint before = group_before >= BUDGET || BUDGET - group_before <= ahead ? BUDGET : group_before + ahead;
     store(r, past(before, r.cost));
 }
+// The same as a draw of one point a record ([`clamp_draws`]): the point
+// lies outside the view, so nothing reaches the targets. Each record is
+// charged on its own (no group memory in a vertex program): only for
+// calls of one record.
+[RootSignature(RS)]
+float4 vertex(uint i : SV_VertexID) : SV_Position {
+    Rec r = measure(i);
+    if (r.live) {
+        store(r, past(r.cost > 0 ? charge(r.cost) : 0, r.cost));
+    }
+    return float4(2.0, 2.0, 0.5, 1.0);
+}
 "#;
 
 /// Whether the records clamped by one group of the compute pass are
@@ -229,7 +241,32 @@ pub(crate) const MAX_DISPATCH_GROUPS: u32 = 1 << 20;
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The clamp as a draw of points ([`clamp_draws`]): no targets, no
+    /// pixel program. `None` if it did not compile.
+    draw: Option<ID3D12PipelineState>,
 }
+
+/// Whether the clamp before an indirect draw (not a dispatch) is a draw of
+/// one point a record, outside the view, whose vertex program clamps the
+/// record (`VICTORY_CLAMP_DRAW=1`; off by default). The compute pass before
+/// every indirect draw switched the card from drawing to compute and back:
+/// about 10 microseconds a clamp on the 4070 Ti against about 5 as a draw
+/// (`bare_cost`, batches (k) and (l)). The targets are unbound around the
+/// points (the pipeline names none), and the caller binds its own again
+/// ([`clamped_as_draw`]).
+fn clamp_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_DRAW").is_some_and(|v| v == "1"))
+}
+
+/// Whether the clamp of `records` of `kind` is recorded as a draw
+/// (of one record only: the vertex program charges each record alone)
+/// ([`clamp_draws`]): then the list's graphics root signature, pipeline,
+/// topology and targets are ours after it.
+pub(crate) fn clamped_as_draw(kind: u32, records: u32) -> bool {
+    kind != 2 && records == 1 && clamp_draws() && clamp().is_some_and(|c| c.draw.is_some())
+}
+
 
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Clamp {}
@@ -255,6 +292,56 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let (root, pso) = make_stage(device, s!("main"), s!("cs_5_1"), |root, bytes| {
+        // SAFETY: the description points at live data and never releases
+        // its pointer to the root signature.
+        unsafe {
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+        }
+    })?;
+    let draw = make_stage(device, s!("vertex"), s!("vs_5_1"), |root, bytes| {
+        // SAFETY: as above.
+        unsafe {
+            device.CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            })
+        }
+    });
+    if let Err(e) = &draw {
+        tracing::warn!(error = %e, "no argument clamp as a draw: compute passes only");
+    }
+    Ok(Clamp { root, pso, draw: draw.ok().map(|(_, pso)| pso) })
+}
+
+/// The clamp's `entry` compiled for `target`, its root signature and the
+/// pipeline `make` makes of them.
+fn make_stage(
+    device: &ID3D12Device,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+    make: impl FnOnce(&ID3D12RootSignature, &[u8]) -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -265,8 +352,8 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             s!("clamp"),
             None,
             None,
-            s!("main"),
-            s!("cs_5_1"),
+            entry,
+            target,
             0,
             0,
             &mut code,
@@ -292,15 +379,8 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
+        let pso = make(&root, bytes)?;
+        Ok((root, pso))
     }
 }
 
@@ -345,7 +425,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, clamped_as_draw(spec.0, spec.2)).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -365,9 +445,10 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, clamped_as_draw(spec.0, spec.2)).then_some(dst)
 }
 
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -377,7 +458,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -392,6 +473,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    as_draw: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -467,18 +549,36 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    let draw = if as_draw { c.draw.as_ref() } else { None };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+        match (records > 0, draw) {
+            (false, _) => {}
+            (true, Some(pso)) => {
+                // No targets: the pipeline names none.
+                l.OMSetRenderTargets(0, None, false, None);
+                l.SetGraphicsRootSignature(&c.root);
+                l.SetPipelineState(pso);
+                l.SetGraphicsRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetGraphicsRootShaderResourceView(1, src_gpu);
+                l.SetGraphicsRootShaderResourceView(2, count_gpu);
+                l.SetGraphicsRootUnorderedAccessView(3, dst_gpu);
+                l.SetGraphicsRootUnorderedAccessView(4, budget);
+                // A point list.
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(1));
+                l.DrawInstanced(records, 1, 0, 0);
+            }
+            (true, None) => {
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootShaderResourceView(2, count_gpu);
+                l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+                l.SetComputeRootUnorderedAccessView(4, budget);
+                l.Dispatch(records.div_ceil(64), 1, 1);
+            }
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -741,7 +841,7 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Clamp { root, pso, draw: None })
         }
     }
 
@@ -1167,7 +1267,9 @@ void main() {
                 src[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        for ahead in [true, false] {
+        assert!(warp.clamp.draw.is_some(), "the clamp as a draw must compile on WARP");
+        // Each also as a draw of points (`clamp_draws`).
+        for (ahead, drawn) in [(true, false), (false, false), (true, true), (false, true)] {
             let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
             let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
@@ -1187,6 +1289,7 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
+                drawn,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.

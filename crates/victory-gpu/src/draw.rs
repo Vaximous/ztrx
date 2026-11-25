@@ -2439,6 +2439,17 @@ impl State {
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
+                if crate::indirect::clamped_as_draw(kind, records) {
+                    // The clamp was a draw of ours, with no targets.
+                    self.host_roots[0] = 0;
+                    if self.topology_set {
+                        self.set_topology(list, self.topology);
+                    }
+                    if self.targets_set {
+                        let handles = std::mem::take(&mut self.target_handles);
+                        self.set_targets(list, &handles, self.depth_handle);
+                    }
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,

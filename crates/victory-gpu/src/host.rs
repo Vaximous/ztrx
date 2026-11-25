@@ -1383,9 +1383,13 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 const CARD_CHUNK: u64 = 64 << 10;
 
 /// Chunks of [`HostList::card_scratch`] no list holds, at most
-/// [`CARD_SPARE_MOST`] bytes of them.
+/// [`CARD_SPARE_MOST`] bytes of them (256 MiB was too few for the lists in
+/// flight with blocks copied, run zall13wg: a buffer made for most).
+/// A list gives its chunks back when it is reset, which is only once every
+/// submission of it has run (`crate::list::recycle` and the title's reset
+/// both come after the submissions are waited for).
 static CARD_SPARE: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
-const CARD_SPARE_MOST: u64 = 256 << 20;
+const CARD_SPARE_MOST: u64 = 1 << 30;
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {

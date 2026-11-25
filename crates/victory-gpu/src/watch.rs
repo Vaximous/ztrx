@@ -173,6 +173,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    // A new submission: what Windows says of unmapped blocks stands for it.
+    QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    QUERY_STANDS.store(true, std::sync::atomic::Ordering::Relaxed);
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -201,6 +204,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    QUERY_STANDS.store(false, std::sync::atomic::Ordering::Relaxed);
+    QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
@@ -637,8 +642,57 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// Bumped when a submission starts its one asking ([`ask_once`]) and when
+/// the runtime remaps title memory: [`uncommitted_end`]'s answers stand
+/// while it is the same.
+static QUERY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a submission's one asking stands ([`ask_once`] to
+/// [`ask_once_end`]): only then are [`uncommitted_end`]'s answers kept.
+static QUERY_STANDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`uncommitted_end`]'s answers by block, and the epoch they were given in.
+static QUERIED: Mutex<(u64, Option<std::collections::HashMap<usize, usize>>)> = Mutex::new((0, None));
+
+/// Whether [`uncommitted_end`] answers from what it was told earlier in the
+/// same submission (`VICTORY_QUERY_ONCE=0`: asks every time, as before).
+/// Ranges with unmapped blocks (the title's streamed heap) are never all
+/// clean, so each refresh of them asked Windows about every hole again,
+/// walking the page tables to the hole's end: 8.8% of the submitting
+/// thread in the world (run fxprof3). What changes: a hole the title
+/// commits (with no mapping the runtime tells of) while a submission is
+/// prepared is copied from the next submission on, as memory written
+/// meanwhile is ([`once`]).
+fn query_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUERY_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    if !query_once() || !QUERY_STANDS.load(std::sync::atomic::Ordering::Relaxed) {
+        return uncommitted_end_now(block);
+    }
+    let epoch = QUERY_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut q = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
+        if q.0 != epoch {
+            *q = (epoch, None);
+        }
+        if let Some(&end) = q.1.as_ref().and_then(|m| m.get(&block)) {
+            return end;
+        }
+    }
+    let end = uncommitted_end_now(block);
+    let mut q = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
+    if q.0 == epoch {
+        q.1.get_or_insert_with(Default::default).insert(block, end);
+    }
+    end
+}
+
+/// [`uncommitted_end`], asked of Windows.
+fn uncommitted_end_now(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -736,6 +790,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -965,6 +1020,35 @@ mod tests {
             unsafe { (at as *mut u8).write_volatile(1) };
         }
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+    }
+
+    /// What Windows says of a hole stands while a submission's asking
+    /// does, and is asked again after.
+    #[test]
+    fn a_hole_is_asked_about_once_per_submission() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: a fresh reservation of our own.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!at.is_null());
+        let first = (at as usize).div_ceil(BLOCK);
+        let end = (at as usize + 4 * BLOCK) / BLOCK;
+        assert!(first < end);
+        ask_once(&[]);
+        assert_eq!(uncommitted_end(first), end);
+        // SAFETY: inside our reservation.
+        let committed =
+            unsafe { VirtualAlloc((first * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+        if query_once() && once() {
+            assert_eq!(uncommitted_end(first), end);
+        }
+        ask_once_end();
+        assert_eq!(uncommitted_end(first), first);
+        // SAFETY: our reservation, released whole.
+        assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
     }
 
     /// A range of view memory whose first block is not mapped is a view

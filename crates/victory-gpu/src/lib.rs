@@ -58,6 +58,8 @@ mod extent;
 mod guarded;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod skip;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

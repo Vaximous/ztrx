@@ -449,14 +449,79 @@ pub(crate) fn let_go_idle() {
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// the host, not in title memory, which stays as it was. Per texture the
+/// subresources written (`None`: all of them, a whole-resource copy).
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, Option<std::collections::BTreeSet<u32>>>>> = Mutex::new(None);
 
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+/// Since the start: textures the title fills that a host copy or resolve
+/// wrote first ([`host_written`]), those of them no list had uploaded from
+/// title memory yet, those it wrote only in part (some subresources), and
+/// uploads of the other subresources made since (`VICTORY_HOST_WRITTEN_SUBS=1`).
+/// Which of the first two a run has depends on whether the copy came before
+/// the texture's first use: a texture marked before any upload never had
+/// its title memory sent up (before the switch).
+pub(crate) static HOST_WRITES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `VICTORY_HOST_WRITTEN_SUBS=1`: a copy or resolve into a title texture
+/// keeps the host's contents only in the subresources it wrote; the others
+/// are still uploaded from title memory, as for any texture. Before (and by
+/// default), a copy into any subresource stopped all uploads of the
+/// texture for good: a streamed texture whose low mips the title copies
+/// from its older version kept whatever its other mips held then (never
+/// its title memory, if the copy came before its first use).
+fn subs_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOST_WRITTEN_SUBS").is_some_and(|v| v == "1"))
+}
+
+/// A host copy or resolve writes subresource `sub` of `resource` (`None`:
+/// all of it).
+pub(crate) fn host_written(resource: This, sub: Option<u32>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(Default::default);
+    let first = !set.contains_key(&(resource as usize));
+    let entry = set.entry(resource as usize).or_insert_with(|| Some(Default::default()));
+    match (entry.as_mut(), sub) {
+        (Some(subs), Some(sub)) => {
+            subs.insert(sub);
+        }
+        (Some(_), None) => *entry = None,
+        (None, _) => {}
+    }
+    let partly = entry.is_some();
+    drop(guard);
+    if first && let Some(texture) = crate::resource::host_resource(resource) && title_written(texture) {
+        let uploaded = STAGING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&(resource as usize)).map(|s| s.uploaded.load(Relaxed)))
+            .unwrap_or(false);
+        let n = HOST_WRITES[0].fetch_add(1, Relaxed) + 1;
+        if !uploaded {
+            HOST_WRITES[1].fetch_add(1, Relaxed);
+        }
+        if partly {
+            HOST_WRITES[2].fetch_add(1, Relaxed);
+        }
+        if n <= 16 {
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            tracing::info!(
+                n,
+                uploaded,
+                sub = ?sub,
+                frame = crate::frame::current(),
+                "a host copy or resolve writes a texture the title fills: {}x{}x{} f{} mips {}",
+                d.Width,
+                d.Height,
+                d.DepthOrArraySize,
+                d.Format.0,
+                d.MipLevels
+            );
+        }
+    }
 }
 
 /// Whether the host GPU wrote `resource` by a copy or resolve
@@ -467,7 +532,16 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+        .is_some_and(|set| set.contains_key(&resource))
+}
+
+/// The subresources of `resource` a host copy or resolve wrote: `None` if
+/// none did, `Some(None)` if they all count as written (any of them unless
+/// [`subs_only`]).
+fn host_wrote_subs(resource: usize) -> Option<Option<std::collections::BTreeSet<u32>>> {
+    let set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = set.as_ref()?.get(&resource)?;
+    Some(if subs_only() { entry.clone() } else { None })
 }
 
 /// The title released a resource.
@@ -499,14 +573,15 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    // even if the title later writes its memory too (only in the
+    // subresources the copies wrote with `VICTORY_HOST_WRITTEN_SUBS=1`).
+    let host_subs = match host_wrote_subs(resource as usize) {
+        None => None,
+        Some(None) => return,
+        Some(Some(subs)) => Some(subs),
+    };
+    if !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -530,7 +605,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
+    if host_subs.is_some() {
+        HOST_WRITES[3].fetch_add(1, Relaxed);
+    }
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if host_subs.as_ref().is_some_and(|subs| subs.contains(&(i as u32))) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;

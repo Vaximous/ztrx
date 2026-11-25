@@ -8617,6 +8617,13 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             {
+                let [marked, unsent, partly, rest] =
+                    [0, 1, 2, 3].map(|i| crate::texture::HOST_WRITES[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures the title fills written by host copies since the start: {marked}, {unsent} of them before any upload                      from title memory, {partly} in some subresources only; {rest} uploads of the other subresources                      (VICTORY_HOST_WRITTEN_SUBS)"
+                );
+            }
+            {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =

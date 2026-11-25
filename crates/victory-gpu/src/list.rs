@@ -1016,7 +1016,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::host_written(dst, None);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1148,7 +1148,9 @@ extern "system" fn copy_texture_region(
         // source above too).
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        // Subresource index locations name the one they write (the index
+        // is the location's first four bytes past the kind).
+        crate::texture::host_written(dst.resource, (dst.kind == 0).then_some(dst.footprint.offset as u32));
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1302,7 +1304,7 @@ extern "system" fn resolve(
         list.twin_use(src, false, false);
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written(dst, Some(dst_sub));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

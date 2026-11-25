@@ -497,6 +497,9 @@ fn group_bytes() -> u64 {
 /// once into a stand-in so that addresses `phase` past a multiple of 256
 /// are 256-byte aligned there ([`group_bytes`]).
 pub(crate) struct FillGroup {
+    /// Copied: its block is in a stand-in. Not yet: a fill was seen there
+    /// ([`group_second`]), filled on its own.
+    copied: bool,
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     /// The stand-in's address of `lo`.
     gpu: u64,
@@ -526,6 +529,40 @@ pub(crate) struct FillGroup {
 /// title memory, a copy of its own would see whatever the extent left out.
 fn group_good(writes: u64, writes_now: u64, declared: bool) -> bool {
     writes == writes_now && !declared
+}
+
+/// Whether a block is copied only for the second fill from it with nothing
+/// written in between (`VICTORY_FILL_GROUP_SECOND`; on by default, `=0`
+/// the first fill copies it). With sources learned whole most blocks served
+/// one fill before a writing call dropped them (run zall13wg: 1,236 blocks
+/// of 64 KiB copied a frame for 2,900 fills, 0.47 ms each): one fill's own
+/// copy is 256 bytes, a block's a chunk of 64 KiB.
+fn group_second() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_GROUP_SECOND").is_none_or(|v| v != "0"))
+}
+
+/// What a fill does with the list's entry for its block ([`group_fill`]).
+#[derive(Debug, PartialEq)]
+enum GroupStep {
+    /// Show the block's stand-in.
+    Use,
+    /// Copy the block now.
+    Copy,
+    /// Note the block seen; fill on its own.
+    Note,
+}
+
+/// [`GroupStep`] for an entry (`None`: none for this block and copy;
+/// `Some(copied)`) that is still good or not ([`group_good`]), with
+/// [`group_second`] `second`.
+fn group_step(entry: Option<bool>, good: bool, second: bool) -> GroupStep {
+    match entry {
+        Some(true) if good => GroupStep::Use,
+        Some(false) if good => GroupStep::Copy,
+        _ if second => GroupStep::Note,
+        _ => GroupStep::Copy,
+    }
 }
 
 /// Whether `[src, src + len)` is to be refreshed for a group (noted so if
@@ -569,22 +606,44 @@ fn group_fill(list: &HostList, from: &std::sync::Arc<crate::shadow::Shadow>, src
     }
     let mut groups = list.fill_groups();
     let key = (bs, phase as u16);
-    if let Some(g) = groups.get_mut(&key)
-        && std::sync::Arc::ptr_eq(&g.shadow, from)
-    {
-        let (hit, now) = list.declared_writes_overlap(g.checked, g.lo as usize, g.hi as usize);
-        if group_good(g.writes, list.write_count(), hit) {
-            g.checked = now;
-            if refresh_due(&mut g.refreshed, &mut g.epoch, list.title_writes(), src as usize, len as usize)
-                && from.refresh(list, src, len)
-            {
-                FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
-            }
-            FILL_STATS[FILL_GROUP_USES].fetch_add(1, Ordering::Relaxed);
-            return Some(g.gpu + (src - g.lo));
-        }
-    }
     let lo = group_start(bs.max(start), phase);
+    let (entry, good) = match groups.get(&key) {
+        Some(g) if std::sync::Arc::ptr_eq(&g.shadow, from) => {
+            let (hit, _) = list.declared_writes_overlap(g.checked, g.lo as usize, g.hi as usize);
+            (Some(g.copied), group_good(g.writes, list.write_count(), hit))
+        }
+        _ => (None, false),
+    };
+    let step = group_step(entry, good, group_second());
+    if step == GroupStep::Note {
+        groups.insert(
+            key,
+            FillGroup {
+                copied: false,
+                shadow: from.clone(),
+                gpu: 0,
+                lo,
+                hi: be,
+                checked: BIND_STEPS.get(),
+                refreshed: Vec::new(),
+                epoch: 0,
+                writes: list.write_count(),
+            },
+        );
+        return None;
+    }
+    if step == GroupStep::Use
+        && let Some(g) = groups.get_mut(&key)
+    {
+        g.checked = list.steps();
+        if refresh_due(&mut g.refreshed, &mut g.epoch, list.title_writes(), src as usize, len as usize)
+            && from.refresh(list, src, len)
+        {
+            FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
+        }
+        FILL_STATS[FILL_GROUP_USES].fetch_add(1, Ordering::Relaxed);
+        return Some(g.gpu + (src - g.lo));
+    }
     let (stand_in, at, first) = list.card_scratch(be - lo)?;
     if from.refresh(list, src, len) {
         FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
@@ -599,6 +658,7 @@ fn group_fill(list: &HostList, from: &std::sync::Arc<crate::shadow::Shadow>, src
     groups.insert(
         key,
         FillGroup {
+            copied: true,
             shadow: from.clone(),
             gpu,
             lo,
@@ -753,8 +813,56 @@ pub(crate) fn fill_blocked(src: usize, len: usize) {
     }
     FILL_STATS[2].fetch_add(1, Ordering::Relaxed);
     drop(learned);
-    let (src, len) = learned_range(src, len);
+    let (src, len) = match repeat_whole(src, len) {
+        Some(whole) => whole,
+        None => learned_range(src, len),
+    };
     learn(&mut LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src, len);
+}
+
+/// `VICTORY_CARD_LEARN_REPEAT=<n>` (0, off, by default): with sources
+/// learned by range or block, the title buffer of a fill that made a
+/// submission wait is learned whole once its fills did so `n` times (each
+/// at a place not learned yet). A ring the title reads a new place of every
+/// frame, which a flight wrote, made a submission wait every frame (run
+/// zall13g: 1.0 settles a frame, 61 ms); whole learning for every source
+/// sent 10-13k fills a frame through the card (run zall10).
+fn learn_repeat() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_CARD_LEARN_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Title buffers (start) whose fills made submissions wait, and how often.
+static WAITED_BY_BUFFER: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+/// [`learn_repeat`]: the whole title buffer to learn for a wait of a fill
+/// at `[src, src + len)`, if its buffer's fills waited often enough.
+fn repeat_whole(src: usize, len: usize) -> Option<(usize, usize)> {
+    let n = learn_repeat();
+    if n == 0 {
+        return None;
+    }
+    let copy = crate::shadow::find(src as u64, len as u64)?;
+    let start = copy.title_start();
+    let count = {
+        let mut waited = WAITED_BY_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        count_wait(&mut waited, start)
+    };
+    (count >= n).then(|| (start as usize, copy.left(start) as usize))
+}
+
+/// Counts a wait for title buffer `start` in `waited`: how many now.
+fn count_wait(waited: &mut Vec<(u64, u32)>, start: u64) -> u32 {
+    match waited.iter_mut().find(|w| w.0 == start) {
+        Some(w) => {
+            w.1 += 1;
+            w.1
+        }
+        None => {
+            waited.push((start, 1));
+            1
+        }
+    }
 }
 
 /// A fill compared ([`fills_check_on`]): what the CPU filled and what the
@@ -1030,7 +1138,35 @@ fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, group_good, group_start, in_blocks, inside, learn, overlaps, plan_fills, refresh_due, verdict};
+    use super::{
+        GroupStep, Verdict, count_wait, group_good, group_start, group_step, in_blocks, inside, learn, overlaps, plan_fills,
+        refresh_due, verdict,
+    };
+
+    /// With the second fill rule a block is noted first, copied for the
+    /// next fill while nothing was written, used after; anything written
+    /// starts it over.
+    #[test]
+    fn a_block_is_copied_for_its_second_fill_and_used_after() {
+        assert_eq!(group_step(None, false, true), GroupStep::Note);
+        assert_eq!(group_step(Some(false), true, true), GroupStep::Copy);
+        assert_eq!(group_step(Some(false), false, true), GroupStep::Note);
+        assert_eq!(group_step(Some(true), true, true), GroupStep::Use);
+        assert_eq!(group_step(Some(true), false, true), GroupStep::Note);
+        // Without it, the first fill copies.
+        assert_eq!(group_step(None, false, false), GroupStep::Copy);
+        assert_eq!(group_step(Some(true), false, false), GroupStep::Copy);
+        assert_eq!(group_step(Some(true), true, false), GroupStep::Use);
+    }
+
+    /// Waits are counted per title buffer.
+    #[test]
+    fn waits_are_counted_per_buffer() {
+        let mut w = Vec::new();
+        assert_eq!(count_wait(&mut w, 0x1000), 1);
+        assert_eq!(count_wait(&mut w, 0x2000), 1);
+        assert_eq!(count_wait(&mut w, 0x1000), 2);
+    }
 
     /// A group is used again only while no shader that may write was
     /// recorded since it was made and no declared write meets it.

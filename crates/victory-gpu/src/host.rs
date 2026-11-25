@@ -5652,6 +5652,9 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// The overlay for the last second's stats ([`crate::hud`]): its dark
+    /// box and lit cells, in back-buffer pixels.
+    hud: Option<(RECT, Vec<RECT>)>,
 }
 
 impl Meter {
@@ -5665,11 +5668,12 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            hud: None,
         }
     }
 
-    /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    /// Counts a presented frame, shown in a `width` x `height` back buffer.
+    fn frame(&mut self, hwnd: HWND, width: u32, height: u32) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -5693,6 +5697,20 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        if crate::hud::on() {
+            let rect = |r: crate::hud::Rect| RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+            let lines = crate::hud::lines(fps, ms, cpu, gpu);
+            let scale = crate::hud::scale(height);
+            self.hud = crate::hud::layout(
+                &[lines[0].as_str(), lines[1].as_str()],
+                4 * scale,
+                4 * scale,
+                scale,
+                width as i32,
+                height as i32,
+            )
+            .map(|(backing, lit)| (rect(backing), lit.into_iter().map(rect).collect()));
+        }
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -5954,7 +5972,11 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, flags)
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    // Laid out for the old size; the next second lays it out again.
+                    p.meter.hud = None;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
@@ -6009,14 +6031,31 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
+            // Our frame-rate overlay ([`crate::hud`]), drawn into the back
+            // buffer only: the title's texture (and so saved frames) never
+            // has it.
+            let hud = p.meter.hud.as_ref();
+            let back_state = if hud.is_some() {
+                D3D12_RESOURCE_STATE_RENDER_TARGET
+            } else {
+                D3D12_RESOURCE_STATE_PRESENT
+            };
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
+                transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, back_state),
             ]);
+            if let Some((backing, lit)) = hud {
+                let rtv = self.rtv(Some(&back), None);
+                list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], Some(std::slice::from_ref(backing)));
+                if !lit.is_empty() {
+                    list.ClearRenderTargetView(rtv, &[1.0, 1.0, 0.2, 1.0], Some(lit));
+                }
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -6040,7 +6079,7 @@ impl Host {
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
             let _ = presented;
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, p.width, p.height);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

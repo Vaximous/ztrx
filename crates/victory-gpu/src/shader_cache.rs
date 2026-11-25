@@ -75,6 +75,8 @@ fn build() -> &'static [u8; 32] {
                     // How scalar loads of raw views are read.
                     "VICTORY_SMEM_VECTOR",
                     "VICTORY_EXCHANGE_BATCH",
+                    // Legacy products lowered plain (measurement).
+                    "VICTORY_LEGACY_MUL",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

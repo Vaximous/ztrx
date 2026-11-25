@@ -982,6 +982,106 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
+/// Since the start: pages of host copies the audit compared with title
+/// memory, those that differed while title memory was known unwritten
+/// since their last copy (a write the copy missed, or one whose notice is
+/// still on its way), those that still differed at a check two or more
+/// frames later (distinct pages: a copy stale for good), and pages copied
+/// again for it (`VICTORY_BUFFER_RECHECK=1`).
+pub(crate) static AUDIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `VICTORY_BUFFER_RECHECK=1`: the audit of host copies looks at eight
+/// times as many pages (a budget of 128 MiB a frame instead of 8) and
+/// copies again any page that differs from title memory although the
+/// watch says it was not written. Without it the audit only counts.
+fn recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_RECHECK").is_some_and(|v| v == "1"))
+}
+
+/// A page of a host copy taken as current (copied after its last known
+/// write) is compared, now and then, with title memory. A copy that
+/// differs where title memory was not written since is stale: a write
+/// that never reached the watch (a fill that landed before the copy was
+/// marked current, a reset of the write-watch racing the fill, a write of
+/// ours through another view noted late). Pages are picked by a hash of
+/// the page and the frame (one in 64, one in 8 with [`recheck`]), within a
+/// budget per frame, so every page used for long is looked at.
+fn audit(shadow: &Shadow, at: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SPENT: AtomicU64 = AtomicU64::new(0);
+    static SEEN: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+    let on = recheck();
+    let (every, budget) = if on { (8u64, 128u64 << 20) } else { (64, 8 << 20) };
+    let frame = crate::frame::current();
+    let mix = ((at / PAGE) as u64 ^ frame.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    if !(mix >> 40).is_multiple_of(every) {
+        return;
+    }
+    if FRAME.swap(frame, Relaxed) != frame {
+        SPENT.store(0, Relaxed);
+    }
+    if SPENT.fetch_add(PAGE as u64, Relaxed) >= budget {
+        return;
+    }
+    thread_local! {
+        static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let differs = TITLE.with_borrow_mut(|title| {
+        title.resize(PAGE, 0);
+        if !crate::host::read_into(at as *const u8, title) {
+            return None;
+        }
+        Some(first_difference(shadow.page_bytes(at), title))
+    });
+    AUDIT[0].fetch_add(1, Relaxed);
+    let Some(Some(byte)) = differs else {
+        return;
+    };
+    // Written meanwhile (or unknown): the next asking takes it.
+    if !crate::watch::unwritten_since_asked(at) {
+        return;
+    }
+    AUDIT[1].fetch_add(1, Relaxed);
+    let lasting = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        match seen.get(&at).copied() {
+            Some(u64::MAX) => false,
+            Some(first) if frame >= first + 2 => {
+                seen.insert(at, u64::MAX);
+                true
+            }
+            Some(_) => false,
+            None => {
+                if seen.len() < 1 << 16 {
+                    seen.insert(at, frame);
+                }
+                false
+            }
+        }
+    };
+    if lasting {
+        let n = AUDIT[2].fetch_add(1, Relaxed) + 1;
+        if n <= 16 {
+            tracing::info!(
+                n,
+                frame,
+                page = format_args!("{at:#x}"),
+                byte,
+                copy = format_args!("{:#x}+{:#x}", shadow.start, shadow.len),
+                carded = shadow.carded(),
+                "a host copy differs from title memory the watch says was not written (stale for two frames or more)"
+            );
+        }
+    }
+    if on {
+        shadow.recopy(at);
+        AUDIT[3].fetch_add(1, Relaxed);
+    }
+}
+
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
@@ -2828,6 +2928,14 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
+            if *at != 0 && write <= *at {
+                // A page taken as current: now and then compared with
+                // title memory ([`audit`]).
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                if page * PAGE >= start.max(from) && (page + 1) * PAGE <= end.min(to) {
+                    audit(self, page * PAGE);
+                }
+            }
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
@@ -2862,6 +2970,17 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// [`audit`]'s repair: copies the page at `at` again.
+    fn recopy(&self, at: usize) {
+        self.copy(at, at + PAGE);
+    }
+
+    /// The copy's bytes for title page `at` (inside the buffer).
+    fn page_bytes(&self, at: usize) -> &[u8] {
+        // SAFETY: the page lies inside the copy's mapping.
+        unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize), PAGE) }
     }
 
     /// Whether shaders read and write this copy in the card's own memory

@@ -893,6 +893,9 @@ pub(crate) struct HostList {
     /// Where the next clamp of indirect records goes in the list's scratch
     /// buffer ([`crate::indirect::clamp_ring`]).
     ring_at: std::sync::atomic::AtomicU64,
+    /// The keys of the clamps recorded since the list's last first use of
+    /// its budget, by trust word ([`HostList::clamp_slot`]).
+    clamp_keys: Mutex<Vec<u64>>,
     /// Calls recorded whose shaders may write buffers ([`HostList::wrote`]),
     /// since the reset.
     writes: std::sync::atomic::AtomicU64,
@@ -3350,20 +3353,60 @@ pub(crate) fn read_flight_line(frames: f64) {
          (VICTORY_READ_FIXUP)",
         bail[0], bail[1], bail[2], bail[3], bail[4], bail[5]
     );
-    if crate::cardcopy::fills_check_on() {
-        let [fills, bytes] = [0, 1].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    {
+        let [fills, bytes, cuts] = [0, 1, 2].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "CPU fills per frame of what an earlier list of the same submission may write on the card: {fills:.1}, \
-             {bytes:.0} bytes (they read the bytes from before)"
+             {bytes:.0} bytes (they read the bytes from before); submissions cut before such a list: {cuts:.2} \
+             (VICTORY_CROSS_LIST_CUT)"
         );
     }
 }
+
+/// Bytes of a list's budget buffer: the budget and the clamp's notes in
+/// the first 16 words, then the trust words of its clamps
+/// (`crate::indirect::trust_mode`; the clamp writes them from byte 64 on).
+const BUDGET_BYTES: u64 = 4096;
+/// The first trust word.
+const TRUST_WORDS: usize = 16;
 
 /// Since the last frame-rate line, with `VICTORY_CARD_FILLS_CHECK`: CPU
 /// fills (and their bytes) of a list that read what an earlier list of
 /// the same submission declared written on the card. The fill runs at
 /// submission, before either list, so it reads the bytes from before.
-static CROSS_LIST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Third: submissions cut before such a list ([`cross_list_cut`]).
+static CROSS_LIST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `VICTORY_CROSS_LIST_CUT=1` (off by default): a flight whose list reads
+/// on the CPU at submission (a fill of upload memory, a title buffer copy,
+/// a texture's memory) what an earlier list of the same submission may
+/// write on the card is cut before that list ([`cross_list_at`]). The
+/// earlier lists fly first; the rest is then prepared behind them, and its
+/// reads wait for their writes to land as any read under a flight's
+/// writes does (`late_blocked`). Without the cut such a read takes the
+/// bytes from before the earlier list ran. `VICTORY_FILL_AFTER_WRITE`
+/// closes this within one list only, and which lists of a submission
+/// write and read depends on how the title's threads record them: a
+/// skinned character's constants read black now and then (the hair of
+/// runs zall15d and zall20d2).
+fn cross_list_cut() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CROSS_LIST_CUT").is_some_and(|v| v == "1"))
+}
+
+/// The first of `runs` (past the first) that reads on the CPU what an
+/// earlier one declared written on the card ([`cross_list_cut`]).
+fn cross_list_at(runs: &[&HostList]) -> Option<usize> {
+    let mut written: Vec<(usize, usize)> = Vec::new();
+    for (i, list) in runs.iter().enumerate() {
+        if !written.is_empty() && blocked_by(&written, std::slice::from_ref(list), false).is_some() {
+            return Some(i);
+        }
+        let more = list.deferred().gpu_written.clone();
+        join_ranges(&mut written, more);
+    }
+    None
+}
 
 /// [`CROSS_LIST`] for one submission.
 fn count_cross_list(runs: &[&HostList]) {
@@ -4865,6 +4908,7 @@ impl Host {
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
                 since_wait: std::sync::atomic::AtomicU8::new(3),
                 ring_at: std::sync::atomic::AtomicU64::new(0),
+                clamp_keys: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6083,6 +6127,8 @@ impl Host {
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&lists);
+                crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+                crate::list::switch_count(crate::list::SW_LISTS, 1);
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -6416,6 +6462,26 @@ impl Host {
         // idle once more by then).
         if self.early_cut(&lists, &order) {
             let (first, rest) = cut_flight(lists, &order, 1);
+            self.execute_late(first.0, first.1);
+            self.execute_late(rest.0, rest.1);
+            return;
+        }
+        if cross_list_cut()
+            && order.iter().all(|&i| i < lists.len())
+            && {
+                // Each list once (as `cut_flight` takes them).
+                let mut seen = order.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() == order.len()
+            }
+            && let Some(at) = {
+                let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                cross_list_at(&runs)
+            }
+        {
+            CROSS_LIST[2].fetch_add(1, Ordering::Relaxed);
+            let (first, rest) = cut_flight(lists, &order, at);
             self.execute_late(first.0, first.1);
             self.execute_late(rest.0, rest.1);
             return;
@@ -6848,9 +6914,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        if crate::cardcopy::fills_check_on() {
-            count_cross_list(runs);
-        }
+        count_cross_list(runs);
         work_stage(STAGE_LISTS);
         for list in runs {
             list.run_deferred(&mut batch);
@@ -6889,6 +6953,8 @@ impl Host {
             // With the relay the flight takes a place in the order of the
             // queue: what its compare pushes down is merged as of there.
             let order = flown.then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+            crate::list::switch_count(crate::list::SW_LISTS, lists.len() as u64);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -6965,6 +7031,8 @@ impl Host {
                 SYNC_IN_AIR.fetch_add(1, Ordering::AcqRel);
                 InAir
             });
+            crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+            crate::list::switch_count(crate::list::SW_LISTS, group.len() as u64);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -8154,7 +8222,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer(BUDGET_BYTES)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -8162,6 +8230,9 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
+            // The clamps of the list's last recording, by trust word: what
+            // its run noted in them (`crate::indirect::trust_note`).
+            let keys = std::mem::take(&mut *self.clamp_keys.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -8181,10 +8252,31 @@ impl HostList {
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
                 }
+                for (i, &key) in keys.iter().enumerate() {
+                    let word = words.add(TRUST_WORDS + i);
+                    let noted = word.read_volatile();
+                    if noted & 1 != 0 {
+                        crate::indirect::trust_note(key, noted & 2 != 0);
+                    }
+                    word.write_volatile(0);
+                }
             })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A trust word in the budget buffer for a clamp of `key` recorded next
+    /// (`crate::indirect::trust_mode`); `None` when the words are all taken.
+    pub(crate) fn clamp_slot(&self, key: u64) -> Option<u32> {
+        // The last recording's keys are taken first.
+        self.budget()?;
+        let mut keys = self.clamp_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if TRUST_WORDS + keys.len() >= BUDGET_BYTES as usize / 4 {
+            return None;
+        }
+        keys.push(key);
+        Some((keys.len() - 1) as u32)
     }
 
     /// `len` bytes (at most 64 KiB) of device-local memory, 256-byte
@@ -9086,6 +9178,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::list::barrier_line(frames);
+        crate::indirect::trust_line(frames);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9152,6 +9245,14 @@ impl Meter {
                     [0, 1, 2, 3].map(|i| crate::texture::HOST_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
                     "textures the title fills written by host copies since the start: {marked}, {unsent} of them before any upload                      from title memory, {partly} in some subresources only; {rest} uploads of the other subresources                      (VICTORY_HOST_WRITTEN_SUBS)"
+                );
+            }
+            {
+                let [looked, differed, lasting, recopied] =
+                    [0, 1, 2, 3].map(|i| crate::shadow::AUDIT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "host copies audited against title memory since the start: {looked} pages, {differed} differed where the \
+                     watch says unwritten, {lasting} pages stale two frames or more; {recopied} copied again (VICTORY_BUFFER_RECHECK)"
                 );
             }
             {

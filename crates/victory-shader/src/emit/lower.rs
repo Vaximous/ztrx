@@ -3606,6 +3606,10 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
+        // For measurement only: the plain product (`super::legacy_plain`).
+        if super::legacy_plain() {
+            return m;
+        }
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);

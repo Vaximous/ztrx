@@ -1428,12 +1428,14 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
+            crate::list::switch_count(crate::list::SW_ROOTS, 1);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            crate::list::switch_count(crate::list::SW_PIPELINES, 1);
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
@@ -3141,7 +3143,12 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), w.scratch_at + offset - w.base, w.hoisted));
-        let unclamped = unclamped();
+        // A key whose clamps never change its records is left unclamped
+        // (`crate::indirect::trust_mode`): it reads the title's records as
+        // with `VICTORY_CLAMP=0`.
+        let trust_key = crate::indirect::trust_key(args.id(), kind, stride, counter.is_some());
+        let trusted = hit.is_none() && !unclamped() && crate::indirect::trust_skip(trust_key);
+        let unclamped = unclamped() || trusted;
         if unclamped {
             self.window = None;
         }
@@ -3247,6 +3254,8 @@ impl State {
                     && (hoist == 1 || list.write_count() == 0)
                     && !list.gpu_written(arguments as usize, len.max(u64::from(step) * u64::from(records)) as usize)
                     && counter.as_ref().is_none_or(|(_, at)| !list.gpu_written(*at as usize, 4));
+                // The clamps below note their run under the key.
+                let _slot = crate::indirect::slot_for(list, trust_key);
                 let hoisted = if hoistable {
                     crate::indirect::hoisted(list, (&args.buffer, offset), if ahead { None } else { count_arg }, (kind, step, records), ahead)
                 } else {

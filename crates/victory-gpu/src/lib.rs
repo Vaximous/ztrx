@@ -57,6 +57,8 @@ mod extent;
 #[cfg(windows)]
 mod guarded;
 #[cfg(windows)]
+mod lazy;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]

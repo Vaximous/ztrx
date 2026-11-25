@@ -1336,6 +1336,7 @@ pub(crate) fn back_line(frames: f64) {
         );
         crate::extent::check_line();
         crate::extent::whole_line(frames);
+        crate::lazy::line(frames);
         crate::cardcopy::line(frames);
         let e: Vec<f64> = EXTENTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -1805,6 +1806,11 @@ impl Shadow {
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// The title address the copy starts at.
+    pub(crate) fn title_start(&self) -> u64 {
+        self.start
     }
 
     /// The copy's own number (see the field).

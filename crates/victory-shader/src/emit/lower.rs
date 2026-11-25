@@ -836,6 +836,9 @@ pub(super) fn pair_sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAIR_SYNC").is_none_or(|v| v != "0"))
 }
 
+/// The most values one meeting of a pair carries ([`Lower::meet_with`]).
+const PAYLOAD: u32 = 2;
+
 fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
@@ -1407,7 +1410,9 @@ impl<'a> Lower<'a> {
                 s.lds_dwords += 1;
                 if group > 64 && group % 64 == 0 && !x.st.wide.is_empty() && pair_sync_on() {
                     pair_sync = Some(s.lds_dwords);
-                    s.lds_dwords += group / 64;
+                    // each console wave's meeting counter, then its exchange slots
+                    // ([`Self::meet_with`]): two sets of PAYLOAD values for each half
+                    s.lds_dwords += group / 64 * (1 + 4 * PAYLOAD);
                 }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -3618,17 +3623,34 @@ impl<'a> Lower<'a> {
     /// each other, so one waiting does not keep its partner from coming. Returns the block to
     /// go on in.
     fn meet(&mut self, at: usize) -> usize {
+        self.meet_with(at, &[]).0
+    }
+
+    /// Whether [`Self::meet_with`] can carry values in block `at`.
+    fn can_carry(&self, at: usize) -> bool {
+        self.pair_sync.is_some() && !(at == self.cur && at == self.s.entry || at != self.cur && !self.s.m.ended(at))
+    }
+
+    /// [`Self::meet`], with each host wave giving `mine` (values the same in all its lanes) for
+    /// its half: both get (lower half's, upper half's) of each, when the meeting is a pair's
+    /// ([`Self::can_carry`]; empty otherwise). The values go to one of two sets of slots, by
+    /// the meeting's number: a set is written again two meetings later, which the host wave
+    /// that writes it reaches only after its partner has come to the meeting in between, so
+    /// after the partner has read it. One meeting per exchange, where a group barrier needs
+    /// one before the reads and one after.
+    fn meet_with(&mut self, at: usize, mine: &[V]) -> (usize, Vec<(V, V)>) {
+        assert!(mine.len() <= PAYLOAD as usize);
         self.meetings.push(at);
         let Some(pc) = self.pair_sync else {
             self.group_sync(at);
-            return at;
+            return (at, Vec::new());
         };
         // (a block not ended that is not the one being lowered would be ended later, over
         // the wait; the entry block stays first and whole while it is being lowered)
         if at == self.cur && at == self.s.entry || at != self.cur && !self.s.m.ended(at) {
             self.meet_bad = true;
             self.group_sync(at);
-            return at;
+            return (at, Vec::new());
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let thread = self.console_thread();
@@ -3668,13 +3690,42 @@ impl<'a> Lower<'a> {
         };
         let void = self.s.t.void;
         let fence = self.s.m.i32(meeting_mode() & !1);
-        self.s.op(pre, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let lds = self.s.lds();
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        // the values for the meeting, in the set its number picks (the count before this
+        // host wave arrives is 2(n-1) or 2(n-1)+1 at the pair's meeting n)
+        let mut slots = None;
+        if !mine.is_empty() {
+            let ptr = self.s.m.element(pre, lds, slot);
+            let was = self.s.m.atomic(pre, Rmw::Or, ptr, zero);
+            let was = self.s.op(pre, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[was]);
+            let n = self.s.m.bin(pre, Bin::LShr, was, one);
+            let set = self.s.m.bin(pre, Bin::And, n, one);
+            let per_set = self.s.m.i32(2 * PAYLOAD);
+            let set = self.s.m.bin(pre, Bin::Mul, set, per_set);
+            let waves = self.s.threads.map_or(1, |t| t.iter().product::<u32>() / 64);
+            let first = self.s.m.i32(pc + waves);
+            let per_wave = self.s.m.i32(4 * PAYLOAD);
+            let own = self.s.m.bin(pre, Bin::Mul, wave, per_wave);
+            let base = self.s.m.bin(pre, Bin::Add, first, own);
+            let base = self.s.m.bin(pre, Bin::Add, base, set);
+            let cl = self.console_lane();
+            let five = self.s.m.i32(5);
+            let half = self.s.m.bin(pre, Bin::LShr, cl, five);
+            for (k, &v) in mine.iter().enumerate() {
+                let off = self.s.m.i32(2 * k as u32);
+                let to = self.s.m.bin(pre, Bin::Add, base, off);
+                let to = self.s.m.bin(pre, Bin::Add, to, half);
+                let ptr = self.s.m.element(pre, lds, to);
+                self.s.m.store(pre, ptr, v);
+            }
+            slots = Some(base);
+        }
+        self.s.op(pre, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         // one lane of the host wave counts it
         let lane = self.s.op(pre, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.op(pre, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[lane]);
         let is_first = self.s.m.cmp(pre, pred::EQ, lane, first);
-        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
         let add = self.s.m.select(pre, is_first, one, zero);
         let ptr = self.s.m.element(pre, lds, slot);
         let old = self.s.m.atomic(pre, Rmw::Add, ptr, add);
@@ -3692,7 +3743,20 @@ impl<'a> Lower<'a> {
         self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         self.meetings.push(c);
         self.s.flags |= flags::WAVE_OPS;
-        c
+        let mut got = Vec::new();
+        if let Some(base) = slots {
+            for k in 0..mine.len() {
+                let off = self.s.m.i32(2 * k as u32);
+                let lo_at = self.s.m.bin(c, Bin::Add, base, off);
+                let hi_at = self.s.m.bin(c, Bin::Add, lo_at, one);
+                let p0 = self.s.m.element(c, lds, lo_at);
+                let p1 = self.s.m.element(c, lds, hi_at);
+                let lo = self.s.m.load(c, p0);
+                let hi = self.s.m.load(c, p1);
+                got.push((lo, hi));
+            }
+        }
+        (c, got)
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -3714,6 +3778,10 @@ impl<'a> Lower<'a> {
             let lo = self.s.m.select(at, upper, z, mine);
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
+        }
+        if self.can_carry(at) {
+            let (_, got) = self.meet_with(at, &[mine]);
+            return got[0];
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
@@ -7451,9 +7519,14 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let c = self.cur;
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let ((lo_has, hi_has), (lo, hi)) = if self.can_carry(c) {
+                            let (_, got) = self.meet_with(c, &[has, mine]);
+                            (got[0], got[1])
+                        } else {
+                            let h = self.exchange_halves(c, has);
+                            let c = self.cur;
+                            (h, self.exchange_halves(c, mine))
+                        };
                         let c = self.cur;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);

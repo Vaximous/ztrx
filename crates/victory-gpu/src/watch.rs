@@ -74,7 +74,7 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        .filter(|r| r.0 < r.1)
+        .filter(|r| r.0 < r.1 && !known_view(r.0))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -194,7 +194,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !known_view(start) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -343,8 +343,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // View memory the guards know: the kernel would only fail.
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = known_view(start) || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -509,6 +510,24 @@ mod bits_tests {
         bits.set_range(far - 3, far + 70);
         assert!(bits.all(far - 3, far + 70) && !bits.all(far - 4, far));
     }
+}
+
+/// Whether the block at `at` is view memory the guards hold (read-only by
+/// our hand, or noted absent): not write-watched, so asking the kernel
+/// about a range from there fails. The world's refreshes asked it about
+/// such ranges first, every time, before guarding them (a failing
+/// `GetWriteWatch` each; the port of a change of victory-perf, 4cb867b6).
+/// A remapped range is forgotten by the guards
+/// ([`title_memory_remapped`]). `VICTORY_KNOWN_VIEWS=0` asks first, as
+/// before.
+fn known_view(at: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_VIEWS").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let g = guards();
+    let block = at / BLOCK;
+    g.protected.contains(&block) || g.absent.contains(&block)
 }
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {

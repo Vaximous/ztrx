@@ -122,8 +122,17 @@ struct Window {
     looked: usize,
 }
 
-/// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// The most records clamped in one pass ([`windows`]):
+/// `VICTORY_INDIRECT_WINDOW_MOST` (16 to 65,536; 64 unless set).
+fn window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_WINDOW_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(64, |n| n.clamp(16, 65_536))
+    })
+}
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (on by default;
@@ -140,7 +149,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// With the switch, when a draw asks for a record a short step after the
 /// one drawn before, the clamp takes that record and the ones that step
-/// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
+/// apart after it (16, then twice as many each time, [`window_most`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
 /// their record there with no pass of ours, until one of these: a compute
@@ -181,6 +190,16 @@ fn step_most() -> u64 {
             .unwrap_or(256)
             .clamp(16, 65536)
     })
+}
+
+/// `VICTORY_HEAP_ROLLING=1` (off by default): the heap pass of buffer
+/// views ([`State::heap_buffers`]) looks again at a sixteenth of the slots
+/// each pass, where every 16th pass looked at all of them (83,000 slots; a
+/// spike of ~140 ms in vitutu1/victory-perf's measure, whose rolling pass
+/// this is).
+fn heap_rolling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLLING").is_some_and(|v| v == "1"))
 }
 
 fn windows() -> bool {
@@ -1501,7 +1520,25 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let slots = if heap_rolling() && *passes != 0 {
+            // A sixteenth of the slots each pass, with the changed ones:
+            // every slot is still looked at again every 16 passes, without
+            // a pass that looks at all of them at once.
+            let bucket = (*passes % 16) as u32;
+            let mut seen: std::collections::HashSet<u32> = changed.iter().copied().collect();
+            let mut slots = changed;
+            let mut live = std::collections::HashSet::new();
+            for index in host.buffer_slots() {
+                if index % 16 == bucket {
+                    live.insert(index);
+                    if seen.insert(index) {
+                        slots.push(index);
+                    }
+                }
+            }
+            ranges.retain(|&index, _| index % 16 != bucket || live.contains(&index));
+            slots
+        } else if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -2694,7 +2731,7 @@ impl State {
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / step).min(window_most()) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                         } else {
                             (stride, max)
@@ -2716,10 +2753,14 @@ impl State {
                     WINDOWED[6].fetch_sub(1, Ordering::Relaxed);
                     WINDOWED[1].fetch_add(1, Ordering::Relaxed);
                 }
+                // Host copies of their own (not placed over title memory that
+                // other buffers alias): the clamp may wait on them alone
+                // (`crate::indirect::clamp_scoped`).
+                let own = !args.in_place() && counter.as_ref().is_none_or(|(s, _)| !s.in_place());
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), own)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), own)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;

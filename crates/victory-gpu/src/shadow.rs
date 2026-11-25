@@ -1501,9 +1501,53 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// [`changed_runs`] of bytes at address `at` (`n` of them) widened to the
+/// 4-byte words they lie in and joined where they then touch
+/// (`VICTORY_MERGE_WORDS`, on; `=0` byte-exact, as before). A shader writes
+/// whole words, so a word the title changed a byte of is the title's:
+/// putting all of it in takes nothing a flight wrote but where both wrote
+/// the same word. The title changes floats a byte or two at a time: 85,737
+/// runs of 2.6 bytes a frame went up beside flights' writes, past the
+/// 65,536 a submission takes ([`crate::host`]'s `merge_runs`), and 0.6 times a
+/// frame the submission waited for every flight to land instead, 15-37 ms
+/// (run zall7b).
+fn word_runs(runs: Vec<(usize, usize)>, at: usize, n: usize) -> Vec<(usize, usize)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if runs.is_empty() || !*ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_WORDS").is_none_or(|v| v != "0")) {
+        return runs;
+    }
+    widen_runs(runs, at, n)
+}
+
+fn widen_runs(runs: Vec<(usize, usize)>, at: usize, n: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (r, m) in runs {
+        let a = ((at + r) & !3).saturating_sub(at).min(r);
+        let b = ((at + r + m + 3) & !3).saturating_sub(at).min(n);
+        match out.last_mut() {
+            Some(last) if last.0 + last.1 >= a => last.1 = b.max(last.0 + last.1) - last.0,
+            _ => out.push((a, b - a)),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, widen_runs};
+
+    /// Runs widened to their words: in the range, joined where they touch,
+    /// every changed byte still in one.
+    #[test]
+    fn word_runs_cover_whole_words() {
+        // At an address 2 past a word: offset 2 starts a word.
+        assert_eq!(widen_runs(vec![(0, 1)], 2, 10), vec![(0, 2)]);
+        assert_eq!(widen_runs(vec![(3, 1)], 2, 10), vec![(2, 4)]);
+        assert_eq!(widen_runs(vec![(2, 1), (4, 1), (11, 1)], 2, 12), vec![(2, 4), (10, 2)]);
+        assert_eq!(widen_runs(vec![(1, 1), (6, 2), (9, 1)], 0, 10), vec![(0, 10)]);
+        assert_eq!(widen_runs(vec![(0, 8)], 0, 8), vec![(0, 8)]);
+        assert!(widen_runs(Vec::new(), 0, 8).is_empty());
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2468,7 +2512,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let runs = word_runs(changed_runs(title, held), lo, n);
                     if runs.len() > *runs_left {
                         MERGE_FAILED[2].fetch_add(1, Ordering::Relaxed);
                         return true;
@@ -2489,7 +2533,7 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    for (r, m) in word_runs(changed_runs(title, held), lo, n) {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.

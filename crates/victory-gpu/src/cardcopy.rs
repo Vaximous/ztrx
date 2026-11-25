@@ -218,7 +218,10 @@ pub(crate) fn landed() {
 
 /// Whether constants filled into upload memory from title memory a
 /// flight's shaders may write are copied on the card instead
-/// (`VICTORY_CARD_FILLS=1`; off by default).
+/// (`VICTORY_CARD_FILLS`; on by default, `=0` off). On: the fills compared
+/// against the CPU's were all alike (run zl3cck, 2,000 of 2,000), and
+/// off, the fills' waits were most of the submitting thread's waiting for
+/// "title memory read": 1.0 a frame, 31 ms (run zall7b).
 ///
 /// A fill of upload memory is a read of title memory at submission, for
 /// the card: where a flight in the air declared that memory written (a
@@ -236,7 +239,7 @@ pub(crate) fn landed() {
 /// ([`fill_blocked`]).
 pub(crate) fn fills_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_CARD_FILLS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_CARD_FILLS_CHECK=1`: the first constants copied on the card are

@@ -92,6 +92,8 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    // What the title asked for, console bits and all (`census`).
+    let (asked_kind, asked_protect) = (kind, protect);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -158,11 +160,33 @@ pub extern "system" fn XMemVirtualAlloc(
             size,
             kind = format_args!("{kind:#x}"),
             flags = format_args!("{flags:#x}"),
+            protect = format_args!("{asked_protect:#x}"),
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
     }
+    if census() {
+        tracing::info!(
+            base = format_args!("{base:p}"),
+            size,
+            kind = format_args!("{asked_kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            protect = format_args!("{asked_protect:#x}"),
+            at = format_args!("{at:p}"),
+            "xmem census: XMemVirtualAlloc"
+        );
+    }
     at
+}
+
+/// `VICTORY_XMEM_CENSUS=1`: every `XMemVirtualAlloc` and
+/// `XMemAllocatePhysicalPages` call is logged with what the title asked
+/// for, console bits included (memory kind, write-combining, GPU access),
+/// which the host drops. For the no-copy memory model: which title memory
+/// the CPU only writes, which it reads too, which the GPU writes.
+fn census() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_XMEM_CENSUS").is_ok_and(|v| v == "1"));
+    *ON
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -437,6 +461,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    if census() {
+        tracing::info!(n, flags = format_args!("{flags:#x}"), "xmem census: XMemAllocatePhysicalPages");
+    }
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());

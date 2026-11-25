@@ -2884,9 +2884,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
                     Some(Some((lo, hi))) if crate::extent::narrow() => {
                         if hi > lo {
                             shadow.gpu_writes(list, address + lo, hi - lo, crate::shadow::Declarer::View);
+                            #[cfg(feature = "diagnostics")]
+                            list.note_declared(address + lo, hi - lo, true);
                         }
                     }
-                    _ => shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View),
+                    _ => {
+                        shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View);
+                        #[cfg(feature = "diagnostics")]
+                        list.note_declared(address, len, false);
+                    }
                 }
                 if BOUNDED.get() {
                     crate::shadow::declared_by_bounded(len);

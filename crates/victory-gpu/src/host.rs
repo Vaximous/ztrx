@@ -755,6 +755,11 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// The ranges of title memory the list's table views declared written
+    /// (address, bytes, whether narrowed by a store extent), with when and
+    /// in which frame: for [`read_place`]'s look at what a read waits for.
+    #[cfg(feature = "diagnostics")]
+    declared: Mutex<Vec<(usize, usize, bool, std::time::Instant, u64)>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -2170,6 +2175,9 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// When it was sent to the card (looked at with diagnostics).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    sent_at: std::time::Instant,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2347,11 +2355,100 @@ fn read_place(runs: &[&HostList]) -> Option<bool> {
     };
     let last = flights.iter().rposition(|ranges| blocked_by(ranges, runs, false).is_some())?;
     let newest = last + 1 == flights.len();
+    #[cfg(feature = "diagnostics")]
+    producer(runs, &flights[last]);
     READ_PLACE[0].fetch_add(1, Ordering::Relaxed);
     READ_PLACE[if newest { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
     READ_PLACE[3].fetch_add((flights.len() - last - 1) as u64, Ordering::Relaxed);
     READ_PLACE[4].fetch_add(flights.len() as u64, Ordering::Relaxed);
     Some(newest)
+}
+
+/// Since the last frame-rate line, of reads that waited for a flight:
+/// those whose producing declaration was found; of them recorded in the
+/// frame of the read, narrowed by an extent; microseconds from the
+/// declaration to the flight's send, and from the send to the read.
+#[cfg(feature = "diagnostics")]
+static PRODUCERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The ranges of title memory `runs` read at submission: what, where, bytes.
+#[cfg(feature = "diagnostics")]
+fn read_ranges(runs: &[&HostList]) -> Vec<(&'static str, usize, usize)> {
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    out.push(("a buffer copy's source", src, len));
+                    out.push(("a buffer copy's destination", dst, len));
+                }
+                &Step::Fill(_, src, len) => out.push(("a fill of upload memory", src, len)),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    out.push(("a texture", at, len));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// For a read of `runs` that waits for flights: the newest flight that
+/// declared what is read (its ranges `ranges`), and in its lists the table
+/// view whose declaration it is: when and in which frame that was recorded,
+/// whether an extent narrowed it, when the flight was sent.
+#[cfg(feature = "diagnostics")]
+fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
+    let reads = read_ranges(runs);
+    let Some(&(what, at, len)) = reads.iter().find(|&&(_, at, len)| touches(ranges, at, at + len)) else {
+        return;
+    };
+    let line = line();
+    let found = line.line.iter().rev().find_map(|item| {
+        let Late::Run(flight) = item else {
+            return None;
+        };
+        flight.lists.iter().find_map(|l| {
+            let declared = l.host().declared.lock().unwrap_or_else(|e| e.into_inner());
+            declared
+                .iter()
+                .find(|&&(a, n, ..)| a < at + len && at < a + n)
+                .map(|&d| (d, flight.number, flight.sent_at))
+        })
+    });
+    drop(line);
+    let now = std::time::Instant::now();
+    let frame = crate::queue::presented();
+    let Some(((address, bytes, narrowed, recorded, recorded_frame), number, sent)) = found else {
+        static UNFOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if UNFOUND.fetch_add(1, Ordering::Relaxed) < 20 {
+            tracing::info!(
+                "a read waits for a flight whose declaration of it is not a table view's (or that flight landed): \
+                 {what} at {at:#x}+{len:#x}"
+            );
+        }
+        return;
+    };
+    let to_send = sent.saturating_duration_since(recorded).as_micros() as u64;
+    let to_read = now.saturating_duration_since(sent).as_micros() as u64;
+    PRODUCERS[0].fetch_add(1, Ordering::Relaxed);
+    PRODUCERS[1].fetch_add(u64::from(recorded_frame == frame), Ordering::Relaxed);
+    PRODUCERS[2].fetch_add(u64::from(narrowed), Ordering::Relaxed);
+    PRODUCERS[3].fetch_add(to_send, Ordering::Relaxed);
+    PRODUCERS[4].fetch_add(to_read, Ordering::Relaxed);
+    static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TOLD.fetch_add(1, Ordering::Relaxed);
+    if n < 60 || n.is_multiple_of(200) {
+        tracing::info!(
+            "a read waits for flight {number}: {what} at {at:#x}+{len:#x}, declared by a table view {address:#x}+{bytes:#x} \
+             ({}), recorded in frame {recorded_frame} (now {frame}), {:.1} ms before the flight was sent, which was \
+             {:.1} ms ago",
+            if narrowed { "narrowed by its store extent" } else { "whole" },
+            to_send as f64 / 1000.0,
+            to_read as f64 / 1000.0,
+        );
+    }
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
@@ -2846,6 +2943,21 @@ fn late_line(frames: f64) {
             r[4] / 1000.0,
         );
     }
+    #[cfg(feature = "diagnostics")]
+    if relay_exact() {
+        let p: Vec<u64> = PRODUCERS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+        let n = p[0].max(1) as f64;
+        tracing::info!(
+            "reads that waited, their producing table views per frame: {:.1} found, {:.1} recorded in the frame of \
+             the read, {:.1} narrowed by an extent; on average {:.1} ms from the view's recording to its flight's send, \
+             {:.1} ms from the send to the read",
+            p[0] as f64 / frames,
+            p[1] as f64 / frames,
+            p[2] as f64 / frames,
+            p[3] as f64 / n / 1000.0,
+            p[4] as f64 / n / 1000.0,
+        );
+    }
     if relay_exact() {
         let p: Vec<f64> = READ_PLACE.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -3194,6 +3306,8 @@ impl Host {
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                declared: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -4218,6 +4332,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                sent_at: std::time::Instant::now(),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4269,6 +4384,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                sent_at: std::time::Instant::now(),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5026,6 +5142,8 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
+        #[cfg(feature = "diagnostics")]
+        self.declared.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5498,6 +5616,19 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// A table view declared `[address, address + len)` written
+    /// (`narrowed`: by a store extent), for [`read_place`].
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_declared(&self, address: u64, len: u64, narrowed: bool) {
+        self.declared.lock().unwrap_or_else(|e| e.into_inner()).push((
+            address as usize,
+            len as usize,
+            narrowed,
+            std::time::Instant::now(),
+            crate::queue::presented(),
+        ));
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,

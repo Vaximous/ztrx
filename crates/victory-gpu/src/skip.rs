@@ -126,7 +126,7 @@ fn with(f: impl FnOnce(&mut Collect)) {
     });
 }
 
-fn collecting() -> bool {
+pub(crate) fn collecting() -> bool {
     COLLECT.with_borrow(Option::is_some)
 }
 

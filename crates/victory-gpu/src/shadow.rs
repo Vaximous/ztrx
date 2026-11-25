@@ -1777,7 +1777,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            moved();
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2941,12 +2945,28 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+/// Bumped whenever what [`find`] answers for an ask may change: a title
+/// buffer registered or let go, a window or an in-place copy made or let
+/// go. A caller that keeps what `find` answered (`crate::draw`'s readable
+/// memo) asks again once it moves.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// [`EPOCH`] now.
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(Ordering::Acquire)
+}
+
+fn moved() {
+    EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    moved();
     buffers().insert(
         (start, resource),
         Entry {
@@ -2959,6 +2979,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+    moved();
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -2999,6 +3020,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        moved();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -3321,6 +3345,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        moved();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -3357,6 +3382,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    moved();
     Some(shadow)
 }
 

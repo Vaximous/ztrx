@@ -53,6 +53,11 @@ pub(crate) fn start() {
 }
 
 /// A buffer view bound ([`crate::skip::note_buffer`]'s callers).
+/// Whether this thread collects a dispatch's views now.
+pub(crate) fn collecting() -> bool {
+    SEEN.with_borrow(Option::is_some)
+}
+
 pub(crate) fn note_buffer(shadow: &crate::shadow::Shadow, address: u64, len: u64, uav: bool) {
     SEEN.with_borrow_mut(|s| {
         let Some(s) = s else {

@@ -567,13 +567,18 @@ pub(crate) static BIND_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// Nanoseconds of the binds by phase, since the last frame-rate line
 /// ([`take_bind_phases`]); [`BIND_PHASES`] names them. The last three
-/// are inside others: the views made readable (refreshes, declared
-/// writes, texture uploads and states), the constant buffers filled (on
-/// the card or the CPU), and `crate::shadow::find` (all its callers).
-pub(crate) static BIND_PHASE_NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// from 9 on are inside others: the views made readable (refreshes,
+/// declared writes, texture uploads and states), the constant buffers
+/// filled (on the card or the CPU), `crate::shadow::find` (all its
+/// callers); then the parts of the descriptor tables: the title's own
+/// slots mirrored (without their readable), fresh tables' keys hashed,
+/// fresh tables reused from earlier in the list (with their readable),
+/// fresh tables' host views made, their dynamic slots taken; and views
+/// decoded from title records (`crate::descriptor::view`, all callers).
+pub(crate) static BIND_PHASE_NS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// [`BIND_PHASE_NS`]'s phases.
-pub(crate) const BIND_PHASES: [&str; 12] = [
+pub(crate) const BIND_PHASES: [&str; 18] = [
     "heaps, root signature, pipeline",
     "store extents",
     "descriptor tables",
@@ -586,10 +591,16 @@ pub(crate) const BIND_PHASES: [&str; 12] = [
     "views made readable",
     "constant buffers filled",
     "host copies looked up",
+    "tables: title slots mirrored",
+    "tables: fresh keys hashed",
+    "tables: fresh reused",
+    "tables: fresh views made",
+    "tables: dynamic slots taken",
+    "views decoded",
 ];
 
 /// [`BIND_PHASE_NS`] since the last call.
-pub(crate) fn take_bind_phases() -> [u64; 12] {
+pub(crate) fn take_bind_phases() -> [u64; 18] {
     std::array::from_fn(|i| BIND_PHASE_NS[i].swap(0, Ordering::Relaxed))
 }
 
@@ -2459,7 +2470,11 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let mirrored = {
+            let _timer = PhaseTimer::new(12);
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = mirrored {
             readable(list, u.kind, &view, Some((u.slot, u.table_offset_dwords)));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2572,6 +2587,7 @@ impl State {
             }
             // The table and what its entries hold (record words).
             let key = {
+                let _timer = PhaseTimer::new(13);
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
@@ -2582,6 +2598,7 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some((first, constants)) = self.fresh_tables.get(&key) {
+                let _timer = PhaseTimer::new(14);
                 let first = *first;
                 // Its constant buffers as the table made first holds them
                 // (the whole range, as there): as noted when it was made
@@ -2619,7 +2636,11 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let taken = {
+                let _timer = PhaseTimer::new(16);
+                host.dynamic(n)
+            };
+            let Some(first) = taken else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -2657,7 +2678,10 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        {
+                            let _timer = PhaseTimer::new(15);
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3344,14 +3368,69 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 /// `at`: the table entry the view is at (root slot, dword in the table).
+/// Whether buffer views a list already made readable are passed over
+/// ([`readable`]): looked up again they find the same host copy, whose
+/// refresh the list has already (`HostList::defer_refresh` keeps one per
+/// range until a title copy), and a buffer has no texture state to make.
+/// Shader views only, as long as no title copy is recorded and no host copy
+/// is made or let go in between (`crate::shadow::epoch`), and not while
+/// a dispatch's views are being collected (`crate::skip`, `crate::hot`).
+/// `VICTORY_READABLE_MEMO=0`: every view made readable each time, as before.
+fn readable_memo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READABLE_MEMO").is_none_or(|v| v != "0"))
+}
+
+/// Views [`readable`] passed over ([`readable_memo`]) and made readable,
+/// since the last frame-rate line ([`take_readable_memo`]).
+static READABLE_MEMO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`READABLE_MEMO`] since the last call.
+pub(crate) fn take_readable_memo() -> [u64; 2] {
+    std::array::from_fn(|i| READABLE_MEMO[i].swap(0, Ordering::Relaxed))
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u32)>) {
     let _timer = PhaseTimer::new(9);
     const UNORDERED_ACCESS: u32 = 0x8;
+    let memo = (readable_memo()
+        && kind == ResourceType::Srv
+        && matches!(view, View::Shader(..) | View::Placed(..))
+        && !crate::skip::collecting()
+        && !crate::hot::collecting())
+    .then(crate::shadow::epoch);
+    if let Some(epoch) = memo
+        && list.readable_known(view, epoch)
+    {
+        READABLE_MEMO[0].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    READABLE_MEMO[1].fetch_add(1, Ordering::Relaxed);
     let placed = crate::descriptor::host::placed_texture(view);
+    let memo = memo.filter(|_| placed.is_none());
+    let original = view;
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     let copy = crate::descriptor::host::buffer_copy(view);
+    // A buffer with a host copy and no texture of the host's: passed over
+    // the next time ([`readable_memo`]).
+    if let Some(epoch) = memo
+        && copy.is_some()
+        && match view {
+            View::Placed(..) => true,
+            View::Shader(resource, _) => {
+                crate::resource::host_resource(*resource as This).is_none()
+                    && crate::resource::alias_of(*resource as This).is_none()
+                    && crate::resource::twin(*resource as This).is_none()
+            }
+            _ => false,
+        }
+    {
+        // Noted first, made readable below: a title copy or a host copy
+        // moved meanwhile moves the epoch, and the note is dropped.
+        list.readable_done(original, epoch);
+    }
     if copy.is_none() {
         crate::skip::note_bad("a texture, or a view of a buffer without a host copy");
     }

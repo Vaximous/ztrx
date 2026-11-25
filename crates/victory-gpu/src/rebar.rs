@@ -56,6 +56,14 @@
 //! - `WriteProcessMemory` into our own page that is no-access or read-only
 //!   fails (error 998): the kernel cannot merge into a protected page for
 //!   us.
+//! - `card_direct_writes_beside_a_flight` holds (twice): 128 KiB written
+//!   through the BAR in 5 us while a flight ran some 300 ms; the next list
+//!   read exactly those bytes, the flight's own write stood, the piece
+//!   between was untouched. The flight had read the old bytes as it
+//!   started. 24,045 ranges of 4 KiB (98 MB): through the BAR 4.4-4.9 ms of
+//!   the CPU (20-22 GB/s); as copies 4.4-4.7 ms of recording and 5.6-6.2
+//!   ms on the card. So the writes cost the submitting thread about what
+//!   recording the copies did; what they save is the card's time.
 
 #[cfg(test)]
 mod tests {

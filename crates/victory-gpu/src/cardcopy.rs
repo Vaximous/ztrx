@@ -43,8 +43,11 @@ const CHECKS_MOST: u64 = 2000;
 static LEARNED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: copies done by the card, their bytes,
-/// sources learned; and of all time: compared, alike, different.
-static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// sources learned; and of all time: compared, alike, different, alike a
+/// later card copy to the same place that landed with it, of the different
+/// those whose destination on the card was not the source right after the
+/// copy.
+static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// A title buffer copy from `[src, src + len)` made a submission wait for
 /// flights: later copies from there are done by the card.
@@ -89,6 +92,8 @@ fn learned(src: usize, len: usize) -> bool {
 struct Compared {
     dst: usize,
     src: Box<[u8]>,
+    /// The destination on the card right after the copy.
+    card_dst: Box<[u8]>,
     done: Box<std::sync::atomic::AtomicU32>,
     age: u32,
 }
@@ -144,32 +149,42 @@ pub(crate) fn try_copy(list: &HostList, dst: usize, src: usize, len: usize) -> b
     STATS[0].fetch_add(1, Ordering::Relaxed);
     STATS[1].fetch_add(len as u64, Ordering::Relaxed);
     if check_on() && STATS[3].load(Ordering::Relaxed) < CHECKS_MOST {
-        compare_later(list, &from, src, dst, len);
+        compare_later(list, &from, &to, src, dst, len);
     }
     true
 }
 
 /// [`check_on`]: the source's bytes on the card, read back right after
 /// the copy, to compare with the destination once the list has landed.
-fn compare_later(list: &HostList, from: &crate::shadow::Shadow, src: usize, dst: usize, len: usize) {
+fn compare_later(
+    list: &HostList,
+    from: &crate::shadow::Shadow,
+    to: &crate::shadow::Shadow,
+    src: usize,
+    dst: usize,
+    len: usize,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let Some(back) = host.read_back_buffer(len as u64) else {
+    let (Some(back), Some(back_dst)) = (host.read_back_buffer(len as u64), host.read_back_buffer(len as u64)) else {
         return;
     };
-    // SAFETY: as in `try_copy`; the read-back buffer is fresh and `len`
+    // SAFETY: as in `try_copy`; the read-back buffers are fresh and `len`
     // bytes long.
     unsafe {
         list.list.CopyBufferRegion(&back, 0, &from.buffer, from.offset(src as u64), len as u64);
+        list.list.CopyBufferRegion(&back_dst, 0, &to.buffer, to.offset(dst as u64), len as u64);
     }
     let mut record = Compared {
         dst,
         src: vec![0u8; len].into_boxed_slice(),
+        card_dst: vec![0u8; len].into_boxed_slice(),
         done: Box::new(std::sync::atomic::AtomicU32::new(0)),
         age: 0,
     };
     list.defer_read_back(back, record.src.as_mut_ptr(), [len, 1, len]);
+    list.defer_read_back(back_dst, record.card_dst.as_mut_ptr(), [len, 1, len]);
     list.defer_write(record.done.as_ptr().cast(), crate::queue::Written::Value(1), 4);
     STATS[3].fetch_add(1, Ordering::Relaxed);
     COMPARED.lock().unwrap_or_else(|e| e.into_inner()).push(record);
@@ -189,36 +204,75 @@ pub(crate) fn landed() {
     if compared.is_empty() {
         return;
     }
+    // Several flights land together: a later copy to the same place may
+    // have landed with this one, and title memory then holds its source
+    // (run zl3cck's 90 differences, all at one 32-byte destination copied
+    // every frame, were looked at only after that). Which source the
+    // title's bytes are is decided over all copies landed now.
+    let landed: Vec<bool> = compared.iter().map(|c| c.done.load(Ordering::Acquire) != 0).collect();
+    let mut verdicts: Vec<Option<Verdict>> = (0..compared.len())
+        .map(|i| {
+            if !landed[i] {
+                return None;
+            }
+            let c = &compared[i];
+            let mut now = vec![0u8; c.src.len()];
+            if !crate::host::read_into(c.dst as *const u8, &mut now) {
+                return Some(Verdict::Different(None, false));
+            }
+            let later = compared
+                .iter()
+                .zip(&landed)
+                .skip(i + 1)
+                .filter(|(o, l)| **l && o.dst == c.dst && o.src.len() == c.src.len())
+                .map(|(o, _)| &*o.src);
+            Some(verdict(&now, &c.src, &c.card_dst, later))
+        })
+        .collect();
+    let mut i = 0;
     compared.retain_mut(|c| {
-        if c.done.load(Ordering::Acquire) == 0 {
+        let v = verdicts[i].take();
+        i += 1;
+        let Some(v) = v else {
             c.age += 1;
             if c.age > 300 {
                 // A list may still write them: never freed.
                 std::mem::forget(std::mem::take(&mut c.src));
+                std::mem::forget(std::mem::take(&mut c.card_dst));
                 std::mem::forget(std::mem::replace(&mut c.done, Box::new(std::sync::atomic::AtomicU32::new(0))));
                 return false;
             }
             return true;
-        }
-        let mut now = vec![0u8; c.src.len()];
-        let same = crate::host::read_into(c.dst as *const u8, &mut now) && *now == *c.src;
-        STATS[if same { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
-        if !same {
-            let first = now.iter().zip(c.src.iter()).position(|(a, b)| a != b);
-            tracing::warn!(
-                dst = format_args!("{:#x}", c.dst),
-                len = c.src.len(),
-                ?first,
-                "a buffer copy done by the card left other bytes than its source"
-            );
-        }
+        };
+        match v {
+            Verdict::Alike => STATS[4].fetch_add(1, Ordering::Relaxed),
+            Verdict::Superseded => STATS[6].fetch_add(1, Ordering::Relaxed),
+            Verdict::Different(first, copy_wrong) => {
+                STATS[5].fetch_add(1, Ordering::Relaxed);
+                if copy_wrong {
+                    STATS[7].fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::warn!(
+                    dst = format_args!("{:#x}", c.dst),
+                    len = c.src.len(),
+                    ?first,
+                    copy_wrong,
+                    "a buffer copy done by the card left other bytes than its source (copy_wrong: the card's \
+                     destination right after the copy was not the source either)"
+                );
+                0
+            }
+        };
         false
     });
 }
 
 /// Whether constants filled into upload memory from title memory a
 /// flight's shaders may write are copied on the card instead
-/// (`VICTORY_CARD_FILLS=1`; off by default).
+/// (`VICTORY_CARD_FILLS`; on by default, `=0` off). On: the fills compared
+/// against the CPU's were all alike (run zl3cck, 2,000 of 2,000), and
+/// off, the fills' waits were most of the submitting thread's waiting for
+/// "title memory read": 1.0 a frame, 31 ms (run zall7b).
 ///
 /// A fill of upload memory is a read of title memory at submission, for
 /// the card: where a flight in the air declared that memory written (a
@@ -236,7 +290,7 @@ pub(crate) fn landed() {
 /// ([`fill_blocked`]).
 pub(crate) fn fills_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_CARD_FILLS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILLS").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_CARD_FILLS_CHECK=1`: the first constants copied on the card are
@@ -435,18 +489,56 @@ pub(crate) fn line(frames: f64) {
     let bytes = STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
     tracing::info!(
         "title buffer copies done by the card per frame (VICTORY_CARD_COPIES=1): {made:.1}, {:.1} KB; sources learned \
-         {}; compared {} (alike {}, different {})",
+         {}; compared {} (alike {}, alike a later copy to the same place landed with it {}, different {}, of them \
+         wrong on the card right after the copy {})",
         bytes / 1024.0,
         STATS[2].load(Ordering::Relaxed),
         STATS[3].load(Ordering::Relaxed),
         STATS[4].load(Ordering::Relaxed),
+        STATS[6].load(Ordering::Relaxed),
         STATS[5].load(Ordering::Relaxed),
+        STATS[7].load(Ordering::Relaxed),
     );
+}
+
+/// What a compared card copy left ([`landed`]).
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// Title memory holds the source.
+    Alike,
+    /// It holds the source of a later copy to the same place that landed
+    /// with it.
+    Superseded,
+    /// Neither: the first byte that differs, and whether the card's
+    /// destination right after the copy was not the source either.
+    Different(Option<usize>, bool),
+}
+
+fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator<Item = &'a [u8]>) -> Verdict {
+    if now == src {
+        return Verdict::Alike;
+    }
+    if later.any(|s| s == now) {
+        return Verdict::Superseded;
+    }
+    let first = now.iter().zip(src).position(|(a, b)| a != b);
+    Verdict::Different(first, card_dst != src)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{learn, overlaps};
+    use super::{Verdict, learn, overlaps, verdict};
+
+    /// A copy whose place a later landed copy wrote is not counted
+    /// different; one wrong on the card already is told apart.
+    #[test]
+    fn verdicts_tell_later_copies_and_wrong_copies_apart() {
+        let (a, b, c) = ([1u8, 2, 3, 4], [1u8, 2, 9, 4], [7u8, 7, 7, 7]);
+        assert_eq!(verdict(&a, &a, &a, std::iter::empty()), Verdict::Alike);
+        assert_eq!(verdict(&b, &a, &a, [&c[..], &b[..]].into_iter()), Verdict::Superseded);
+        assert_eq!(verdict(&b, &a, &a, [&c[..]].into_iter()), Verdict::Different(Some(2), false));
+        assert_eq!(verdict(&b, &a, &c, std::iter::empty()), Verdict::Different(Some(2), true));
+    }
 
     /// Learned sources join where they touch; a copy is done by the card if
     /// it reads any of them.

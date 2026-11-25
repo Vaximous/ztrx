@@ -186,7 +186,11 @@ pub(crate) fn try_copy(list: &HostList, dst: usize, src: usize, len: usize) -> b
             learned(src, len)
         }
     };
-    if !on() || len == 0 || !chosen() {
+    // The list's own card writes earlier (`after_write_on`): a CPU copy
+    // runs at submission, before them, so it would read the bytes from
+    // before, or be overwritten by their copy-back.
+    let after_write = || after_write_on() && (list.gpu_written(src, len) || list.gpu_written(dst, len));
+    if !on() || len == 0 || !chosen() && !after_write() {
         return false;
     }
     let (Some(from), Some(to)) =
@@ -363,10 +367,24 @@ pub(crate) fn fills_on() -> bool {
 
 /// `VICTORY_CARD_FILLS_CHECK=1`: the first constants copied on the card are
 /// also filled by the CPU, as before, and the two compared once the list
-/// has landed.
-fn fills_check_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_CARD_FILLS_CHECK").is_ok_and(|v| v == "1"))
+/// has landed. `=2`: only those `VICTORY_READ_ON_CARD` sent to the card
+/// because flights may write them (the CPU fill then makes the submission
+/// wait for them, so the compare is against the landed bytes). `=3`: only
+/// those sent to the card because the list itself may write them earlier
+/// ([`after_write_on`]; the CPU fill reads title memory before that write,
+/// so a difference there is the staleness the card fill closes).
+fn fills_check_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_FILLS_CHECK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        _ => 0,
+    })
+}
+
+pub(crate) fn fills_check_on() -> bool {
+    fills_check_mode() != 0
 }
 
 /// Source ranges of fills that made a submission wait, joined.
@@ -430,7 +448,8 @@ fn fill_uav_skip_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_FILL_UAV_SKIP").is_ok_and(|v| v == "1"))
 }
 
-/// `VICTORY_FILL_AFTER_WRITE=1` (off by default): a draw's constants in
+/// `VICTORY_FILL_AFTER_WRITE=1` (on by default with [`read_on_card`],
+/// `=0` turns it off): a draw's constants in
 /// title memory that the list's own shaders or card copies may write
 /// earlier in it are copied on the card ([`try_fill`]) whether or not
 /// their source was learned.
@@ -448,9 +467,20 @@ fn fill_uav_skip_on() -> bool {
 /// fills; written and read within one submission they never wait, so they
 /// are never learned (runs zall10lw and zall11blk: the strips at the
 /// bottom of the picture, not in zall9b).
+///
+/// With `VICTORY_READ_ON_CARD` every title buffer copy whose ends flights
+/// may write is a card copy, its destination declared written; the title
+/// often copies a buffer's constants and draws with them in the same list.
+/// Done by the CPU (before), the copy came first in the list's steps; a
+/// CPU fill of them now reads title memory before the card's copy (run
+/// zall15d: the hair black).
 fn after_write_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_FILL_AFTER_WRITE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_FILL_AFTER_WRITE").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => read_on_card(),
+    })
 }
 
 /// Whether a draw's constants and a title buffer copy are read on the card
@@ -948,9 +978,10 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
 /// [`try_fill`].
 fn fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     use windows::Win32::Graphics::Direct3D12::*;
-    let chosen = || {
+    let mut under = false;
+    let mut chosen = || {
         if read_on_card() {
-            let under = crate::host::flights_write(src as usize, len as usize);
+            under = crate::host::flights_write(src as usize, len as usize);
             if under {
                 READ_ON_CARD_STATS[0].fetch_add(1, Ordering::Relaxed);
             }
@@ -993,7 +1024,12 @@ fn fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     if from.writes_pending() {
         FILL_STATS[FILL_UNDER_FLIGHTS].fetch_add(1, Ordering::Relaxed);
     }
-    let check = fills_check_on() && FILL_STATS[3].load(Ordering::Relaxed) < CHECKS_MOST;
+    let check = match fills_check_mode() {
+        1 => true,
+        2 => under,
+        3 => !under,
+        _ => false,
+    } && FILL_STATS[3].load(Ordering::Relaxed) < CHECKS_MOST;
     // SAFETY: a live buffer.
     let gpu = unsafe { stand_in.GetGPUVirtualAddress() } + at;
     let fill = Fill { stand_in, at, from: from.buffer.clone(), from_at: from.offset(src), len, first, src, check };

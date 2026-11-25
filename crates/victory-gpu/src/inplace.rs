@@ -1276,6 +1276,50 @@ mod tests {
         }
     }
 
+    /// On the software adapter: scratch memory made as with
+    /// `VICTORY_READ_FIXUP` (write-combined, in the PC, the common state)
+    /// is written by the CPU, overwritten by a copy on the card, made
+    /// readable again by a transition, and the CPU sees the card's bytes.
+    #[test]
+    fn warp_scratch_memory_the_card_may_write() {
+        let Some(device) = warp() else { return };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let mut rig = Rig::new(&device).unwrap();
+        // SAFETY: plain creation, mapping and copies of buffers of the
+        // test's own, the ranges inside them.
+        unsafe {
+            let mut scratch: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(K64 as u64, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COMMON, None, &mut scratch)
+                .unwrap();
+            let scratch = scratch.unwrap();
+            let mut data = std::ptr::null_mut();
+            scratch.Map(0, None, Some(&mut data)).unwrap();
+            let data = data.cast::<u8>();
+            std::ptr::write_bytes(data, 0x11, 1024);
+            let source = rig.committed(D3D12_HEAP_TYPE_DEFAULT, K64 as u64, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            rig.store(&source, 0x200, &[0x5a; 64]).unwrap();
+            rig.run(|list| {
+                list.CopyBufferRegion(&scratch, 0x100, &source, 0x200, 64);
+                list.ResourceBarrier(&[crate::host::transition(
+                    &scratch,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                )]);
+            })
+            .unwrap();
+            let got = std::slice::from_raw_parts(data, 1024);
+            assert!(got[0x100..0x140].iter().all(|&b| b == 0x5a), "the card's copy");
+            assert!(got[..0x100].iter().chain(&got[0x140..]).all(|&b| b == 0x11), "the CPU's bytes around it");
+            scratch.Unmap(0, None);
+        }
+    }
+
     /// The census names each kind of memory.
     #[test]
     fn census_tells_private_memory_from_views() {

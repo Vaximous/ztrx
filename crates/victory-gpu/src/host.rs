@@ -2575,8 +2575,9 @@ mod relay_tests {
         written_landed(&[(copy, 5)].into_iter().collect(), 0);
         assert!(fixup_hot(copy, 4, 6, &[]));
         assert!(!fixup_hot(copy, 7, 9, &[(copy, 0, 100)]));
-        // A neighbour seen written lately (`VICTORY_READ_FIXUP_NEAR`, 1).
-        assert!(fixup_hot(copy, 6, 9, &[]));
+        // A neighbour seen written lately: hot only with
+        // `VICTORY_READ_FIXUP_NEAR` 1 or more.
+        assert_eq!(fixup_hot(copy, 6, 9, &[]), super::fixup_near() >= 1);
         assert!(!fixup_hot(0xd000, 0, 9, &[(0xd000, 0, 100)]));
         // Flagged long ago (frame 0, read far later is simulated by a piece
         // whose frame is old): hot only while declared in the air.
@@ -2980,12 +2981,18 @@ struct FillCheck {
 
 /// [`read_fixup_mode`] `recent`: a fill's pieces count as written by
 /// flights also if a piece this near (`VICTORY_READ_FIXUP_NEAR`, in
-/// pieces of 64 KiB, default 1; 0 the fill's own) was. A shader that
+/// pieces of 64 KiB; 0, the default, the fill's own) was. A shader that
 /// appends moves on into the next piece, which no landing flagged yet:
 /// such first writes are what the seen-written prediction cannot see.
+///
+/// At 1 (run zall26r) it sent 3,400-5,100 fills a frame to the card
+/// against 170-195 at 0 (zall24r), with more refreshes under flights to
+/// put in, and the picture showed contour banding on a wall that zall24r
+/// did not: the more fills go to the card, the worse the picture (zall19fx,
+/// all of them, was broken too).
 fn fixup_near() -> u32 {
     static N: OnceLock<u32> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_READ_FIXUP_NEAR").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    *N.get_or_init(|| std::env::var("VICTORY_READ_FIXUP_NEAR").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// [`fixup_check`]: per piece (copy, piece) of copies in the card's
@@ -5398,9 +5405,13 @@ impl Host {
                         // through the BAR (then the scatter pass, whose
                         // table was made from all of `ranges`, is not used).
                         let direct = copies.as_ref().map(|c| &c[k]);
+                        // Whether the scatter pass wrote the copy (it is left
+                        // in the copies' state then, copies or not).
+                        let mut wrote = false;
                         let copied = match (direct, scattered.get(k), work.scatter.as_ref(), table_gpu) {
                             (Some(held), ..) => held.as_slice(),
                             (None, Some((copies, at, count)), Some(pass), Some(table)) if *count > 0 => {
+                                wrote = true;
                                 // The copy is promoted from the common state,
                                 // where every buffer is at the start of a
                                 // submission; then in the state the copies
@@ -5433,8 +5444,11 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         // (Written through the BAR only: the buffer is in the
-                        // common state, and the hashing's read promotes it.)
-                        if !copied.is_empty() {
+                        // common state, and the hashing's read promotes it.
+                        // After the scatter pass alone it is in the copies'
+                        // state too: run zall26r's ranges were all small, and
+                        // the hashing read the copy with no transition.)
+                        if !copied.is_empty() || wrote {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,

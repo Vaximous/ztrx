@@ -9414,6 +9414,10 @@ impl Meter {
                     "textures the title fills written by host copies since the start: {marked}, {unsent} of them before any upload                      from title memory, {partly} in some subresources only; {rest} uploads of the other subresources                      (VICTORY_HOST_WRITTEN_SUBS)"
                 );
             }
+            tracing::info!(
+                "host textures made since the start (committed, optimal layout): {}",
+                crate::resource::census_line()
+            );
             {
                 let [looked, differed, lasting, recopied] =
                     [0, 1, 2, 3].map(|i| crate::shadow::AUDIT[i].load(Ordering::Relaxed));

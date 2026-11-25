@@ -1707,8 +1707,118 @@ fn host_texture(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // SAFETY: a plain query of a description the device just took.
+        let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[t.GetDesc()]) }.SizeInBytes;
+        host_census(desc, &d, bytes);
     }
     texture
+}
+
+/// What host textures are made as, since the start, for the bandwidth
+/// census line: counts, then bytes. See [`census_line`].
+pub(crate) static CENSUS: [std::sync::atomic::AtomicU64; CENSUS_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CENSUS_SLOTS];
+/// The title's flag bits and layouts (bit per layout value) seen.
+pub(crate) static CENSUS_TITLE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+const CENSUS_SLOTS: usize = 2 * CENSUS_KINDS;
+/// The kinds [`CENSUS`] counts, each a count and (at `CENSUS_KINDS + i`)
+/// bytes.
+const CENSUS_NAMES: [&str; 18] = [
+    "made",
+    "render targets",
+    "depth",
+    "unordered access",
+    "targets with unordered access",
+    "title depth with unordered access (twin)",
+    "title simultaneous access (dropped)",
+    "title row-major layout (made optimal)",
+    "typeless on the host",
+    "wider texels than the title's",
+    "multisampled",
+    "block compressed",
+    "8/16-bit texels",
+    "32-bit texels",
+    "64-bit texels",
+    "96/128-bit texels",
+    "32-bit float targets or unordered (R32/RG32/RGBA32 float)",
+    "16-bit float targets or unordered",
+];
+const CENSUS_KINDS: usize = CENSUS_NAMES.len();
+
+/// Counts one host texture made: `title` the title's description, `host`
+/// what the host was asked for, `bytes` what the host gave.
+fn host_census(title: &ResourceDesc, host: &ResourceDesc, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const SIMULTANEOUS: u32 = 0x20;
+    const ROW_MAJOR: u32 = 1;
+    let note = |i: usize| {
+        CENSUS[i].fetch_add(1, Relaxed);
+        CENSUS[CENSUS_KINDS + i].fetch_add(bytes, Relaxed);
+    };
+    CENSUS_TITLE[0].fetch_or(u64::from(title.flags), Relaxed);
+    CENSUS_TITLE[1].fetch_or(1 << title.layout.min(63), Relaxed);
+    note(0);
+    let f = host.flags;
+    for (i, on) in [
+        f & TARGET != 0,
+        f & DEPTH != 0,
+        f & UNORDERED != 0,
+        f & TARGET != 0 && f & UNORDERED != 0,
+        title.flags & (DEPTH | UNORDERED) == DEPTH | UNORDERED,
+        title.flags & SIMULTANEOUS != 0,
+        title.layout == ROW_MAJOR,
+        family(host.format) == host.format && family(host.format + 1) == host.format,
+        element(host.format).map(|e| e.0) > element(title.format).map(|e| e.0),
+        host.sample_count > 1,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if on {
+            note(1 + i);
+        }
+    }
+    match element(host.format) {
+        Some((_, 4)) => note(11),
+        Some((1 | 2, _)) => note(12),
+        Some((4, _)) => note(13),
+        Some((8, _)) => note(14),
+        Some((12 | 16, _)) => note(15),
+        _ => {}
+    }
+    if f & (TARGET | UNORDERED) != 0 {
+        if [2, 6, 16, 41].contains(&host.format) {
+            note(16);
+        }
+        if [10, 34, 54].contains(&host.format) {
+            note(17);
+        }
+    }
+}
+
+/// The census line's text: each kind's count and MiB, then the title's
+/// flag bits and layouts seen.
+pub(crate) fn census_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut text: Vec<String> = CENSUS_NAMES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let n = CENSUS[i].load(Relaxed);
+            let mib = CENSUS[CENSUS_KINDS + i].load(Relaxed) >> 20;
+            format!("{name} {n} ({mib} MiB)")
+        })
+        .collect();
+    text.push(format!(
+        "title flag bits {:#x}, layouts {:#x}",
+        CENSUS_TITLE[0].load(Relaxed),
+        CENSUS_TITLE[1].load(Relaxed)
+    ));
+    text.join(", ")
 }
 
 /// A texture's console memory and description; `None` for buffers.

@@ -1027,7 +1027,16 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // `VICTORY_WIDE_THREADS=<n>` (1-32): the kept threads; by default a
+        // quarter of the logical processors, 2 to 6. With the change
+        // tracking's kernel calls out of its locks (`VICTORY_WATCH_SPLIT`),
+        // `VirtualProtect` on views went on scaling to 8 threads on this PC
+        // (`crate::rebar`).
+        let n = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 32))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");

@@ -7415,7 +7415,10 @@ impl HostList {
 /// title memory. With the switch the copies of a flush (four or more) are
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// they are for the title's threads; those locks were held across the
+/// kernel calls, so the refreshes waited for each other there, unless
+/// `VICTORY_WATCH_SPLIT=1` (`crate::watch`) makes the calls outside them.
+/// `VICTORY_WIDE_THREADS` sets how many threads are kept.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
@@ -8146,10 +8149,11 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
+                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms;                  guards given back half done (VICTORY_WATCH_SPLIT) {} since the start",
                 slow[0] as f64 / frames,
                 slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
+                slow[2] as f64 / 1e3,
+                crate::watch::SPLIT_CANCELLED.load(Ordering::Relaxed)
             );
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;

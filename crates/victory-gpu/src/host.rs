@@ -2657,6 +2657,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
+                            if touches(written, src, src + len) {
+                                crate::cardcopy::blocked(src, len);
+                            }
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             note_read_block("a buffer copy", written, src, len);

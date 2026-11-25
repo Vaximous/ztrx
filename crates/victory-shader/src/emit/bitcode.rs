@@ -430,6 +430,90 @@ impl Module {
         false
     }
 
+    /// Whether instruction `i` is a group barrier with an LDS fence (`dx.op.barrier` whose
+    /// mode waits for the group and fences group-shared memory).
+    fn group_barrier(&self, i: u32) -> bool {
+        let Op::Call(f, args) = &self.insts[i as usize].op else {
+            return false;
+        };
+        self.funcs[*f as usize].name == "dx.op.barrier"
+            && args.get(1).and_then(|&m| self.int_value(m)).is_some_and(|m| m & 9 == 9)
+    }
+
+    /// Takes out the barriers of `cands` (calls, each with a key) that no thread needs to wait
+    /// at: from each, every path to a store of `stores` with its key (an LDS slot the barrier
+    /// keeps from being written again before the group read it) passes a group barrier kept.
+    /// Returns how many went.
+    pub fn drop_barriers(&mut self, cands: &[(V, u32)], stores: &[(V, u32)]) -> usize {
+        let at: HashMap<u32, (usize, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, blk)| blk.body.iter().enumerate().map(move |(n, &i)| (i, (b, n))))
+            .collect();
+        let id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => panic!("not an instruction"),
+        };
+        let mut kept: Vec<bool> = cands.iter().map(|&(c, _)| !at.contains_key(&id(c))).collect();
+        let dropped = |kept: &[bool], i: u32| cands.iter().zip(kept).any(|(&(c, _), &k)| !k && id(c) == i);
+        loop {
+            let mut changed = false;
+            for n in 0..cands.len() {
+                if kept[n] {
+                    continue;
+                }
+                let (c, key) = cands[n];
+                let (b0, i0) = at[&id(c)];
+                let hits = |i: u32| stores.iter().any(|&(st, k)| k == key && id(st) == i);
+                // scans a block's body from `from`: Some(true) at a store first, Some(false)
+                // at a barrier first, None through to its end
+                let scan = |b: usize, from: usize| -> Option<bool> {
+                    for &i in &self.blocks[b].body[from..] {
+                        if hits(i) {
+                            return Some(true);
+                        }
+                        if i != id(c) && self.group_barrier(i) && !dropped(&kept, i) {
+                            return Some(false);
+                        }
+                    }
+                    None
+                };
+                let mut reaches = scan(b0, i0 + 1);
+                if reaches.is_none() {
+                    let mut seen = vec![false; self.blocks.len()];
+                    let mut stack: Vec<usize> = successors(self.blocks[b0].term).to_vec();
+                    while let Some(b) = stack.pop() {
+                        if std::mem::replace(&mut seen[b], true) {
+                            continue;
+                        }
+                        match scan(b, 0) {
+                            Some(true) => {
+                                reaches = Some(true);
+                                break;
+                            }
+                            Some(false) => {}
+                            None => stack.extend_from_slice(&successors(self.blocks[b].term)),
+                        }
+                    }
+                }
+                if reaches == Some(true) {
+                    kept[n] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let gone: std::collections::HashSet<u32> =
+            cands.iter().zip(&kept).filter(|(_, k)| !**k).map(|(&(c, _), _)| id(c)).collect();
+        for blk in &mut self.blocks {
+            blk.body.retain(|i| !gone.contains(i));
+        }
+        gone.len()
+    }
+
     /// Whether `block` has its terminator.
     pub fn ended(&self, block: usize) -> bool {
         self.blocks[block].term.is_some()
@@ -538,9 +622,10 @@ impl Module {
         };
         self.push(block, ty, Op::Load(ptr))
     }
-    pub fn store(&mut self, block: usize, ptr: V, value: V) {
+    /// The store, as an instruction ([`Module::drop_barriers`] names it).
+    pub fn store(&mut self, block: usize, ptr: V, value: V) -> V {
         let void = self.void();
-        self.push(block, void, Op::Store(ptr, value));
+        self.push(block, void, Op::Store(ptr, value))
     }
     pub fn atomic(&mut self, block: usize, op: Rmw, ptr: V, value: V) -> V {
         let ty = self.type_of(value);
@@ -1218,6 +1303,47 @@ mod tests {
             }
         }
         live
+    }
+
+    /// A loop of `sites` exchanges, each through pair `site % keys`: a store, a group barrier,
+    /// a load and the barrier after the reads. Returns how many of those last barriers go.
+    fn ring_loop(sites: u32, keys: u32) -> usize {
+        let mut m = Module::default();
+        let (i32t, void) = (m.int(32), m.void());
+        let fty = m.func_ty(void, vec![i32t, i32t]);
+        m.ptr(fty);
+        let barrier = m.function("dx.op.barrier", fty, Some(Attr::NoDuplicate), false);
+        let arr = m.array(16, i32t);
+        let lds = m.global("lds", arr, 3);
+        let (op, mode) = (m.i32(80), m.i32(9));
+        let (body, exit) = (m.new_block(), m.new_block());
+        let (mut cands, mut stores) = (Vec::new(), Vec::new());
+        for site in 0..sites {
+            let key = site % keys;
+            let at = m.i32(2 * key);
+            let ptr = m.element(body, lds, at);
+            let one = m.i32(1);
+            stores.push((m.store(body, ptr, one), key));
+            m.call(body, barrier, vec![op, mode]);
+            m.load(body, ptr);
+            cands.push((m.call(body, barrier, vec![op, mode]), key));
+        }
+        let again = m.bool(true);
+        m.terminate(body, Term::CondBr(again, body, exit));
+        m.terminate(exit, Term::Ret);
+        m.drop_barriers(&cands, &stores)
+    }
+
+    #[test]
+    fn a_barrier_after_an_exchanges_reads_goes_where_another_comes_first() {
+        // one exchange in a loop: its pair is written again with no other barrier between
+        assert_eq!(ring_loop(1, 4), 0);
+        // two through different pairs: each one's first barrier covers the other
+        assert_eq!(ring_loop(2, 4), 2);
+        // through one pair: the next store comes before any barrier but the dropped one
+        assert_eq!(ring_loop(2, 1), 0);
+        // five through four pairs: the last one's pair is the first one's, written next
+        assert_eq!(ring_loop(5, 4), 4);
     }
 
     #[test]

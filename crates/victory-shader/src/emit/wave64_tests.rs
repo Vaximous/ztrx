@@ -636,3 +636,76 @@ fn a_wave_wide_branch_after_a_first_lane_read_shares_its_meeting() {
     }
     eprintln!("ran on the hardware device: the first lane and the branch from one meeting");
 }
+
+/// One console wave of 64 threads. A loop of s1 iterations reads lane 40 of v1 (the upper
+/// host wave's) and lane 3 (the lower's) and adds both to v1; each thread stores its v1.
+/// The reads exchange through two pairs of the ring, so neither keeps its barrier after the
+/// reads (`Module::drop_barriers`): the other's first barrier keeps its pair from being
+/// written again before both host waves read it.
+#[test]
+fn lane_reads_in_a_loop_need_one_meeting_each() {
+    let ra = super::valu_tests::vop3(0x360, 12, 256 + 1, 128 + 40, 0); // v_readlane_b32 s12, v1, 40
+    let rb = super::valu_tests::vop3(0x360, 13, 256 + 1, 128 + 3, 0); // v_readlane_b32 s13, v1, 3
+    let words = [
+        0x7E02_0300, // v_mov_b32 v1, v0
+        ra[0],
+        ra[1],
+        rb[0],
+        rb[1],
+        0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+        0x4A02_020D, // v_add_nc_u32 v1, s13, v1
+        0x8081_8101, // s_sub_u32 s1, s1, 1
+        0xBF07_8001, // s_cmp_lg_u32 s1, 0
+        0xBF85_FFF7, // s_cbranch_scc1 to the first lane read
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x38 << 26 | 0x1C << 18 | 0x1000,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    for n in [1u32, 2, 7, 64, 500] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = n;
+            }
+        }
+        let mut v: Vec<u32> = (0..64).collect();
+        for _ in 0..n {
+            let (a, b) = (v[40], v[3]);
+            for x in &mut v {
+                *x = x.wrapping_add(a).wrapping_add(b);
+            }
+        }
+        for _ in 0..4 {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            assert_eq!(out[0][..64], v[..], "{n} iterations");
+        }
+    }
+    eprintln!("ran on the hardware device: lane reads in a loop with one meeting each");
+}

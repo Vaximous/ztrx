@@ -262,6 +262,13 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// Exchanges so far, which pick their pair of the ring by it ([`Self::exchange_pair`]).
+    ring_next: u32,
+    /// The group barriers after an exchange's reads, and the exchanges' stores, by pair of the
+    /// ring: a barrier goes where another always comes before the pair is written again
+    /// ([`super::bitcode::Module::drop_barriers`]).
+    ring_barriers: Vec<(V, u32)>,
+    ring_stores: Vec<(V, u32)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -844,6 +851,17 @@ pub(super) fn pair_sync_on() -> bool {
 /// The most values one meeting of a pair carries ([`Lower::meet_with`]).
 const PAYLOAD: u32 = 2;
 
+/// Pairs of exchange dwords per console wave ([`Lower::exchange_pair`]): an exchange takes
+/// the next, so the barrier after its reads can go where another exchange's barrier comes
+/// before the pair is written again.
+const RING: u32 = 4;
+
+/// `VICTORY_EXCHANGE_BARRIERS=2`: every exchange keeps its barrier after the reads.
+pub(super) fn exchange_barriers_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_BARRIERS").is_some_and(|v| v == "2"))
+}
+
 fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
@@ -1365,7 +1383,7 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += 2 * RING * group.div_ceil(64);
                             }
                         }
                     }
@@ -1596,6 +1614,9 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            ring_next: 0,
+            ring_barriers: Vec::new(),
+            ring_stores: Vec::new(),
             abort: None,
         }
     }
@@ -3619,10 +3640,35 @@ impl<'a> Lower<'a> {
     }
 
     /// A group barrier with an LDS fence in `block`.
-    fn group_sync(&mut self, block: usize) {
+    fn group_sync(&mut self, block: usize) -> V {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode])
+    }
+
+    /// The meeting after the reads of an exchange through pair `key` of the ring
+    /// ([`Self::exchange_pair`]), which keeps the pair from being written again before both
+    /// host waves read it: a group barrier the lowering's end drops where another one always
+    /// comes first ([`Self::drop_ring_barriers`]).
+    fn meet_after_reads(&mut self, at: usize, key: u32) {
+        if self.pair_sync.is_some() {
+            self.meet(at);
+            return;
+        }
+        self.meetings.push(at);
+        let b = self.group_sync(at);
+        self.ring_barriers.push((b, key));
+    }
+
+    /// See [`Self::meet_after_reads`]: unless `VICTORY_EXCHANGE_BARRIERS=2` (all kept).
+    fn drop_ring_barriers(&mut self) {
+        if self.ring_barriers.is_empty() || exchange_barriers_kept() {
+            return;
+        }
+        let n = self.s.m.drop_barriers(&self.ring_barriers, &self.ring_stores);
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("WAVE64-EXCHANGES {n} of {} barriers after the reads dropped", self.ring_barriers.len());
+        }
     }
 
     /// The two host waves of this thread's console wave meet, with a shared-memory fence on
@@ -3653,14 +3699,14 @@ impl<'a> Lower<'a> {
         assert!(mine.len() <= PAYLOAD as usize);
         self.meetings.push(at);
         let Some(pc) = self.pair_sync else {
-            self.group_sync(at);
+            let _ = self.group_sync(at);
             return (at, Vec::new());
         };
         // (a block not ended that is not the one being lowered would be ended later, over
         // the wait; the entry block stays first and whole while it is being lowered)
         if at == self.cur && at == self.s.entry || at != self.cur && !self.s.m.ended(at) {
             self.meet_bad = true;
-            self.group_sync(at);
+            let _ = self.group_sync(at);
             return (at, Vec::new());
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
@@ -3795,14 +3841,15 @@ impl<'a> Lower<'a> {
             return got[0];
         }
         // the pair of dwords of this thread's console wave: its half's, then both
-        let pair = self.exchange_pair(slot);
+        let (pair, key) = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        let st = self.s.m.store(at, ptr, mine);
+        self.ring_stores.push((st, key));
         let at = self.meet(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
@@ -3811,7 +3858,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.meet(at);
+        self.meet_after_reads(at, key);
         (lo, hi)
     }
 
@@ -3938,20 +3985,29 @@ impl<'a> Lower<'a> {
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
     /// block): a group of several console waves has a pair for each.
-    fn exchange_pair(&mut self, slot: u32) -> V {
-        if let Some(v) = self.pair {
-            return v;
-        }
+    fn exchange_pair(&mut self, slot: u32) -> (V, u32) {
         let e = self.s.entry;
-        let thread = self.console_thread();
-        let six = self.s.m.i32(6);
-        let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
-        let base = self.s.m.i32(slot);
-        let v = self.s.m.bin(e, Bin::Add, base, twice);
-        self.pair = Some(v);
-        v
+        let v = match self.pair {
+            Some(v) => v,
+            None => {
+                let thread = self.console_thread();
+                let six = self.s.m.i32(6);
+                let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+                let per_wave = self.s.m.i32(2 * RING);
+                let own = self.s.m.bin(e, Bin::Mul, wave, per_wave);
+                let base = self.s.m.i32(slot);
+                let v = self.s.m.bin(e, Bin::Add, base, own);
+                self.pair = Some(v);
+                v
+            }
+        };
+        let key = self.ring_next % RING;
+        self.ring_next += 1;
+        if key == 0 {
+            return (v, key);
+        }
+        let off = self.s.m.i32(2 * key);
+        (self.s.m.bin(e, Bin::Add, v, off), key)
     }
 
     /// The console's decision of the branch closing IR block `b`, which the wave takes
@@ -7618,17 +7674,18 @@ impl<'a> Lower<'a> {
                     }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-                    let k = self.exchange_pair(slot);
+                    let (k, key) = self.exchange_pair(slot);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
-                    self.s.m.store(self.cur, ptr, a);
+                    let st = self.s.m.store(self.cur, ptr, a);
+                    self.ring_stores.push((st, key));
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
                     let c2 = self.meet(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.meet(c2);
+                    self.meet_after_reads(c2, key);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -11166,6 +11223,7 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        self.drop_ring_barriers();
         Ok(())
     }
 }

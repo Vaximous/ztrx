@@ -15,6 +15,14 @@
 //!   heap can be put at an address of our choice (a shared handle mapped
 //!   as a section into a placeholder): the crux of backing title memory
 //!   with it.
+//! - `card_direct_writes_beside_a_flight` checks what
+//!   `VICTORY_CARD_DIRECT=1` (`crate::shadow::card_direct`) rests on: while
+//!   a flight that writes piece 0 of a GPU upload buffer still runs, the
+//!   CPU writes pieces 2 and 3 through the BAR; a list sent after that
+//!   (the next submission's hashing) must read exactly those bytes, the
+//!   flight's own write must stand, and piece 1 must be untouched. It also
+//!   times 30,000 scattered ranges of 4 KiB (about a frame's sends) both
+//!   ways: written through the BAR, and recorded and run as copies.
 //! - `kernel_calls_scale` measures `GetWriteWatch` (with reset),
 //!   `VirtualProtect` on 64 KiB views of a reserved section (as `xmem`
 //!   maps the page pool) and `VirtualQuery`, from 1 to 16 threads on
@@ -48,6 +56,14 @@
 //! - `WriteProcessMemory` into our own page that is no-access or read-only
 //!   fails (error 998): the kernel cannot merge into a protected page for
 //!   us.
+//! - `card_direct_writes_beside_a_flight` holds (twice): 128 KiB written
+//!   through the BAR in 5 us while a flight ran some 300 ms; the next list
+//!   read exactly those bytes, the flight's own write stood, the piece
+//!   between was untouched. The flight had read the old bytes as it
+//!   started. 24,045 ranges of 4 KiB (98 MB): through the BAR 4.4-4.9 ms of
+//!   the CPU (20-22 GB/s); as copies 4.4-4.7 ms of recording and 5.6-6.2
+//!   ms on the card. So the writes cost the submitting thread about what
+//!   recording the copies did; what they save is the card's time.
 
 #[cfg(test)]
 mod tests {
@@ -566,6 +582,256 @@ mod tests {
         }
         drop(more);
         println!("end: {}", bar1());
+    }
+
+    /// A compute pipeline from HLSL whose root signature is inside it.
+    fn pipeline(device: &ID3D12Device, source: &str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; then the
+        // blob's own bytes, which hold the root signature too.
+        unsafe {
+            let compiled = D3DCompile(source.as_ptr().cast(), source.len(), s!("rebar"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors));
+            if let Some(errors) = &errors {
+                let text = std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize());
+                println!("{}", String::from_utf8_lossy(text));
+            }
+            compiled?;
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            })?;
+            Ok((root, pso))
+        }
+    }
+
+    /// `VICTORY_CARD_DIRECT=1`'s ground: writes through the BAR beside a
+    /// flight that is still running, in pieces it does not write.
+    #[test]
+    #[ignore = "opens the card: cargo test -p victory-gpu --lib rebar -- --ignored --nocapture --test-threads=1"]
+    fn card_direct_writes_beside_a_flight() {
+        let (device, name) = hardware().expect("a hardware adapter");
+        println!("adapter: {name}");
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        // SAFETY: a plain query that fills our structure.
+        let _ = unsafe {
+            device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32)
+        };
+        if !o16.GPUUploadHeapSupported.as_bool() {
+            println!("no GPU upload heaps: VICTORY_CARD_DIRECT=1 keeps the copies");
+            return;
+        }
+        // The flight: reads piece 2's first word as it starts, spins, then
+        // writes piece 0 (a mark, the spin's result, what it saw).
+        const FLIGHT: &str = "#define RS \"RootConstants(num32BitConstants=2, b0), UAV(u0)\"\n\
+            cbuffer C : register(b0) { uint spins; uint mark; };\n\
+            RWByteAddressBuffer b : register(u0);\n\
+            [RootSignature(RS)]\n[numthreads(1, 1, 1)]\n\
+            void main() { uint seen = b.Load(131072); uint x = seen; for (uint i = 0; i < spins; i++) { x = x * 1664525u + 1013904223u; } \
+            b.Store(0, mark); b.Store(4, x); b.Store(8, seen); }\n";
+        // The next submission's hashing, in short: a weighted sum of the
+        // words of pieces 2 and 3.
+        const HASH: &str = "#define RS \"RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)\"\n\
+            cbuffer C : register(b0) { uint from; uint words; };\n\
+            ByteAddressBuffer src : register(t0);\nRWByteAddressBuffer o : register(u0);\n\
+            [RootSignature(RS)]\n[numthreads(1, 1, 1)]\n\
+            void main() { uint s = 0; for (uint i = 0; i < words; i++) { s += src.Load(from + i * 4) * (i + 1); } o.Store(0, s); }\n";
+        let (flight_root, flight_pso) = pipeline(&device, FLIGHT).expect("the flight's shader");
+        let (hash_root, hash_pso) = pipeline(&device, HASH).expect("the hash's shader");
+        const SIZE: usize = 4 * K64;
+        let card = committed(&device, kind(D3D12_HEAP_TYPE_GPU_UPLOAD), SIZE as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+            .expect("a GPU upload buffer");
+        let side = map(&card).expect("mapped");
+        let shared = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let out = committed(&device, shared, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON).expect("results");
+        let out_at = map(&out).expect("mapped");
+        let back = committed(&device, kind(D3D12_HEAP_TYPE_READBACK), SIZE as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).expect("readback");
+        let back_at = map(&back).expect("mapped");
+        // SAFETY: plain creation of objects of our own.
+        let (queue, fence, lists) = unsafe {
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).expect("queue");
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = (0..3)
+                .map(|_| {
+                    let a: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("allocator");
+                    let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).expect("list");
+                    l.Close().expect("closed");
+                    (a, l)
+                })
+                .collect();
+            (queue, fence, lists)
+        };
+        let mut signalled = 0u64;
+        let mut send = |i: usize, record: &dyn Fn(&ID3D12GraphicsCommandList)| -> u64 {
+            let (a, l) = &lists[i];
+            // SAFETY: our list, its last run waited for; then our queue.
+            unsafe {
+                a.Reset().expect("reset");
+                l.Reset(a, None).expect("reset");
+                record(l);
+                l.Close().expect("closed");
+                queue.ExecuteCommandLists(&[Some(l.cast().expect("a command list"))]);
+                signalled += 1;
+                queue.Signal(&fence, signalled).expect("signal");
+            }
+            signalled
+        };
+        let wait = |value: u64| {
+            // SAFETY: our fence; a null event waits here.
+            unsafe { fence.SetEventOnCompletion(value, HANDLE::default()).expect("waited") };
+            // SAFETY: a plain query.
+            unsafe { device.GetDeviceRemovedReason().expect("the device stays") };
+        };
+        // SAFETY: an open list of ours; live buffers.
+        let (flight_root, flight_pso, card_ref) = (&flight_root, &flight_pso, &card);
+        let flight = |spins: u32, mark: u32| {
+            move |l: &ID3D12GraphicsCommandList| unsafe {
+                l.SetComputeRootSignature(flight_root);
+                l.SetPipelineState(flight_pso);
+                l.SetComputeRoot32BitConstants(0, 2, [spins, mark].as_ptr().cast(), 0);
+                l.SetComputeRootUnorderedAccessView(1, card_ref.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+            }
+        };
+        let words = |at: *const u8, from: usize, n: usize| -> Vec<u32> {
+            // SAFETY: the caller's mapping holds the words.
+            (0..n).map(|i| unsafe { at.add(from + i * 4).cast::<u32>().read_volatile() }).collect()
+        };
+        // Known bytes everywhere first: 0x11 in every byte.
+        // SAFETY: our mapping of SIZE bytes.
+        unsafe { std::ptr::write_bytes(side, 0x11, SIZE) };
+        // The spins that take the card some 300 ms (tried with 2^20).
+        let started = Instant::now();
+        wait(send(0, &flight(1 << 20, 1)));
+        let per = started.elapsed().as_secs_f64() / f64::from(1u32 << 20);
+        let spins = ((0.3 / per) as u64).clamp(1 << 20, 1 << 31) as u32;
+        println!("2^20 spins took {:.1} ms; the flight spins {spins} times", per * 1e3 * f64::from(1u32 << 20));
+        unsafe { std::ptr::write_bytes(side, 0x11, SIZE) };
+        // The flight goes; then, while it runs, pieces 2 and 3 through the
+        // BAR.
+        let in_air = send(0, &flight(spins, 0xf1));
+        // SAFETY: a plain query.
+        let before = unsafe { fence.GetCompletedValue() };
+        let pattern: Vec<u8> = (0..2 * K64).map(|i| (i * 7 + 3) as u8).collect();
+        let wrote_at = Instant::now();
+        // SAFETY: our mapping; pieces 2 and 3.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), side.add(2 * K64), 2 * K64);
+            std::arch::x86_64::_mm_sfence();
+        }
+        let write_us = wrote_at.elapsed().as_secs_f64() * 1e6;
+        // SAFETY: a plain query.
+        let after = unsafe { fence.GetCompletedValue() };
+        // The next submission: the hash of pieces 2 and 3, then everything
+        // fetched.
+        // SAFETY: open lists of ours; live buffers.
+        let hashed = send(1, &|l: &ID3D12GraphicsCommandList| unsafe {
+            l.SetComputeRootSignature(&hash_root);
+            l.SetPipelineState(&hash_pso);
+            l.SetComputeRoot32BitConstants(0, 2, [(2 * K64) as u32, (2 * K64 / 4) as u32].as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, card.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+        });
+        let fetched = send(2, &|l: &ID3D12GraphicsCommandList| unsafe { l.CopyBufferRegion(&back, 0, &card, 0, SIZE as u64) });
+        let flight_ms = started.elapsed().as_secs_f64();
+        wait(fetched);
+        let _ = (hashed, flight_ms);
+        assert!(before < in_air && after < in_air, "the flight was still running while the CPU wrote (completed {before}, then {after}, flight {in_air})");
+        println!("the flight was in the air while the CPU wrote 128 KiB through the BAR in {write_us:.0} us");
+        // The hash read exactly the CPU's bytes.
+        let expected = pattern
+            .chunks_exact(4)
+            .enumerate()
+            .fold(0u32, |s, (i, w)| s.wrapping_add(u32::from_le_bytes([w[0], w[1], w[2], w[3]]).wrapping_mul(i as u32 + 1)));
+        // SAFETY: our mapping; the list that wrote it was waited for.
+        let got = unsafe { out_at.cast::<u32>().read_volatile() };
+        assert_eq!(got, expected, "the next list's hash read the bytes written through the BAR");
+        // SAFETY: the readback's mapping; the copy was waited for.
+        let fetched = unsafe { std::slice::from_raw_parts(back_at, SIZE) };
+        assert_eq!(&fetched[2 * K64..], &pattern[..], "pieces 2 and 3 hold the CPU's bytes");
+        assert!(fetched[K64..2 * K64].iter().all(|&b| b == 0x11), "piece 1 is untouched");
+        let head = words(back_at, 0, 3);
+        assert_eq!(head[0], 0xf1, "the flight's own write stands");
+        assert!(fetched[12..K64].iter().all(|&b| b == 0x11), "the rest of piece 0 is untouched");
+        println!(
+            "the flight saw {:#x} in piece 2 as it started ({}): a flight's reads of a piece it does not write may see the later bytes",
+            head[2],
+            if head[2] == 0x1111_1111 { "the old bytes" } else { "the new bytes" }
+        );
+
+        // About a frame's sends: 30,000 ranges of 4 KiB scattered over 256 MB.
+        const BIG: usize = 256 * MB;
+        const RANGES: usize = 30_000;
+        const EACH: usize = 4096;
+        let up = committed(&device, kind(D3D12_HEAP_TYPE_GPU_UPLOAD), BIG as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+            .expect("a GPU upload buffer");
+        let up_at = map(&up).expect("mapped");
+        let dflt = committed(&device, kind(D3D12_HEAP_TYPE_DEFAULT), BIG as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+            .expect("a default buffer");
+        let staging = committed(&device, shared, BIG as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON).expect("staging");
+        let staging_at = map(&staging).expect("mapped");
+        // SAFETY: our mapping.
+        unsafe { std::ptr::write_bytes(staging_at, 0x5a, BIG) };
+        let mut seed = 12345u64;
+        let mut ranges: Vec<usize> = (0..RANGES)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                ((seed >> 33) as usize % (BIG / EACH)) * EACH
+            })
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        let bytes = ranges.len() * EACH;
+        let mut best_bar = f64::MAX;
+        for _ in 0..3 {
+            let t = Instant::now();
+            for &at in &ranges {
+                // SAFETY: both mappings hold BIG bytes.
+                unsafe { std::ptr::copy_nonoverlapping(staging_at.add(at), up_at.add(at), EACH) };
+            }
+            // SAFETY: a plain fence.
+            unsafe { std::arch::x86_64::_mm_sfence() };
+            best_bar = best_bar.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let mut rig = Rig::new(&device).expect("a queue");
+        let mut best_record = f64::MAX;
+        let mut best_card = f64::MAX;
+        for _ in 0..3 {
+            let mut recorded = 0.0;
+            let card_ms = rig
+                .run(|list| {
+                    let t = Instant::now();
+                    for &at in &ranges {
+                        // SAFETY: live buffers of BIG bytes.
+                        unsafe { list.CopyBufferRegion(&dflt, at as u64, &staging, at as u64, EACH as u64) };
+                    }
+                    recorded = t.elapsed().as_secs_f64() * 1e3;
+                })
+                .expect("copies ran");
+            best_record = best_record.min(recorded);
+            best_card = best_card.min(card_ms);
+        }
+        println!(
+            "{} ranges, {:.0} MB: through the BAR {best_bar:.2} ms of the CPU ({:.1} GB/s); as copies {best_record:.2} ms recording, \
+             {best_card:.2} ms on the card",
+            ranges.len(),
+            bytes as f64 / 1e6,
+            gbps(bytes, best_bar)
+        );
     }
 
     /// For a lazy copy-back into private title memory without a moment in

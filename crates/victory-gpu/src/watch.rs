@@ -667,28 +667,92 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
+    // The other views of the range's pages, read off the runtime's views
+    // under one lock (a lock and a copy per block before, under the guards'
+    // lock, which the landing thread's writes wait for: the guard cost
+    // 15 ms a frame of copy-back, runs zall5zv against VICTORY_VIEW_GUARD=0).
+    // One view (nothing else to guard), or the page the title shows
+    // wherever it has nothing (thousands of views): each view of that one
+    // is guarded by itself.
+    let (aliased, others, _counted) = crate::inplace::alias_blocks_in(from, to, MANY_VIEWS);
+    #[cfg(feature = "diagnostics")]
+    ALIASES[0].fetch_add(_counted, std::sync::atomic::Ordering::Relaxed);
+    for &alias in &aliased {
+        mark_guarded(alias);
+    }
+    g.aliased.extend(aliased);
+    // Runs of blocks next to each other made read-only in one call.
+    let mut run: Option<(usize, usize)> = None;
+    for alias in others {
+        if g.protected.contains(&alias) {
+            continue;
+        }
+        match run {
+            Some((a, b)) if alias == b => run = Some((a, b + 1)),
+            Some((a, b)) => {
+                protect_alias_run(g, a, b);
+                run = Some((alias, alias + 1));
             }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
+            None => run = Some((alias, alias + 1)),
         }
     }
+    if let Some((a, b)) = run {
+        protect_alias_run(g, a, b);
+    }
+}
+
+/// [`protect_alias`] of blocks `[from, to)`: one call if they lie in one
+/// view, else block by block.
+fn protect_alias_run(g: &mut Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    if to > from + 1 {
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        if unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) } != 0 {
+            g.protected.extend(from..to);
+            for block in from..to {
+                mark_guarded(block);
+            }
+            return;
+        }
+    }
+    for block in from..to {
+        protect_alias(g, block);
+    }
+}
+
+/// Address space in which guarded blocks lie, a bit per 64 MiB of the 47
+/// bits of user addresses (set, never cleared): a write of ours through
+/// the kernel into memory with no bit set (the copies in the card's memory
+/// of the title's write-watched buffers, merged at every landing) needs no
+/// look at the guards, whose lock the submitting thread holds while it
+/// guards views.
+static GUARDED_REGIONS: [std::sync::atomic::AtomicU64; REGION_WORDS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; REGION_WORDS];
+const REGION_SHIFT: u32 = 26;
+const REGION_WORDS: usize = (1 << (47 - REGION_SHIFT)) / 64;
+
+fn mark_guarded(block: usize) {
+    let region = (block * BLOCK) >> REGION_SHIFT;
+    if let Some(word) = GUARDED_REGIONS.get(region / 64) {
+        word.fetch_or(1 << (region % 64), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether `[start, end)` may hold guarded blocks.
+fn may_be_guarded(start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start >> REGION_SHIFT, (end - 1) >> REGION_SHIFT);
+    if last - first > 4096 {
+        return true;
+    }
+    (first..=last).any(|region| {
+        GUARDED_REGIONS
+            .get(region / 64)
+            .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & (1 << (region % 64)) != 0)
+    })
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -724,6 +788,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
+        mark_guarded(block);
     }
 }
 
@@ -745,6 +810,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.set_range(from, to);
+        for block in from..to {
+            mark_guarded(block);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -918,14 +986,29 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            g.aliased.remove(&(alias / BLOCK));
+    if aliased.is_empty() {
+        return any;
+    }
+    // Every other view of those pages, under one lock of the runtime's
+    // views, opened in runs.
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut others: Vec<usize> = Vec::new();
+    for block in &aliased {
+        g.aliased.remove(block);
+    }
+    for alias in crate::inplace::pages_of_blocks(&aliased) {
+        let alias = alias / BLOCK;
+        g.aliased.remove(&alias);
+        if !(first..last).contains(&alias) {
+            others.push(alias);
+        }
+    }
+    others.sort_unstable();
+    others.dedup();
+    for run in others.chunk_by(|a, b| a + 1 == *b) {
+        if open_here(g, run[0] * BLOCK, (run[run.len() - 1] + 1) * BLOCK) {
+            #[cfg(feature = "diagnostics")]
+            ALIASES[1].fetch_add(run.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     any
@@ -942,9 +1025,21 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.set(block, false);
+    }
+    // Runs of blocks next to each other opened in one call when they lie
+    // in one view (else block by block).
+    for run in blocks.chunk_by(|a, b| a + 1 == *b) {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        let whole = run.len() > 1
+            && unsafe { VirtualProtect((run[0] * BLOCK) as *const _, run.len() * BLOCK, PAGE_READWRITE, &mut old) }
+                != 0;
+        if !whole {
+            for &block in run {
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
     }
     !blocks.is_empty()
 }
@@ -956,7 +1051,10 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 pub fn writing(at: usize, len: usize) {
     crate::lazy::opening(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    // Memory where nothing was ever guarded is left alone without the lock.
+    if may_be_guarded(at, at.saturating_add(len)) {
+        open(&mut guards(), at, at.saturating_add(len));
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }

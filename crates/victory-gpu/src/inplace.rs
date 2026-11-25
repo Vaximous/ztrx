@@ -335,36 +335,70 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
-    if start >= end {
-        return Vec::new();
-    }
+/// The addresses of the 64 KiB page shown at each of `blocks` (64 KiB
+/// block numbers) in every title view that shows it, the block's own
+/// included, under one lock; nothing for a block that is not a view.
+pub(crate) fn pages_of_blocks(blocks: &[usize]) -> Vec<usize> {
     let v = views();
     let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
-    }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
+    for &block in blocks {
+        let page = block * K64;
+        let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
+            continue;
+        };
+        let within = page.wrapping_sub(base);
+        if within >= bytes || !within.is_multiple_of(K64) {
+            continue;
+        }
+        if let Some(shown) = v.pages.get(&(section, offset + within as u64)) {
+            out.extend_from_slice(shown);
+        }
     }
     out
 }
 
-/// The address of the 64 KiB page shown at `page` in every title view that
-/// shows it, `page`'s own address included; empty if `page` is not a view.
-pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
-    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
-        return Vec::new();
-    };
-    let within = page.wrapping_sub(base);
-    if within >= bytes || !within.is_multiple_of(K64) {
-        return Vec::new();
+/// For the guards (`crate::watch`), under one lock: of the 64 KiB blocks
+/// `[from_block, to_block)`, those whose page the title shows in 2 to
+/// `max_views` views. Returns the blocks of all those views (the range's
+/// own included), the other views' blocks (in order, once each), and how
+/// many of the range's blocks were such. Ported from victory-perf
+/// (4cb867b6).
+pub(crate) fn alias_blocks_in(from_block: usize, to_block: usize, max_views: usize) -> (Vec<usize>, Vec<usize>, u64) {
+    let (start, end) = (from_block.saturating_mul(K64), to_block.saturating_mul(K64));
+    if start >= end {
+        return (Vec::new(), Vec::new(), 0);
     }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+    let v = views();
+    if v.views.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let (mut all, mut others, mut counted) = (Vec::new(), Vec::new(), 0u64);
+    let first = v.views.range(..=start).next_back().filter(|&(&base, &(bytes, _, _))| base + bytes > start);
+    for (&base, &(bytes, section, offset)) in first.into_iter().chain(v.views.range(start.saturating_add(1)..end)) {
+        let (lo, hi) = ((base / K64).max(from_block), base.saturating_add(bytes).div_ceil(K64).min(to_block));
+        for block in lo..hi {
+            let within = (block * K64).wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 || shown.len() > max_views {
+                continue;
+            }
+            counted += 1;
+            for &at in shown {
+                all.push(at / K64);
+                if at / K64 != block {
+                    others.push(at / K64);
+                }
+            }
+        }
+    }
+    others.sort_unstable();
+    others.dedup();
+    (all, others, counted)
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +

@@ -13,6 +13,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// What [`HostHeap::mirror_buffer`] found.
+pub(crate) enum BufferMirror {
+    /// The slot shows the view it showed, which still lives.
+    Unchanged,
+    /// The slot was made (again): the view's key and the view.
+    Changed(u64, View),
+    /// No view there.
+    Empty,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -962,6 +972,36 @@ impl HostHeap {
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         buffers.iter().copied().collect()
+    }
+
+    /// The title slots that hold buffer views, of those whose index is
+    /// `bucket` modulo 64.
+    pub(crate) fn buffer_slots_bucket(&self, bucket: u32) -> Vec<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.iter().copied().filter(|i| i & 63 == bucket & 63).collect()
+    }
+
+    /// [`HostHeap::mirror`] for a draw, for the heap pass of buffer views:
+    /// [`BufferMirror::Unchanged`], without looking further, where slot
+    /// `index` still holds the view of key `cached` (not 0), that view
+    /// lives, and the host slot was made from it.
+    pub(crate) fn mirror_buffer(&self, index: u32, handle: u64, cached: u64) -> BufferMirror {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if cached != 0
+            && index < self.count
+            && tag == VIEW_TAG
+            && key == cached
+            && view_at(i, generation).is_some()
+            && self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] == key
+        {
+            return BufferMirror::Unchanged;
+        }
+        match self.mirror(index, handle, true) {
+            Some(view) => BufferMirror::Changed(key, view),
+            None => BufferMirror::Empty,
+        }
     }
 
     /// The title slots whose buffer view was written, or went, since the

@@ -123,14 +123,16 @@ struct Window {
 }
 
 /// The most records clamped in one pass ([`windows`]):
-/// `VICTORY_INDIRECT_WINDOW_MOST` (16 to 65,536; 64 unless set).
+/// `VICTORY_INDIRECT_WINDOW_MOST` (16 to 65,536; 4,096 unless set: a
+/// whole argument buffer of mesh records in a few doubling passes, where
+/// 64 clamped one again every 64 records).
 fn window_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_INDIRECT_WINDOW_MOST")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(64, |n| n.clamp(16, 65_536))
+            .map_or(4096, |n| n.clamp(16, 65_536))
     })
 }
 
@@ -192,14 +194,126 @@ fn step_most() -> u64 {
     })
 }
 
-/// `VICTORY_HEAP_ROLLING=1` (off by default): the heap pass of buffer
-/// views ([`State::heap_buffers`]) looks again at a sixteenth of the slots
-/// each pass, where every 16th pass looked at all of them (83,000 slots; a
-/// spike of ~140 ms in vitutu1/victory-perf's measure, whose rolling pass
-/// this is).
+/// Host copy spans of a heap's buffer views: the copy, from, to.
+type HeapSpans = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+
+/// [`State::heap_buffers`]'s look at the slots with [`heap_rolling`]: the
+/// slots written since the last pass, and a 64th of the others in turn,
+/// whose view is taken again only if the slot shows another one than the
+/// pass saw last time (`HostHeap::mirror_buffer`). Per 64th of the slots,
+/// the spans its views cover are kept, made again only where a slot of it
+/// changed. The slots looked at, the views and the spans per host copy.
+///
+/// After vitutu1/victory-perf's 64-bucket heap cache (b230f2a5).
+fn heap_spans_rolling(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap) -> (usize, u32, HeapSpans) {
+    use crate::descriptor::host::BufferMirror;
+    type Bucket = std::collections::HashMap<u32, (u64, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+    type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+    struct Cache {
+        passes: u64,
+        buckets: [Bucket; 64],
+        spans: [Spans; 64],
+    }
+    fn widen(spans: &mut HeapSpans, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: u64, to: u64) {
+        let span = spans.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), from, to));
+        span.1 = span.1.min(from);
+        span.2 = span.2.max(to);
+    }
+    static CACHES: std::sync::Mutex<Option<std::collections::HashMap<usize, Cache>>> = std::sync::Mutex::new(None);
+    let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = caches.get_or_insert_with(Default::default).entry(std::ptr::from_ref(host) as usize).or_insert_with(|| Cache {
+        passes: 0,
+        buckets: std::array::from_fn(|_| Bucket::new()),
+        spans: std::array::from_fn(|_| Spans::new()),
+    });
+    let changed = host.buffer_changes();
+    let mut dirty = 0u64;
+    // (slot, whether it is made again whatever it shows).
+    let slots: Vec<(u32, bool)> = if cache.passes == 0 {
+        cache.buckets.iter_mut().for_each(Bucket::clear);
+        dirty = u64::MAX;
+        host.buffer_slots().into_iter().map(|i| (i, true)).collect()
+    } else {
+        let bucket = (cache.passes & 63) as usize;
+        let mut seen: std::collections::HashSet<u32> = changed.iter().copied().collect();
+        let mut slots: Vec<(u32, bool)> = changed.into_iter().map(|i| (i, true)).collect();
+        let rolling = host.buffer_slots_bucket(bucket as u32);
+        let live: std::collections::HashSet<u32> = rolling.iter().copied().collect();
+        let before = cache.buckets[bucket].len();
+        cache.buckets[bucket].retain(|index, _| live.contains(index));
+        if cache.buckets[bucket].len() != before {
+            dirty |= 1 << bucket;
+        }
+        slots.extend(rolling.into_iter().filter(|&i| seen.insert(i)).map(|i| (i, false)));
+        slots
+    };
+    cache.passes += 1;
+    for &(index, again) in &slots {
+        let b = (index & 63) as usize;
+        let made = heap.handle(index).and_then(|handle| {
+            let cached = if again {
+                0
+            } else {
+                // Only while the copy the slot showed is still the one
+                // there: a copy let go and made again leaves the old one
+                // behind.
+                cache.buckets[b]
+                    .get(&index)
+                    .filter(|(_, s, from, to)| {
+                        !s.in_place() && crate::shadow::find_any(*from, to - from).is_some_and(|now| std::sync::Arc::ptr_eq(&now, s))
+                    })
+                    .map_or(0, |e| e.0)
+            };
+            match host.mirror_buffer(index, handle, cached) {
+                BufferMirror::Unchanged => Some(None),
+                BufferMirror::Empty => None,
+                BufferMirror::Changed(key, view) => {
+                    crate::descriptor::host::buffer_copy(&view).map(|copy| Some((key, copy)))
+                }
+            }
+        });
+        match made {
+            Some(None) => {}
+            Some(Some((key, (shadow, address, len)))) => {
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                cache.buckets[b].insert(index, (key, shadow, address, address + len));
+                dirty |= 1 << b;
+            }
+            None => {
+                if cache.buckets[b].remove(&index).is_some() {
+                    dirty |= 1 << b;
+                }
+            }
+        }
+    }
+    while dirty != 0 {
+        let b = dirty.trailing_zeros() as usize;
+        dirty &= dirty - 1;
+        let mut spans = HeapSpans::new();
+        for (_, shadow, from, to) in cache.buckets[b].values() {
+            widen(&mut spans, shadow, *from, *to);
+        }
+        cache.spans[b] = spans.into_values().collect();
+    }
+    let views = cache.buckets.iter().map(|b| b.len() as u32).sum();
+    let mut spans = HeapSpans::new();
+    for (shadow, from, to) in cache.spans.iter().flatten() {
+        widen(&mut spans, shadow, *from, *to);
+    }
+    (slots.len(), views, spans)
+}
+
+/// `VICTORY_HEAP_ROLLING` (on by default, `=0` off): the heap pass of
+/// buffer views ([`State::heap_buffers`]) looks at the changed slots and a
+/// 64th of the others each pass ([`heap_spans_rolling`]), where every 16th
+/// pass looked at all of them (83,000 slots) and every pass rebuilt every
+/// span (10-25 ms a frame in the world, run zall4).
 fn heap_rolling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLLING").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLLING").is_none_or(|v| v != "0"))
 }
 
 fn windows() -> bool {
@@ -1505,95 +1619,82 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if heap_rolling() && *passes != 0 {
-            // A sixteenth of the slots each pass, with the changed ones:
-            // every slot is still looked at again every 16 passes, without
-            // a pass that looks at all of them at once.
-            let bucket = (*passes % 16) as u32;
-            let mut seen: std::collections::HashSet<u32> = changed.iter().copied().collect();
-            let mut slots = changed;
-            let mut live = std::collections::HashSet::new();
-            for index in host.buffer_slots() {
-                if index % 16 == bucket {
-                    live.insert(index);
-                    if seen.insert(index) {
-                        slots.push(index);
-                    }
-                }
-            }
-            ranges.retain(|&index, _| index % 16 != bucket || live.contains(&index));
-            slots
-        } else if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
+        let (slot_count, views, spans) = if heap_rolling() {
+            heap_spans_rolling(heap, host)
         } else {
-            changed
+            // Per host heap: the host copy and range each slot's buffer view
+            // reads, kept from pass to pass. Only the slots written since the
+            // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
+            // at best); all of them every 16 passes, because a view of a
+            // released resource goes stale without a write, and a slot written
+            // before its memory had a host copy is only made then.
+            type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+            static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+                std::sync::Mutex::new(None);
+            let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+            let (passes, ranges) = kept
+                .get_or_insert_with(Default::default)
+                .entry(std::ptr::from_ref(host) as usize)
+                .or_insert_with(|| (0, Ranges::new()));
+            let changed = host.buffer_changes();
+            let slots = if *passes % 16 == 0 {
+                ranges.clear();
+                host.buffer_slots()
+            } else {
+                changed
+            };
+            *passes += 1;
+            // Whether the device was there before the pass: a view that removes
+            // it is named below.
+            static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+            for (n, &index) in slots.iter().enumerate() {
+                ranges.remove(&index);
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                let Some(view) = host.mirror(index, handle, true) else {
+                    continue;
+                };
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                ranges.insert(index, (shadow, address, address + len));
+            }
+            let views = ranges.len() as u32;
+            // Per host copy, the span its picked views cover.
+            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            drop(kept);
+            (slots.len(), views, spans)
         };
-        *passes += 1;
-        // Whether the device was there before the pass: a view that removes
-        // it is named below.
-        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
-            }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-            }
-            ranges.insert(index, (shadow, address, address + len));
-        }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
-        drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1636,7 +1737,7 @@ impl State {
         if u64::from(views) > seen + seen / 2 {
             LOGGED.store(u64::from(views), Ordering::Relaxed);
             tracing::info!(
-                slots = slots.len(),
+                slots = slot_count,
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,

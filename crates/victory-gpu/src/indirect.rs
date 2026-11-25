@@ -448,7 +448,7 @@ pub(crate) fn bound(
     })
 }
 
-/// `VICTORY_CLAMP_SCOPED=1` (off by default): a clamp's wait for earlier
+/// `VICTORY_CLAMP_SCOPED` (on by default, `=0` off): a clamp's wait for earlier
 /// shader writes (the title's argument and count passes) is a UAV barrier
 /// on the argument and count buffers alone, not on every resource, where
 /// those are host copies of their own (not placed over title memory that
@@ -459,7 +459,7 @@ pub(crate) fn bound(
 /// itself from ZigZagBoi1/ScarlettPort).
 pub(crate) fn clamp_scoped() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_SCOPED").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_SCOPED").is_none_or(|v| v != "0"))
 }
 
 /// Whether the scratch buffer's barriers around the clamp are enhanced

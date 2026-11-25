@@ -438,6 +438,8 @@ pub(crate) fn bound(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| clamp_note("clamp", spec, wait));
     record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, clamped_as_draw(spec.0, spec.2)).then(|| {
         list.waited();
         dst
@@ -546,10 +548,21 @@ pub(crate) fn bound_ahead(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| clamp_note("clamp-window", spec, wait));
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, clamped_as_draw(spec.0, spec.2)).then(|| {
         list.waited();
         dst
     })
+}
+
+/// For timing notes: a clamp's own line, so the card's time of its waits
+/// and pass is told apart from the indirect call after it.
+#[cfg(feature = "diagnostics")]
+fn clamp_note(what: &str, (kind, _, records): (u32, u32, u32), wait: bool) -> String {
+    let drawn = if clamped_as_draw(kind, records) { " drawn" } else { "" };
+    let wait = if wait { "waiting" } else { "alone" };
+    format!("{what}{drawn} {wait} kind {kind} records {records}")
 }
 
 #[cfg(test)]
@@ -1106,6 +1119,100 @@ void main() {
                 change(now_ptr);
                 assert_eq!(run(&mut warp, c, *wide, 1), *expected, "case {n}, wide {wide}");
             }
+        }
+    }
+
+    /// The wide compare's hash of one piece changes for a flip of one byte
+    /// at every 16-byte offset of the bytes it covers: a whole piece, a
+    /// short first piece (the copy starting 5,000 bytes into it) and a
+    /// short last piece (the copy ending 62,536 bytes into it, not a
+    /// multiple of 4 KiB); and not for a byte past what it covers.
+    #[test]
+    fn warp_wide_card_hash_sees_every_byte() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("the wide compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        // Variants hashed per submission, each in a region of its own.
+        const BATCH: usize = 512;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer((PIECE * BATCH) as u64);
+        let (_hashes, hashes_ptr, hashes_gpu) = warp.shared_buffer((16 * BATCH) as u64);
+        let (_differs, _, differs_gpu) = warp.shared_buffer(64);
+        let base: Vec<u8> = (0..PIECE).map(|i| (i * 131 + i / 977 + 7) as u8).collect();
+        // (skew, size): the piece's bytes are [0, hi) of its region, hi
+        // widened to 16 bytes.
+        for (skew, size) in [(0u32, PIECE as u32), (5000, PIECE as u32), (0, 62_536)] {
+            let hi = (PIECE as u32 - skew).min(size);
+            let covered = (hi as usize).div_ceil(16) * 16;
+            // Byte flipped per variant: none, one per 16-byte slot it covers
+            // (a different byte of the slot each time), then four past it.
+            let mut flips: Vec<Option<usize>> = vec![None];
+            flips.extend((0..covered / 16).map(|k| Some(k * 16 + k % 16)));
+            let outside: Vec<usize> = (covered..PIECE).step_by(4093).take(4).collect();
+            flips.extend(outside.iter().map(|&at| Some(at)));
+            let mut hashes: Vec<[u32; 4]> = Vec::new();
+            for batch in flips.chunks(BATCH) {
+                // SAFETY: our open list, live buffers, the compare's root
+                // signature; each region and hash slot is inside its mapping.
+                unsafe {
+                    for (v, flip) in batch.iter().enumerate() {
+                        let region = now_ptr.add(v * PIECE);
+                        std::ptr::copy_nonoverlapping(base.as_ptr(), region, PIECE);
+                        if let Some(at) = *flip {
+                            *region.add(at) ^= 0x5A;
+                        }
+                    }
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    for v in 0..batch.len() {
+                        // Piece 0 of a copy starting `skew` into it; the
+                        // hash stored (mode 0) in the variant's slot.
+                        let constants = [0u32, skew, size, 1, 0, 0];
+                        warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        warp.list.SetComputeRootShaderResourceView(1, now_gpu + (v * PIECE) as u64);
+                        warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu + (v * 16) as u64);
+                        let (x, y) = crate::host::card_compare_groups(1, true);
+                        warp.list.Dispatch(x, y, 1);
+                    }
+                }
+                warp.submit_and_wait();
+                for v in 0..batch.len() {
+                    // SAFETY: inside the mapping.
+                    hashes.push(std::array::from_fn(|w| unsafe { hashes_ptr.cast::<u32>().add(v * 4 + w).read_volatile() }));
+                }
+            }
+            let first = hashes[0];
+            let inside = covered / 16;
+            for (k, h) in hashes[1..=inside].iter().enumerate() {
+                assert_ne!(*h, first, "skew {skew} size {size}: a flip at byte {} left the hash as it was", k * 16 + k % 16);
+            }
+            for (at, h) in outside.iter().zip(&hashes[inside + 1..]) {
+                assert_eq!(*h, first, "skew {skew} size {size}: a flip at byte {at}, past the piece, changed its hash");
+            }
+        }
+    }
+
+    /// Groups of the wide compare for any number of pieces: the piece of
+    /// group (x, y), `y * 65535 + x`, takes every piece once, and groups
+    /// past the last piece are all at its end (they return at once).
+    #[test]
+    fn wide_compare_groups_take_every_piece_once() {
+        for pieces in [1u32, 2, 65_534, 65_535, 65_536, 131_070, 131_071, 200_000] {
+            let (x, y) = crate::host::card_compare_groups(pieces, true);
+            assert!(x <= 65_535 && y <= 65_535 && x >= 1 && y >= 1);
+            let mut seen = vec![false; pieces as usize];
+            for gy in 0..y {
+                for gx in 0..x {
+                    let n = gy * 65_535 + gx;
+                    if n < pieces {
+                        assert!(!seen[n as usize], "{pieces}: piece {n} twice");
+                        seen[n as usize] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "{pieces}: a piece left out");
         }
     }
 

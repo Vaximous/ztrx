@@ -65,6 +65,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_PAIR_SYNC",
+                    "VICTORY_WAVE_WIDE_FIRST",
                     "VICTORY_F16_NEAREST",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
@@ -90,10 +91,36 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// `VICTORY_WAVE_WIDE_FIRST=<hash>,...`: these shaders (16-digit hashes, as the log names
+/// them) get the wave-wide form of a wave64 program first, as `VICTORY_WAVE_WIDE=1` gives
+/// every shader: to find which of them a difference between the two comes from.
+fn wide_first(container: &[u8]) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_FIRST")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !hashes.is_empty() && {
+        let hash = blake3::hash(container).to_hex();
+        hashes.iter().any(|h| hash.starts_with(h.as_str()))
+    }
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        if wide_first(c) {
+            victory_shader::emit::with_wide_first(|| victory_shader::emit::translate(c))
+        } else {
+            victory_shader::emit::translate(c)
+        }
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

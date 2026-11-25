@@ -268,6 +268,21 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// See [`with_wide_first`].
+    static WIDE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 program first, as
+/// `VICTORY_WAVE_WIDE=1` puts it for every program: for one program at a time
+/// (`VICTORY_WAVE_WIDE_FIRST`, a diagnostics switch of the host).
+pub fn with_wide_first<T>(f: impl FnOnce() -> T) -> T {
+    let was = WIDE_FIRST.replace(true);
+    let r = f();
+    WIDE_FIRST.set(was);
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -380,7 +395,7 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_env = std::env::var_os("VICTORY_WAVE_WIDE");
-        let wide_on = wide_env.as_ref().is_some_and(|v| v == "1");
+        let wide_on = wide_env.as_ref().is_some_and(|v| v == "1") || WIDE_FIRST.get();
         // Unless `VICTORY_WAVE_WIDE=0`, a program no other form takes gets this one last: the
         // 64-lane form it would have instead is refused by a host of 32-lane waves, which
         // then never runs it (dispatch arguments, culling and relocation passes left unrun).

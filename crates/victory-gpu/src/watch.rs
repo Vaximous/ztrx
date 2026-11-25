@@ -418,6 +418,80 @@ struct Guards {
     /// views of their pages (a count of windows each): written as long as
     /// it stands, so never noted clean ([`guard`]).
     windowed: BTreeMap<usize, u32>,
+    /// [`hot_blocks`]: blocks found written, by how many times in a row
+    /// (each within [`HOT_GAP_MS`] of the last) and when last.
+    streak: BTreeMap<usize, (u32, u64)>,
+    /// [`hot_blocks`]: blocks left writable, by how many more checks they
+    /// are reported written before they are guarded again.
+    hot: BTreeMap<usize, u32>,
+}
+
+/// `VICTORY_HOT_BLOCKS=<n>` (0, off, by default): a guarded block of view
+/// memory found written at `n` checks in a row is left writable and
+/// reported written at every check (its 64 KiB copied each refresh),
+/// instead of being made read-only again after each copy for the title to
+/// fault on at its next write. After [`HOT_CHECKS`] such checks it is
+/// guarded again, so a block that went quiet is clean once more.
+///
+/// The cost it trades: run zall16cd's windows of view memory took 12.6 ms
+/// a frame asking the guards (about 10 ms of it the guards: 464 faults a
+/// frame and a `VirtualProtect` after each), for 42.8 MB copied, 1.1 MB of
+/// it changed. Copying 64 KiB takes some 4 microseconds; a fault and a
+/// protection call several times that.
+///
+/// Only a block whose page the title shows at this view alone: a write
+/// through a writable block faults nowhere, so the page's other views
+/// would never hear of it. A block that gains another view is guarded
+/// again by that view's guarding (which protects every view of the page).
+fn hot_blocks() -> u32 {
+    let n = HOT.load(std::sync::atomic::Ordering::Relaxed);
+    if n != u32::MAX {
+        return n;
+    }
+    let n = std::env::var("VICTORY_HOT_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    HOT.store(n, std::sync::atomic::Ordering::Relaxed);
+    n
+}
+
+/// [`hot_blocks`], read once (`u32::MAX`: not read yet).
+static HOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Writes further apart than this end a block's streak.
+const HOT_GAP_MS: u64 = 250;
+/// The checks a hot block is reported written at before it is guarded again.
+const HOT_CHECKS: u32 = 32;
+
+/// Whether `block`, found written and writable at a check, stays so
+/// ([`hot_blocks`]) instead of being guarded again.
+fn stays_hot(g: &mut Guards, block: usize) -> bool {
+    let n = hot_blocks();
+    if n == 0 {
+        return false;
+    }
+    if let Some(left) = g.hot.get_mut(&block) {
+        if *left > 1 && !g.aliased.contains(&block) {
+            *left -= 1;
+            return true;
+        }
+        g.hot.remove(&block);
+        g.streak.remove(&block);
+        return false;
+    }
+    let now = crate::host::now_ms();
+    let e = g.streak.entry(block).or_insert((0, now));
+    *e = if now.saturating_sub(e.1) <= HOT_GAP_MS { (e.0 + 1, now) } else { (1, now) };
+    if e.0 < n || g.aliased.contains(&block) {
+        return false;
+    }
+    g.streak.remove(&block);
+    // One view of its page only: checked once, when it turns hot.
+    if !crate::inplace::alias_blocks_in(block, block + 1, usize::MAX).0.is_empty() {
+        return false;
+    }
+    g.hot.insert(block, HOT_CHECKS);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::HotBlocks, 1);
+    true
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -426,6 +500,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     windowed: BTreeMap::new(),
+    streak: BTreeMap::new(),
+    hot: BTreeMap::new(),
 });
 
 /// A set of block numbers, a bit each, in chunks of 16 GB of address
@@ -609,6 +685,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 if !g.windowed.contains_key(&block) {
                     g.clean.set(block, true);
                 }
+            } else if stays_hot(&mut g, block) {
+                // Left writable: reported written at the next check too.
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1388,6 +1466,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
+    // What was hot there is new memory now, maybe with other views.
+    let span = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let hot: Vec<usize> = g.hot.range(span.clone()).map(|(&b, _)| b).collect();
+    for block in hot {
+        g.hot.remove(&block);
+    }
+    let streak: Vec<usize> = g.streak.range(span).map(|(&b, _)| b).collect();
+    for block in streak {
+        g.streak.remove(&block);
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1990,6 +2078,98 @@ mod tests {
                 j.written.remove(&page);
             }
         }
+    }
+
+    /// [`hot_blocks`] set for a test, off again when it ends (also when it
+    /// fails).
+    struct HotFor;
+
+    impl HotFor {
+        fn new(n: u32) -> Self {
+            HOT.store(n, std::sync::atomic::Ordering::Relaxed);
+            HotFor
+        }
+    }
+
+    impl Drop for HotFor {
+        fn drop(&mut self) {
+            HOT.store(0, std::sync::atomic::Ordering::Relaxed);
+            let mut g = guards();
+            g.hot.clear();
+            g.streak.clear();
+        }
+    }
+
+    /// `VICTORY_HOT_BLOCKS`: a block of one view written at every check
+    /// stays writable and is reported at each check while hot, then is
+    /// guarded again; a block whose page has another view never turns hot.
+    #[test]
+    fn a_block_written_at_every_check_stays_writable_while_hot() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile};
+        let _serial = serial();
+        const SIZE: usize = 2 * BLOCK;
+        // The first check, which takes the block in, counts as one.
+        let _hot = HotFor::new(3);
+        // SAFETY: a fresh pagefile section mapped once, unmapped below.
+        let (section, one) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(one, 0);
+            crate::inplace::title_memory_view(one, SIZE, section as usize, 0);
+            (section, one)
+        };
+        let page = (one + BLOCK) / PAGE;
+        assert!(guard(one, one + SIZE).is_some());
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "nothing written yet");
+        // SAFETY: our view; the handler opens the guarded block.
+        let write = |v: u8| unsafe { ((one + BLOCK + 8) as *mut u8).write(v) };
+        // Three checks in a row find it written: hot from the third.
+        write(1);
+        assert_eq!(guard(one, one + SIZE), Some(vec![page]));
+        assert!(!writable(one + BLOCK), "guarded again after the first");
+        write(2);
+        assert_eq!(guard(one, one + SIZE), Some(vec![page]));
+        assert!(writable(one + BLOCK), "hot: left writable");
+        // Reported written at every check while hot, written or not.
+        for _ in 1..HOT_CHECKS {
+            assert_eq!(guard(one, one + SIZE), Some(vec![page]));
+        }
+        // Then guarded again, and clean once taken.
+        assert_eq!(guard(one, one + SIZE), Some(vec![page]));
+        assert!(!writable(one + BLOCK), "guarded again");
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        title_memory_remapped(one, SIZE);
+        // SAFETY: the view mapped above, and its section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+            CloseHandle(section);
+        }
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j.written.range(one / PAGE..(one + SIZE) / PAGE).map(|(&p, _)| p).collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
+    }
+
+    /// A block whose page another view shows does not turn hot.
+    #[test]
+    fn a_block_of_two_views_never_turns_hot() {
+        let _serial = serial();
+        const SIZE: usize = 2 * BLOCK;
+        let _hot = HotFor::new(1);
+        let (section, one, two) = two_views(SIZE);
+        assert!(guard(one, one + SIZE).is_some());
+        assert!(guard(two, two + SIZE).is_some());
+        for v in 0..3u8 {
+            // SAFETY: our view; the handler opens the guarded block.
+            unsafe { ((one + BLOCK + 8) as *mut u8).write(v) };
+            assert_eq!(guard(two, two + SIZE), Some(vec![(two + BLOCK) / PAGE]), "the other view hears of it");
+            assert!(guard(one, one + SIZE).is_some());
+            assert!(!writable(one + BLOCK), "guarded again");
+        }
+        drop_views(section, &[one, two], SIZE);
     }
 
     /// Our plain write into a guarded block opens it, as the title's does.

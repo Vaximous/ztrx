@@ -16,7 +16,10 @@
 //!
 //! `VICTORY_DISPATCH_SKIP=1` leaves them out; `=check` runs every one and
 //! counts, and reports, the runs that were to be left out and changed
-//! something all the same (an input the hashes do not see).
+//! something all the same (an input the hashes do not see); `=0` is off.
+//! Unset, they are left out, for `VICTORY_DISPATCH_SKIP_ONLY`'s default of
+//! `02384a60` alone: in run zall6sk1 1,374 of its 1,376 runs were left out,
+//! 0 wrong, after a check run (zall6sk) with none that changed something.
 //!
 //! What the hashes cannot see makes a dispatch one that is not followed:
 //! textures, title memory read by address, buffers picked from the heap by
@@ -45,7 +48,7 @@ pub(crate) enum Mode {
 pub(crate) fn mode() -> Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_DISPATCH_SKIP").as_deref() {
-        Ok("1") => Mode::Skip,
+        Ok("1") | Err(_) => Mode::Skip,
         Ok("check") => Mode::Check,
         _ => Mode::Off,
     })
@@ -544,12 +547,13 @@ pub(crate) fn wanted(hash: &str) -> bool {
     if mode() == Mode::Off {
         return false;
     }
-    // `VICTORY_DISPATCH_SKIP_ONLY`: shader hash beginnings, by commas.
+    // `VICTORY_DISPATCH_SKIP_ONLY`: shader hash beginnings, by commas;
+    // `02384a60` alone unless set (set and empty: every shader).
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| {
         std::env::var("VICTORY_DISPATCH_SKIP_ONLY")
             .map(|v| v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|_| vec!["02384a60".to_owned()])
     });
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
         return false;

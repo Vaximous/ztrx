@@ -2165,12 +2165,16 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// numbered after them went. Those stay with the fetch on the one queue.
 /// The copy queue's list goes out under [`QUEUE_ORDER`], and the one queue
 /// waits for it there, so nothing sent later runs before it is done.
+///
+/// On by default with [`fetch_queue_loose`] (`VICTORY_FETCH_QUEUE=2`);
+/// `VICTORY_FETCH_QUEUE=1` keeps the pieces later flights declare on the
+/// one queue, `0` fetches everything there, as before.
 fn fetch_queue() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "1" || v == "2"))
+    *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").map_or(true, |v| v == "1" || v == "2"))
 }
 
-/// `VICTORY_FETCH_QUEUE=2`: as [`fetch_queue`], and the pieces a flight
+/// `VICTORY_FETCH_QUEUE=2`, the default: as [`fetch_queue`], and the pieces a flight
 /// sent after the landed ones declares written go to the copy queue too,
 /// read while that flight may be running. In the world about 19 such
 /// pieces a landing kept the fetch on the one queue, behind every flight in
@@ -2186,9 +2190,14 @@ fn fetch_queue() -> bool {
 /// takes only bytes that differ from the CPU's side, which takes what it
 /// merged. Pieces a send of title bytes numbered after the landed flights
 /// went to stay on the one queue (the card's side may be older there).
+///
+/// In the world, at the same 4,800 draws a frame: 120 ms a frame (run
+/// zl1fq2b) against 166 without the copy queue (zl2probe, the same
+/// build), the landing thread's time 46 ms against 127 and the card's 47
+/// against 79.
 fn fetch_queue_loose() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "2"))
+    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE").map_or(true, |v| v == "2"))
 }
 
 /// `VICTORY_FETCH_QUEUE_CHECK=1`: until [`QUICK_CHECKS`] pieces have been

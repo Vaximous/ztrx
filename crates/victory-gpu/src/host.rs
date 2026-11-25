@@ -7554,16 +7554,26 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
+    /// or only `part` of it (left, top, right, bottom), as frame `frame`
+    /// (saved if captures are on, cut to `part` too). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        part: Option<[u32; 4]>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (width, height) = match part {
+            Some([left, top, right, bottom]) => (right - left, bottom - top),
+            None => (desc.Width as u32, desc.Height),
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -7662,7 +7672,26 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            match part {
+                Some([left, top, right, bottom]) => {
+                    let location = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: a borrowed pointer the location never releases.
+                        pResource: std::mem::transmute_copy(resource),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let part = D3D12_BOX {
+                        left,
+                        top,
+                        front: 0,
+                        right,
+                        bottom,
+                        back: 1,
+                    };
+                    list.CopyTextureRegion(&location(&back), 0, 0, 0, &location(texture), Some(&part));
+                }
+                None => list.CopyResource(&back, texture),
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -7708,7 +7737,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::save_read_back(frame, &buffer, &footprint, part);
             }
             let presented = if p.tearing {
                 let hr = p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);

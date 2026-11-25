@@ -301,11 +301,13 @@ fn read_back_of(
     }
 }
 
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back by [`read_back`] (8-bit color only), or only
+/// `part` of it (left, top, right, bottom; inside the frame).
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    part: Option<[u32; 4]>,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
@@ -325,7 +327,14 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        let pitch = f.RowPitch as usize;
+        match part {
+            Some([left, top, right, bottom]) if right <= f.Width && bottom <= f.Height => {
+                let rows = &rows[top as usize * pitch + left as usize * 4..];
+                save(frame, right - left, bottom - top, pitch, bgra, rows);
+            }
+            _ => save(frame, f.Width, f.Height, pitch, bgra, rows),
+        }
         buffer.Unmap(0, None);
     }
 }

@@ -585,12 +585,51 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`): frame token,
+/// the plane's resources, then per resource the part of it shown (left,
+/// top, right, bottom; null for all of it) and where it goes on screen.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+    placement: *const [u32; 4],
+}
+
+/// The part of a `width` x `height` plane the title shows, if it names one
+/// that is inside it and not all of it (`VICTORY_PRESENT_SRC_RECT=0`: never).
+#[cfg(windows)]
+fn shown_part(plane: &Plane, width: u64, height: u32) -> Option<[u32; 4]> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("VICTORY_PRESENT_SRC_RECT").map_or(true, |v| v != "0")) {
+        return None;
+    }
+    let rects = plane.source_rects;
+    if rects.is_null() || !rects.is_aligned() {
+        return None;
+    }
+    // SAFETY: the title passes one rectangle per resource when it passes any.
+    let [left, top, right, bottom] = unsafe { *rects };
+    let placement = if plane.placement.is_null() || !plane.placement.is_aligned() {
+        None
+    } else {
+        // SAFETY: as above, one placement per resource.
+        Some(unsafe { *plane.placement })
+    };
+    static LAST: std::sync::Mutex<Option<([i32; 4], u64, u32)>> = std::sync::Mutex::new(None);
+    let seen = ([left, top, right, bottom], width, height);
+    if LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(seen) != Some(seen) {
+        tracing::info!(left, top, right, bottom, width, height, ?placement, "part of the plane the title shows");
+    }
+    let inside = 0 <= left
+        && left < right
+        && 0 <= top
+        && top < bottom
+        && u64::try_from(right).is_ok_and(|r| r <= width)
+        && u32::try_from(bottom).is_ok_and(|b| b <= height);
+    let all = (left, top) == (0, 0) && u64::try_from(right) == Ok(width) && u32::try_from(bottom) == Ok(height);
+    (inside && !all).then(|| [left, top, right, bottom].map(|v| v as u32))
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -829,7 +868,10 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let part = shown_part(plane, desc.Width, desc.Height);
+        let shown = host.present(texture, state, frame, part);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -1005,6 +1047,26 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn only_the_part_of_the_plane_the_title_names_is_shown() {
+        let plane = |rect: &[i32; 4]| Plane {
+            token: 0,
+            count: 1,
+            resources: std::ptr::null(),
+            source_rects: rect,
+            placement: std::ptr::null(),
+        };
+        let part = |rect: [i32; 4]| shown_part(&plane(&rect), 3840, 2160);
+        assert_eq!(part([0, 0, 3840, 2064]), Some([0, 0, 3840, 2064]));
+        assert_eq!(part([0, 0, 3840, 2160]), None, "all of it");
+        assert_eq!(part([0, 0, 3840, 2161]), None, "past the bottom");
+        assert_eq!(part([-1, 0, 3840, 2064]), None);
+        assert_eq!(part([8, 8, 8, 2064]), None, "empty");
+        let none = Plane { source_rects: std::ptr::null(), ..plane(&[0; 4]) };
+        assert_eq!(shown_part(&none, 3840, 2160), None);
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

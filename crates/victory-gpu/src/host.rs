@@ -732,6 +732,10 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// Fills of upload memory a submission's preparing sends to the card
+    /// instead ([`read_fixup`]): destination (scratch chunk, offset), host
+    /// copy and offset, bytes; the list's prelude records them.
+    fixups: Mutex<Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -1401,7 +1405,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.upload_buffer_in(size, read_fixup())?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1968,6 +1972,9 @@ struct Deferred {
     /// Title copies done at submission recorded so far (`Copy`, `Run`):
     /// after one, ranges are refreshed again (`refreshed` starts over).
     title_writes: u64,
+    /// When fills and title copies were recorded (step, time), for
+    /// [`READ_FLIGHT`].
+    read_times: Vec<(usize, std::time::Instant)>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -2571,6 +2578,182 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
+/// Whether a fill of upload memory that would read what flights in the air
+/// may write is sent to the card at submission instead of waiting for them
+/// (`VICTORY_READ_FIXUP`; on by default, `=0` off): the list's prelude
+/// copies the range from its host copy into the upload memory the list's
+/// view shows, behind the flights on the one queue, and the range is
+/// refreshed as a card fill's is. A read recorded before the flight that
+/// writes it was sent (the title records lists ahead of the submission
+/// before them) found no flight then (`crate::cardcopy::read_on_card`) and
+/// made the submission wait (run zall15g: 2.0 settles a frame, 65.6 ms).
+///
+/// As the wait, as a card fill: the host copy after the flights' shaders,
+/// the title's bytes sent up where they do not write; where the title wrote
+/// under their writes the submission settles first ([`stale_under_flights`]
+/// sees the refresh). Only where every read that would wait is such a fill
+/// of a plain host copy (not in place, not in the card's memory) and of
+/// scratch memory the list holds; else the submission waits as before.
+/// Scratch chunks are then made in memory the card may write too (the same
+/// memory as upload memory: write-combined, in the PC).
+pub(crate) fn read_fixup() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off under `VICTORY_CARD_FILLS_CHECK`: its CPU fills are the compare.
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_READ_FIXUP").is_none_or(|v| v != "0") && !crate::cardcopy::fills_check_on()
+    })
+}
+
+/// Since the last frame-rate line ([`read_fixup`]): fills sent to the card
+/// at submission, submissions that did not wait for it.
+static FIXUP_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`read_fixup`] for `runs`, about to wait for flights for what they read:
+/// whether every fill that would wait was sent to the card (the caller
+/// asks again whether anything else would).
+fn fix_up_reads(runs: &[&HostList]) -> bool {
+    let written = line().written.clone();
+    // (list, step, upload destination, source, bytes)
+    let mut found = Vec::new();
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            match step {
+                &Step::Fill(dst, src, len) if touches(&written, src, src + len) => found.push((l, i, dst, src, len)),
+                // (anything else that would wait still makes the submission wait)
+                _ => {}
+            }
+        }
+    }
+    let mut fixes = Vec::with_capacity(found.len());
+    for &(l, i, dst, src, len) in &found {
+        let Some(shadow) = crate::shadow::find(src as u64, len as u64) else {
+            return false;
+        };
+        if shadow.left(src as u64) < len as u64 || shadow.in_place() || shadow.carded() {
+            return false;
+        }
+        let Some((to, at)) = runs[l].scratch_place(dst) else {
+            return false;
+        };
+        fixes.push((l, i, to, at, shadow, src, len));
+    }
+    for (l, i, to, at, shadow, src, len) in fixes {
+        let list = runs[l];
+        {
+            let mut deferred = list.deferred();
+            deferred.copies[i] = Step::Host(Box::new(|| {}));
+            // Brought up to date as a card fill's source, last.
+            deferred.copies.push(Step::Refresh(shadow.clone(), src, len));
+        }
+        list.fixups.lock().unwrap_or_else(|e| e.into_inner()).push((
+            to,
+            at,
+            shadow.buffer.clone(),
+            shadow.offset(src as u64),
+            len as u64,
+        ));
+        FIXUP_STATS[0].fetch_add(1, Ordering::Relaxed);
+    }
+    FIXUP_STATS[1].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Since the last frame-rate line, of reads a submission waited for
+/// ([`blocked_by`]): those whose flight was sent after the read was
+/// recorded, those sent before, and those whose flight was not found.
+static READ_FLIGHT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For [`READ_FLIGHT`]: a read of `[lo, hi)` (`what`, step `step` of `list`)
+/// waits for flights.
+fn note_read_flight(list: &HostList, step: usize, what: &str, lo: usize, hi: usize) {
+    let recorded = list.deferred().read_times.iter().rev().find(|(at, _)| *at == step).map(|&(_, t)| t);
+    let sent = {
+        let line = line();
+        line.line.iter().rev().find_map(|item| match item {
+            Late::Run(flight) if flight.back.iter().any(|(_, r)| r.iter().any(|&(a, b)| a < hi && lo < b)) => {
+                Some(flight.sent_at)
+            }
+            _ => None,
+        })
+    };
+    let after = match (recorded, sent) {
+        (Some(recorded), Some(sent)) => Some(sent > recorded),
+        _ => None,
+    };
+    READ_FLIGHT[match after {
+        Some(true) => 0,
+        Some(false) => 1,
+        None => 2,
+    }]
+    .fetch_add(1, Ordering::Relaxed);
+    static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if TOLD.fetch_add(1, Ordering::Relaxed) < 40 {
+        // SAFETY: a live list.
+        let kind = unsafe { list.list.GetType() };
+        tracing::info!(
+            "a read waits for a flight: {what} of {} bytes at {lo:#x} in a list of type {}; the flight was sent {}",
+            hi - lo,
+            kind.0,
+            match after {
+                Some(true) => "after the read was recorded",
+                Some(false) => "before the read was recorded",
+                None => "(not found: being landed)",
+            }
+        );
+    }
+}
+
+/// For the frame-rate line: [`READ_FLIGHT`] and [`FIXUP_STATS`].
+pub(crate) fn read_flight_line(frames: f64) {
+    let [after, before, unknown] = [0, 1, 2].map(|i| READ_FLIGHT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [fixed, spared] = [0, 1].map(|i| FIXUP_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "reads that waited for flights per frame: {after:.1} whose flight was sent after the read was recorded, \
+         {before:.1} before, {unknown:.1} being landed; fills sent to the card at submission {fixed:.1}, waits spared \
+         {spared:.1} (VICTORY_READ_FIXUP)"
+    );
+    if crate::cardcopy::fills_check_on() {
+        let [fills, bytes] = [0, 1].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "CPU fills per frame of what an earlier list of the same submission may write on the card: {fills:.1},              {bytes:.0} bytes (they read the bytes from before)"
+        );
+    }
+}
+
+/// Since the last frame-rate line, with `VICTORY_CARD_FILLS_CHECK`: CPU
+/// fills (and their bytes) of a list that read what an earlier list of
+/// the same submission declared written on the card. The fill runs at
+/// submission, before either list, so it reads the bytes from before.
+static CROSS_LIST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`CROSS_LIST`] for one submission.
+fn count_cross_list(runs: &[&HostList]) {
+    let mut written: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        if !written.is_empty() {
+            for step in &deferred.copies {
+                if let &Step::Fill(_, src, len) = step
+                    && touches(&written, src, src + len)
+                {
+                    CROSS_LIST[0].fetch_add(1, Ordering::Relaxed);
+                    CROSS_LIST[1].fetch_add(len as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        written.extend_from_slice(&deferred.gpu_written);
+        written.sort_unstable();
+        // Joined: `a` is kept, before `b`.
+        written.dedup_by(|b, a| {
+            let joined = b.0 <= a.1;
+            if joined {
+                a.1 = a.1.max(b.1);
+            }
+            joined
+        });
+    }
+}
+
 /// Whether title memory `[address, address + len)` is in what flights in the
 /// air may write now: the test a submission's reads wait by
 /// ([`late_blocked`]). Busy (a settle being taken): yes, which costs only a
@@ -2784,6 +2967,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    if count {
+        let blocking = blocking_read(written, runs);
+        if let Some((l, step, what, lo, hi)) = blocking {
+            note_read_flight(runs[l], step, what, lo, hi);
+        }
+    }
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -2830,6 +3019,28 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 }
                 Step::Run(..) => return Some(WHY_RUN),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+            }
+        }
+    }
+    None
+}
+
+/// The first fill or title copy of `runs` that reads (or a copy writes)
+/// what `written` holds: list, step, what, range.
+fn blocking_read(written: &[(usize, usize)], runs: &[&HostList]) -> Option<(usize, usize, &'static str, usize, usize)> {
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            match *step {
+                Step::Copy(_, src, len) if touches(written, src, src + len) => {
+                    return Some((l, i, "a buffer copy", src, src + len));
+                }
+                Step::Copy(dst, _, len) if touches(written, dst, dst + len) => {
+                    return Some((l, i, "a buffer copy's destination", dst, dst + len));
+                }
+                Step::Fill(_, src, len) if touches(written, src, src + len) => {
+                    return Some((l, i, "a fill of upload memory", src, src + len));
+                }
+                _ => {}
             }
         }
     }
@@ -3724,6 +3935,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 card_scratch: Mutex::default(),
+                fixups: Mutex::default(),
                 fill_groups: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -5384,7 +5596,12 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = late_blocked(runs)
+            && !(why == WHY_READ && read_fixup() && fix_up_reads(runs) && {
+                let written = line().written.clone();
+                blocked_by(&written, runs, false).is_none()
+            })
+        {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5467,6 +5684,9 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        }
+        if crate::cardcopy::fills_check_on() {
+            count_cross_list(runs);
         }
         for list in runs {
             list.run_deferred(&mut batch);
@@ -5988,6 +6208,7 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.declared.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6319,9 +6540,25 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // Kept until the list is reset: run again, the list's fills (now
+        // steps that do nothing) are made again here.
+        let fixups = self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if barriers.is_empty() && syncs.is_empty() && fixups.is_empty() {
             return None;
         }
+        // The fills sent to the card ([`read_fixup`]): copies from the host
+        // copies, behind the flights on the queue, into the upload memory
+        // the list's views show, which is then readable again.
+        let mut fixed: Vec<&ID3D12Resource> = Vec::new();
+        for (to, ..) in &fixups {
+            if !fixed.contains(&to) {
+                fixed.push(to);
+            }
+        }
+        let readable: Vec<_> = fixed
+            .iter()
+            .map(|to| transition(to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_GENERIC_READ))
+            .collect();
         let Some((allocator, list)) = self
             .prelude
             .get_or_init(|| host().and_then(|h| h.make_prelude()))
@@ -6342,6 +6579,12 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for (to, at, from, from_at, len) in &fixups {
+                    list.CopyBufferRegion(to, *at, from, *from_at, *len);
+                }
+                if !readable.is_empty() {
+                    list.ResourceBarrier(&readable);
                 }
                 list.Close()
             })
@@ -6451,6 +6694,8 @@ impl HostList {
                 return;
             }
         }
+        let at = deferred.copies.len();
+        deferred.read_times.push((at, std::time::Instant::now()));
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
@@ -6461,9 +6706,20 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        let mut deferred = self.deferred();
+        let at = deferred.copies.len();
+        deferred.read_times.push((at, std::time::Instant::now()));
+        deferred.copies.push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// Where `data` (in a scratch chunk of the list's) is: the chunk and the
+    /// offset in it.
+    fn scratch_place(&self, data: usize) -> Option<(ID3D12Resource, u64)> {
+        let s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        s.chunks
+            .iter()
+            .find(|(c, size)| c.data <= data && data < c.data + *size as usize)
+            .map(|(c, _)| (c._buffer.clone(), (data - c.data) as u64))
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7322,12 +7578,29 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.upload_buffer_in(size, false)
+    }
+
+    /// [`Host::upload_buffer`]; `card_writes`: in memory of the same kind
+    /// (write-combined, in the PC) that copies on the card may write too,
+    /// starting in the common state ([`read_fixup`]).
+    fn upload_buffer_in(&self, size: u64, card_writes: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
-            ..Default::default()
+        let heap = if card_writes {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            }
         };
+        let state = if card_writes { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_GENERIC_READ };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -7350,7 +7623,7 @@ impl Host {
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    state,
                     None,
                     &mut buffer,
                 )

@@ -205,8 +205,16 @@ RWByteAddressBuffer wdata : register(u0);
 // arguments. From byte 64: a 16-byte hash per piece after the last run,
 // then one per piece before this one.
 RWByteAddressBuffer state : register(u1);
-uint4 load4(uint at) { return srv != 0u ? rdata.Load4(at) : wdata.Load4(at); }
-uint load1(uint at) { return srv != 0u ? rdata.Load(at) : wdata.Load(at); }
+// One pipeline per kind of view: a choice between the two in one shader
+// loads through both (the compiler flattens it), and the view not meant
+// reads past its end (a page fault, a hung card).
+#if VIA_SRV
+uint4 load4(uint at) { return rdata.Load4(at); }
+uint load1(uint at) { return rdata.Load(at); }
+#else
+uint4 load4(uint at) { return wdata.Load4(at); }
+uint load1(uint at) { return wdata.Load(at); }
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -265,7 +273,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 struct Hasher {
     root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+    /// Reading through the unordered access view, the shader resource view.
+    pso: [ID3D12PipelineState; 2],
+}
+
+/// The hash pass's source for views of one kind.
+fn source(srv: bool) -> String {
+    format!("#define VIA_SRV {}\n{SOURCE}", u32::from(srv))
 }
 
 fn hasher() -> Option<&'static Hasher> {
@@ -274,18 +288,26 @@ fn hasher() -> Option<&'static Hasher> {
         .get_or_init(|| {
             let made = (|| -> windows::core::Result<Hasher> {
                 let device = &crate::host::host().ok_or_else(windows::core::Error::empty)?.device;
-                let bytes = crate::host::compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
-                // SAFETY: the compiled bytes; the root signature is inside.
+                let compiled = [false, true].map(|srv| {
+                    crate::host::compile(&source(srv), windows::core::s!("main"), windows::core::s!("cs_5_1"))
+                });
+                let [uav, srv] = compiled;
+                let (uav, srv) = (uav?, srv?);
+                // SAFETY: the compiled bytes; the root signature is inside
+                // (one for both).
                 unsafe {
-                    let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
-                    let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::transmute_copy(&root),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: bytes.as_ptr().cast(),
-                            BytecodeLength: bytes.len(),
-                        },
-                        ..Default::default()
-                    })?;
+                    let root: ID3D12RootSignature = device.CreateRootSignature(0, &uav)?;
+                    let pso = |bytes: &[u8]| {
+                        device.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: bytes.as_ptr().cast(),
+                                BytecodeLength: bytes.len(),
+                            },
+                            ..Default::default()
+                        })
+                    };
+                    let pso = [pso(&uav)?, pso(&srv)?];
                     Ok(Hasher { root, pso })
                 }
             })();
@@ -382,7 +404,7 @@ unsafe fn pass(
             0,
         ];
         l.SetComputeRootSignature(&h.root);
-        l.SetPipelineState(&h.pso);
+        l.SetPipelineState(&h.pso[usize::from(srv)]);
         l.SetComputeRoot32BitConstants(0, 12, constants.as_ptr().cast(), 0);
         // Unread, the shader resource view shows a buffer always readable
         // (the state is in the unordered access state).
@@ -750,8 +772,10 @@ mod tests {
 
     #[test]
     fn the_hasher_compiles() {
-        let made = crate::host::compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"));
-        assert!(made.is_ok_and(|b| !b.is_empty()));
+        for srv in [false, true] {
+            let made = crate::host::compile(&source(srv), windows::core::s!("main"), windows::core::s!("cs_5_1"));
+            assert!(made.is_ok_and(|b| !b.is_empty()));
+        }
     }
 
     #[test]
@@ -794,7 +818,15 @@ mod tests {
         });
     }
 
+    /// `VICTORY_SKIP_TEST_LOOPS` times (once by default).
     fn run_steps(len: u64, spans: impl Fn(u64, u64) -> Vec<Span>) {
+        let loops = std::env::var("VICTORY_SKIP_TEST_LOOPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        for _ in 0..loops {
+            run_steps_once(len, &spans);
+        }
+    }
+
+    fn run_steps_once(len: u64, spans: &impl Fn(u64, u64) -> Vec<Span>) {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -879,6 +911,11 @@ mod tests {
                 back.Map(0, None, Some(&mut p)).unwrap();
                 let header = *(p as *const [u32; 16]);
                 back.Unmap(0, None);
+                // Under the debug layer (`VICTORY_D3D12_DEBUG`, with
+                // `VICTORY_D3D12_GBV` validation on the card): no errors.
+                if let Some(error) = host.log_messages() {
+                    panic!("debug layer: {error}");
+                }
                 header
             };
             // Dwords: 4 to be left out, 5 left out, 6 runs, 7 wrong, 8

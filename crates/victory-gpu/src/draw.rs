@@ -1053,6 +1053,7 @@ impl State {
                 let (ranges, reads) = self.leaf_ranges(e);
                 // The constant buffer dwords the extents were bounded with,
                 // as the submission finds them.
+                crate::extent::dump(&stage.shader.hash.to_string(), &reads, GROUPS.get());
                 if !reads.is_empty() && (crate::extent::narrow() || crate::extent::check_on()) {
                     let hash = stage.shader.hash.clone();
                     list.defer_host(move || crate::extent::recheck(&reads, &hash));

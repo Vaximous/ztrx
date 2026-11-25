@@ -164,19 +164,13 @@ impl StoreExtents {
                 },
                 Node::Loaded(site, dword) => {
                     let inst = &p.blocks[site.0].insts[site.1];
-                    let Fields::Smem { offset, soffset, .. } = &inst.fields else {
-                        continue;
-                    };
                     if inst.name().starts_with("s_buffer_load") {
-                        let extra = match *soffset {
-                            Operand::Scalar { code: NULL, .. } => 0,
-                            Operand::Literal(x) => x,
-                            _ => continue,
+                        let Some(at) = buffer_load_offset(inst, dword) else {
+                            continue;
                         };
                         let Ok((slot, entry)) = entry_of(&res, n, site) else {
                             continue;
                         };
-                        let at = (*offset as u32).wrapping_add(extra).wrapping_add(u32::from(dword) * 4);
                         Leaf::Cb { slot, entry, offset: at }
                     } else {
                         let Ok(i) = res.scalar.binary_search_by_key(&site, |x| x.0) else {
@@ -567,7 +561,7 @@ pub(crate) fn check_line() {
     let c = CHECKS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     let r = RECHECKED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     tracing::info!(
-        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back;          {} constant dwords looked at again at submission, {} changed; {} not used as bounds as the card wrote          their memory",
+        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back;          {} constant dwords looked at again at submission, {} changed; {} in memory the card wrote (not used as          bounds unless VICTORY_EXTENT_CARD_CONSTANTS=1)",
         c[0],
         c[1],
         c[2],
@@ -576,6 +570,56 @@ pub(crate) fn check_line() {
         r[1],
         CARD_CONSTANTS.swap(0, Ordering::Relaxed)
     );
+}
+
+/// The byte offset in its constant buffer of dword `dword` of what the
+/// scalar buffer load `inst` loads: GFX10's immediate offset is in bytes,
+/// as is a literal or null `soffset` (None: a register's).
+fn buffer_load_offset(inst: &victory_shader::ir::Inst, dword: u8) -> Option<u32> {
+    let Fields::Smem { offset, soffset, .. } = &inst.fields else {
+        return None;
+    };
+    let extra = match *soffset {
+        Operand::Scalar { code: NULL, .. } => 0,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    Some((*offset as u32).wrapping_add(extra).wrapping_add(u32::from(dword) * 4))
+}
+
+/// `VICTORY_EXTENT_DUMP=<shader hash>`: at the first binds of that compute
+/// shader, the constant buffer dwords its extents read and the 64 dwords
+/// around each (from 64 bytes before), as the CPU finds them then.
+pub(crate) fn dump(hash: &str, reads: &[(u64, u32)], groups: Option<[u32; 3]>) {
+    static WANTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static LEFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(6);
+    let Some(wanted) = WANTED.get_or_init(|| std::env::var("VICTORY_EXTENT_DUMP").ok()) else {
+        return;
+    };
+    if !hash.contains(wanted.as_str())
+        || LEFT.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| n.checked_sub(1)).is_err()
+    {
+        return;
+    }
+    for &(address, value) in reads {
+        let from = address.saturating_sub(64);
+        let mut bytes = [0u8; 256];
+        let read = crate::host::read_into(from as *const u8, &mut bytes);
+        let dwords: Vec<String> = bytes
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(i, d)| format!("{:+#x}={:#x}", from as i64 + 4 * i as i64 - address as i64, u32::from_le_bytes([d[0], d[1], d[2], d[3]])))
+            .collect();
+        tracing::info!(
+            hash,
+            address = format_args!("{address:#x}"),
+            value,
+            ?groups,
+            read,
+            "a constant a store extent is bounded with, and around it: {}",
+            dwords.join(" ")
+        );
+    }
 }
 
 /// The 64 KiB pieces of title memory that copy-backs wrote (what shaders
@@ -600,7 +644,7 @@ fn distrust_card_constants() -> bool {
 
 /// A copy-back wrote `[at, at + len)` of title memory.
 pub(crate) fn card_wrote(at: usize, len: usize) {
-    if len == 0 || !(narrow() || check_on()) || !distrust_card_constants() {
+    if len == 0 || !(narrow() || check_on()) {
         return;
     }
     let (first, last) = ((at >> 16) as u64, ((at + len - 1) >> 16) as u64);
@@ -611,10 +655,8 @@ pub(crate) fn card_wrote(at: usize, len: usize) {
 
 /// Whether a constant buffer dword at `address` may bound a store: not if
 /// a copy-back ever wrote its piece.
+/// (Counted also when they are trusted.)
 pub(crate) fn constant_trusted(address: u64) -> bool {
-    if !distrust_card_constants() {
-        return true;
-    }
     let card = CARD_PIECES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -623,13 +665,60 @@ pub(crate) fn constant_trusted(address: u64) -> bool {
     if card {
         CARD_CONSTANTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    !card
+    !card || !distrust_card_constants()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use victory_shader::stores::Op;
+
+    /// The code of the clear the second check run caught (ba4e20a2), from
+    /// its first instruction to `s_endpgm`: the index is
+    /// `cb[0x14] * s7 + s6 * 32 + v0`, `s_buffer_load_dword s5, s[12:15],
+    /// 0x14` at word 24.
+    const CLEAR: [u32; 36] = [
+        0xD5803B3D, 0x03FF9D44, 0x6D0F7FDD, 0xD58056EE, 0x03FE8D6D, 0xE93D35FC, 0xBFA00003, 0xBE840305,
+        0xBE850380, 0x7E020280, 0xF4080202, 0xFA000000, 0xF4080002, 0xFA000020, 0xF4080302, 0xFA000040,
+        0x7E040280, 0x7E060280, 0x7E080280, 0x7E0A02C1, 0x7E0C02C1, 0x7E0E02C1, 0x7E1002C1, 0xBF8CC07F,
+        0xF4200146, 0xFA000014, 0x8F048506, 0xBF8CC07F, 0x93050705, 0x81050405, 0x4A000005, 0xE01C2000,
+        0x80020100, 0xE01C2000, 0x80000500, 0xBF810000,
+    ];
+
+    /// The constant buffer dwords the clear's index is bounded with.
+    fn constant_offsets(code: &[u32]) -> Vec<u32> {
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = victory_shader::ir::build(&bytes, false, 9).expect("the clear builds");
+        let e = extents(&p);
+        assert_eq!(e.stores.len(), 2);
+        e.nodes
+            .iter()
+            .filter_map(|n| match *n {
+                Node::Loaded(site, dword) => {
+                    let inst = &p.blocks[site.0].insts[site.1];
+                    inst.name().starts_with("s_buffer_load").then(|| buffer_load_offset(inst, dword))
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .expect("an immediate offset")
+    }
+
+    /// GFX10's scalar load offsets are bytes: the clear reads the dword at
+    /// byte 0x14 (dword 5), not at byte 0x50; and a dword past the first of
+    /// a wider load is four bytes on for each.
+    #[test]
+    fn constant_buffer_offsets_are_bytes() {
+        assert_eq!(constant_offsets(&CLEAR), [0x14]);
+        // As `s_buffer_load_dwordx4 s[4:7], s[12:15], 0x10`: s5, s6 and s7
+        // (the index's terms) are its second to fourth dwords, at bytes
+        // 0x14, 0x18 and 0x1c.
+        let mut wide = CLEAR;
+        (wide[24], wide[25]) = (0xF4280106, 0xFA000010);
+        let mut offsets = constant_offsets(&wide);
+        offsets.sort_unstable();
+        assert_eq!(offsets, [0x14, 0x18, 0x1c]);
+    }
 
     /// A constant in a piece a copy-back wrote does not bound stores.
     #[test]

@@ -1862,6 +1862,21 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the title's memory-to-memory copies (`CopyMemoryToMemoryX`, run
+/// at submission) are steps that say where they write
+/// (`VICTORY_KNOWN_WRITES`, on by default; `=0` as before). Each such copy
+/// ended the submission's one write-watch asking, so that every later
+/// flush of the submission asked the kernel again (`GetWriteWatch` was
+/// 19% of the submitting thread in run zl3), and held back a submission
+/// sent ahead while flights were in the air whatever it touched. The
+/// journal now learns the destination as written, as for the title's
+/// buffer copies, and a submission waits for the flights only if the copy
+/// touches what they write. Ported from victory-perf (c3faf2a8).
+fn known_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_WRITES").is_none_or(|v| v != "0"))
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -1907,8 +1922,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// Work that may write title memory; with where, when it is a copy
+    /// (destination, source, bytes; [`known_writes`]).
+    Run(Box<dyn Fn() + Send>, Option<(usize, usize, usize)>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
@@ -2738,7 +2754,15 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                &Step::Run(_, Some((dst, src, len))) if known_writes() => {
+                    if touches(written, src, src.saturating_add(len)) || touches(written, dst, dst.saturating_add(len)) {
+                        if count {
+                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::Run(..) => return Some(WHY_RUN),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -6570,10 +6594,11 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    /// Runs `work` when the list is submitted, in order with its copies:
+    /// work that copies `len` bytes of title memory from `src` to `dst` and
+    /// writes nothing else (refreshes after it copy again).
+    pub(crate) fn defer_copy_run(&self, dst: usize, src: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Run(Box::new(work), Some((dst, src, len))));
         self.deferred().refreshed.clear();
     }
 
@@ -6627,15 +6652,20 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                Step::Run(work, _) | Step::Host(work) => {
+                    if matches!(step, Step::Run(..)) {
                         batch.title_written();
                     }
                     work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_written();
+                    match step {
+                        // A copy that says where it writes: the journal
+                        // learns it, as for the title's buffer copies.
+                        &Step::Run(_, Some((dst, _, len))) if known_writes() => crate::watch::wrote(dst, len),
+                        // It wrote title memory, where is not known here:
+                        // the submission's one asking ends, later
+                        // refreshes ask anew.
+                        Step::Run(..) => crate::watch::ask_once_written(),
+                        _ => {}
                     }
                     #[cfg(feature = "diagnostics")]
                     {

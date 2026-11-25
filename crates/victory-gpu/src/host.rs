@@ -2167,7 +2167,28 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// waits for it there, so nothing sent later runs before it is done.
 fn fetch_queue() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_FETCH_QUEUE=2`: as [`fetch_queue`], and the pieces a flight
+/// sent after the landed ones declares written go to the copy queue too,
+/// read while that flight may be running. In the world about 19 such
+/// pieces a landing kept the fetch on the one queue, behind every flight in
+/// the air (93 ms a frame of waiting, run zp1fq), though the copy queue
+/// took the other 1,237 in 4 ms.
+///
+/// What changes: the title may see, with a landed flight's results, bytes
+/// a flight still running has written so far in the same piece, before its
+/// fence is signalled. A console's CPU reading the memory while the later
+/// work runs sees the same; where the later flight writes nothing in the
+/// piece (the usual case: views declared written whole), nothing differs.
+/// Its own landing merges what it wrote afterwards as before: the merge
+/// takes only bytes that differ from the CPU's side, which takes what it
+/// merged. Pieces a send of title bytes numbered after the landed flights
+/// went to stay on the one queue (the card's side may be older there).
+fn fetch_queue_loose() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "2"))
 }
 
 /// `VICTORY_FETCH_QUEUE_CHECK=1`: until [`QUICK_CHECKS`] pieces have been
@@ -3113,7 +3134,8 @@ fn late_line(frames: f64) {
         let q: Vec<f64> = QUICK_STATS[..6].iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "fetches on the copy queue per frame (VICTORY_FETCH_QUEUE=1): {:.1} pieces {:.1} MB in {:.1} landings, {:.1} ms \
-             waited for them; kept on the one queue: {:.1} pieces a newer flight declares, {:.1} a newer send went to; \
+             waited for them; {:.1} pieces a newer flight declares (on the one queue unless VICTORY_FETCH_QUEUE=2), \
+             {:.1} a newer send went to (on the one queue); \
              compared {} (alike {}, different {})",
             q[0],
             q[1] / (1 << 20) as f64,
@@ -4073,7 +4095,9 @@ impl Host {
                 let (shadow, lo, hi, _, (copy, piece)) = p;
                 if newer.iter().any(|&&(c, a, b)| c == *copy && a <= *piece && *piece < b) {
                     by_flight += 1;
-                    return true;
+                    if !fetch_queue_loose() {
+                        return true;
+                    }
                 }
                 if shadow.sent_after(*lo, *hi, floor) {
                     by_send += 1;

@@ -528,3 +528,39 @@ fn console_waves_on_either_side_of_a_wave_wide_branch_meet_their_own_halves() {
     }
     eprintln!("ran on the hardware device: each console wave's OR, the other wave elsewhere");
 }
+
+/// 64 threads in one console wave; the threads below s0 store their number to dword 0 (an
+/// address of scalars only) inside `if (t < s0) { ... }`, taken wave-wide. On the console
+/// the highest of them stores last, so dword 0 ends as s0 - 1. Two host waves of 32 store
+/// unordered: past 32 threads the lower one's 31 could stay, unless only the console's
+/// highest lane stores (`Lower::last_lane_store`), as the hair shadow-mask pass needs for
+/// the tile word every lane writes to one place.
+#[test]
+fn lanes_storing_to_one_address_leave_the_highest_lanes_data() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz over the store
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the skip");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [1u32, 20, 32, 33, 40, 63, 64] {
+        for _ in 0..8 {
+            let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+            assert_eq!(got, below - 1, "{below} threads storing");
+        }
+    }
+    eprintln!("ran on the hardware device: the highest storing lane's number stays");
+}

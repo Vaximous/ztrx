@@ -277,6 +277,8 @@ struct Lower<'a> {
     meet_bad: bool,
     /// The blocks where host waves meet ([`Self::meet`]), for [`take_loop_meeting`].
     meetings: Vec<usize>,
+    /// Stores left to the console's highest lane ([`Self::last_lane_store`]), by offset.
+    store_gates: Vec<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1560,6 +1562,7 @@ impl<'a> Lower<'a> {
             pair_sync,
             meet_bad: false,
             meetings: Vec::new(),
+            store_gates: Vec::new(),
             flat: None,
             no_barrier,
             fence_only,
@@ -2160,6 +2163,10 @@ impl<'a> Lower<'a> {
         }
         let looped = self.meetings.iter().any(|&b| self.s.m.in_cycle(b));
         LOOP_MEETING.set(looped);
+        if !self.store_gates.is_empty() && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let at: Vec<String> = self.store_gates.iter().map(|o| format!("{o:#x}")).collect();
+            eprintln!("WAVE64-STORES of lane data to one address left to the highest lane: {}", at.join(" "));
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3804,6 +3811,127 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
+    /// Whether VGPR value `v`, read by `store`, is the same in every lane that runs the store:
+    /// the same in every lane ([`lane_uniform`]), or written earlier in the store's block under
+    /// the same EXEC (the same guard) by a vector instruction from scalars, constants and such
+    /// values, or by an LDS read at such an address, as the compiler moves scalars into VGPRs
+    /// for an address or reads a counter from one place.
+    fn same_where_stored(&self, store: &Inst, v: Value) -> bool {
+        let insts = &self.x.p.blocks[self.cur_ir].insts;
+        insts
+            .iter()
+            .position(|i| std::ptr::eq(i, store))
+            .is_some_and(|at| self.same_in_block(at, at, v, 4))
+    }
+
+    /// [`Self::same_where_stored`] for `v` read by instruction `at` of the current block,
+    /// which runs under the guard of instruction `under`.
+    fn same_in_block(&self, under: usize, at: usize, v: Value, depth: u32) -> bool {
+        if self.uniform.contains(&v) {
+            return true;
+        }
+        let b = self.cur_ir;
+        let insts = &self.x.p.blocks[b].insts;
+        let Some(w) = insts[..at].iter().rposition(|i| i.writes.iter().any(|x| x.1 == v)) else {
+            return false;
+        };
+        if depth == 0 || self.x.st.guards[b][w] != self.x.st.guards[b][under] {
+            return false;
+        }
+        let def = &insts[w];
+        let name = def.name();
+        // the source VGPRs (a guarded write also reads the register it writes, for the lanes
+        // outside EXEC, which do not matter here)
+        let vectors_same = |srcs: &[Operand]| {
+            def.reads.iter().all(|r| match r.0 {
+                Reg::V(x) => {
+                    let src = srcs.iter().any(|op| matches!(*op, Operand::Vector { reg, dwords }
+                        if x >= reg && x < reg.saturating_add(dwords)));
+                    !src || self.same_in_block(under, w, r.1, depth - 1)
+                }
+                _ => true,
+            })
+        };
+        match &def.fields {
+            Fields::Ds { gds: false, addr: Some(addr), .. } if name == "ds_read_b32" => {
+                vectors_same(std::slice::from_ref(addr))
+            }
+            Fields::Valu(valu) => {
+                if valu.dpp.is_some() || valu.sdwa.is_some() || name.contains("lane") || name.starts_with("v_mbcnt")
+                    || name.starts_with("v_cmp")
+                {
+                    return false;
+                }
+                let is_mask = |x: Value| self.x.st.masks.contains_key(&x) || self.x.st.highs.contains_key(&x);
+                let scalars = valu.src.iter().all(|op| match *op {
+                    Operand::Scalar { code, .. } if code != NULL => def.read(Reg::S(code)).is_none_or(|x| !is_mask(x)),
+                    _ => true,
+                });
+                scalars && vectors_same(&valu.src)
+            }
+            _ => false,
+        }
+    }
+
+    /// A store of lane data to one address in every lane (an LDS dword, a texel, a buffer
+    /// element the address of which is made of scalars): on the console the wave's highest
+    /// lane in EXEC writes last, so its data stays. Two host waves of 32 store unordered, so the
+    /// lower half's data may stay instead; and the host does not promise which of its lanes
+    /// writes last. The guard this returns lets only the console's highest lane store: the
+    /// host wave's highest lane under `guard`, in the upper half, or in the lower half when the
+    /// upper half has no lane there (which the halves exchange, unless every lane stores).
+    /// Unchanged where the halves cannot meet, or the data is the same in every lane.
+    fn last_lane_store(&mut self, inst: &Inst, guard: Option<V>, data: &[(u8, u8)]) -> Result<Option<V>, Why> {
+        let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
+        if !halves {
+            return Ok(guard);
+        }
+        let is_data = |r: u8| data.iter().any(|&(reg, n)| r >= reg && r < reg.saturating_add(n));
+        let mut lane_data = false;
+        for &(r, v) in &inst.reads {
+            if let Reg::V(x) = r {
+                let same = self.same_where_stored(inst, v);
+                if is_data(x) {
+                    lane_data |= !same;
+                } else if !same {
+                    return Ok(guard); // lanes store to their own addresses
+                }
+            }
+        }
+        if !lane_data || !self.all_lanes(self.cur_ir) {
+            return Ok(guard);
+        }
+        self.store_gates.push(inst.machine.offset);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let g = guard.unwrap_or_else(|| self.s.m.bool(true));
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
+        let mine = self.s.m.extract(c, ballot, 0);
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let one = self.s.m.i32(1);
+        let above = self.s.m.bin(c, Bin::LShr, mine, lane);
+        let above = self.s.m.bin(c, Bin::LShr, above, one);
+        let z = self.s.m.i32(0);
+        let top = self.s.m.cmp(c, pred::EQ, above, z);
+        let cl = self.console_lane();
+        let k32 = self.s.m.i32(32);
+        let upper = self.s.m.cmp(c, pred::IUGE, cl, k32);
+        let half_ok = if guard.is_none() {
+            // every lane stores: the upper half's highest lane is the console's
+            upper
+        } else {
+            let (_, hi) = self.exchange_halves(c, mine);
+            let c = self.cur;
+            let none_above = self.s.m.cmp(c, pred::EQ, hi, z);
+            self.s.m.bin(c, Bin::Or, upper, none_above)
+        };
+        let c = self.cur;
+        let ok = self.s.m.bin(c, Bin::And, top, half_ok);
+        Ok(Some(self.s.m.bin(c, Bin::And, g, ok)))
+    }
+
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
     /// block): a group of several console waves has a pair for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
@@ -4652,6 +4780,14 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
+            let regs: Vec<(u8, u8)> = data
+                .iter()
+                .filter_map(|d| match *d {
+                    Operand::Vector { reg, dwords } => Some((reg, dwords)),
+                    _ => None,
+                })
+                .collect();
+            let guard = self.last_lane_store(inst, guard, &regs)?;
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
                 let p = dword(self, off);
@@ -9269,6 +9405,7 @@ impl<'a> Lower<'a> {
                 });
             }
             let h = self.handle(site, src, false, props)?;
+            let guard = self.last_lane_store(inst, guard, &[(reg, if *d16 { 2 } else { 4 })])?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             args.extend(cs);
@@ -10215,6 +10352,11 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
+            let data_regs: Vec<(u8, u8)> = match data {
+                Some(Operand::Vector { reg, dwords }) => vec![(*reg, *dwords)],
+                _ => Vec::new(),
+            };
+            let guard = self.last_lane_store(inst, guard, &data_regs)?;
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);

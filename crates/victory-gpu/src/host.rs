@@ -759,7 +759,7 @@ pub(crate) struct HostList {
     /// (address, bytes, whether narrowed by a store extent), with when and
     /// in which frame: for [`read_place`]'s look at what a read waits for.
     #[cfg(feature = "diagnostics")]
-    declared: Mutex<Vec<(usize, usize, bool, std::time::Instant, u64)>>,
+    declared: Mutex<Vec<(usize, usize, bool, std::time::Instant, u64, (u64, &'static str))>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -2420,7 +2420,7 @@ fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
     drop(line);
     let now = std::time::Instant::now();
     let frame = crate::queue::presented();
-    let Some(((address, bytes, narrowed, recorded, recorded_frame), number, sent)) = found else {
+    let Some(((address, bytes, narrowed, recorded, recorded_frame, (hash, why)), number, sent)) = found else {
         static UNFOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if UNFOUND.fetch_add(1, Ordering::Relaxed) < 20 {
             tracing::info!(
@@ -2442,7 +2442,7 @@ fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
     if n < 60 || n.is_multiple_of(200) {
         tracing::info!(
             "a read waits for flight {number}: {what} at {at:#x}+{len:#x}, declared by a table view {address:#x}+{bytes:#x} \
-             ({}), recorded in frame {recorded_frame} (now {frame}), {:.1} ms before the flight was sent, which was \
+             ({}) of shader {hash:016x} ({why}), recorded in frame {recorded_frame} (now {frame}), {:.1} ms before the flight was sent, which was \
              {:.1} ms ago",
             if narrowed { "narrowed by its store extent" } else { "whole" },
             to_send as f64 / 1000.0,
@@ -5619,13 +5619,16 @@ impl HostList {
     /// A table view declared `[address, address + len)` written
     /// (`narrowed`: by a store extent), for [`read_place`].
     #[cfg(feature = "diagnostics")]
-    pub(crate) fn note_declared(&self, address: u64, len: u64, narrowed: bool) {
+    /// `shader`: the compute shader's hash and why it has no extents, if
+    /// one is bound (0 if not).
+    pub(crate) fn note_declared(&self, address: u64, len: u64, narrowed: bool, shader: (u64, &'static str)) {
         self.declared.lock().unwrap_or_else(|e| e.into_inner()).push((
             address as usize,
             len as usize,
             narrowed,
             std::time::Instant::now(),
             crate::queue::presented(),
+            shader,
         ));
     }
 

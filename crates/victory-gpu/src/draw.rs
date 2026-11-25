@@ -2894,13 +2894,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
                         if hi > lo {
                             shadow.gpu_writes(list, address + lo, hi - lo, crate::shadow::Declarer::View);
                             #[cfg(feature = "diagnostics")]
-                            list.note_declared(address + lo, hi - lo, true);
+                            list.note_declared(address + lo, hi - lo, true, UNEXTENDED.get());
                         }
                     }
                     _ => {
                         shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View);
                         #[cfg(feature = "diagnostics")]
-                        list.note_declared(address, len, false);
+                        list.note_declared(address, len, false, UNEXTENDED.get());
                     }
                 }
                 if BOUNDED.get() {

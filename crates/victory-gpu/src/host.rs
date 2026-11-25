@@ -7524,6 +7524,19 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            let b = crate::draw::take_bind_stats();
+            let per_frame = |i: usize| b[i] as f64 / frames;
+            tracing::info!(
+                "binds per frame: {:.0} ({:.1} us each, {:.1} ms); root arguments {:.0} set, {:.0} \
+                 left as the list held them; tables reused {:.0}, {:.0} of their descriptors not read again",
+                per_frame(0),
+                b[1] as f64 / b[0].max(1) as f64,
+                per_frame(1) / 1e3,
+                per_frame(2),
+                per_frame(3),
+                per_frame(4),
+                per_frame(5)
+            );
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

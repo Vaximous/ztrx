@@ -405,9 +405,12 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Graphics, compute: the root constants and root views the host list holds since `bind`
+    /// last set that root signature ([`bind_cache`]).
+    root_args: [RootArgs; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// dynamic slot, and the constant buffers the table was made with.
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Vec<(u64, u64)>)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -535,6 +538,65 @@ pub(crate) fn take_frame() -> Vec<String> {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
+/// Whether `bind` leaves out the root arguments a host list holds already and the decoding of
+/// a reused table's descriptors (`VICTORY_BIND_CACHE=0` turns it off).
+///
+/// A root argument (32-bit constants, a root CBV, SRV or UAV) stays on a host list until it
+/// is set again or the bind point's root signature is set: [`RootArgs`] is cleared exactly
+/// there, where `bind` sets the signature. Everything of ours that sets another signature on
+/// the title's host list (clamps, extent checks, followed dispatches, a list cut) has `bind`
+/// set the title's again (`host_roots` made 0), as the signature itself needed already, and
+/// a list reset starts a new `State`. No command signature of ours changes root arguments.
+///
+/// A table reused within a list (same table, same descriptor words) notes the constant
+/// buffers it was made with, as the comment there always said, instead of decoding every
+/// descriptor of the table again: the world's tables run to hundreds of slots.
+pub(crate) fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Binds (draws, mesh draws, dispatches) and the microseconds they took; root arguments set
+/// and left out as already set; tables reused within their list, and the descriptors their
+/// reuse did not decode again. For the per-frame line ([`take_bind_stats`]).
+pub(crate) static BIND_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`BIND_STATS`] since the last call.
+pub(crate) fn take_bind_stats() -> [u64; 6] {
+    std::array::from_fn(|i| BIND_STATS[i].swap(0, Ordering::Relaxed))
+}
+
+/// What a bind point's root parameters hold, as `bind` set them since it last set the root
+/// signature (which clears them on the host list).
+#[derive(Default)]
+pub(crate) struct RootArgs {
+    constants: std::collections::HashMap<u32, Vec<u32>>,
+    /// By parameter: kind (0 CBV, 1 SRV, 2 UAV) and address.
+    views: std::collections::HashMap<u32, (u8, u64)>,
+}
+
+impl RootArgs {
+    /// The root signature was set: no argument is.
+    pub(crate) fn clear(&mut self) {
+        self.constants.clear();
+        self.views.clear();
+    }
+
+    /// Whether constants `values` must be set at `param` (they are taken as set now).
+    pub(crate) fn constants(&mut self, param: u32, values: &[u32]) -> bool {
+        if self.constants.get(&param).is_some_and(|v| v[..] == *values) {
+            return false;
+        }
+        self.constants.insert(param, values.to_vec());
+        true
+    }
+
+    /// Whether a root view of `kind` at `gpu` must be set at `param` (taken as set now).
+    pub(crate) fn view(&mut self, param: u32, kind: u8, gpu: u64) -> bool {
+        self.views.insert(param, (kind, gpu)) != Some((kind, gpu))
+    }
+}
+
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
@@ -677,6 +739,28 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// The host list's bind points `which` (0 graphics, 1 compute) no longer hold the title's
+    /// root signature (something of ours set another, the heaps changed, or the list is a new
+    /// one): the next `bind` sets it again, and with it every root argument.
+    pub(crate) fn lose_roots(&mut self, which: &[usize]) {
+        for &i in which {
+            self.host_roots[i] = 0;
+            self.root_args[i].clear();
+        }
+    }
+
+    /// Whether `bind` must set root signature `root` at a bind point (graphics or compute),
+    /// which is then taken as set, with no root arguments ([`RootArgs`]).
+    fn wants_root_signature(&mut self, compute: bool, root: usize) -> bool {
+        let i = usize::from(compute);
+        if self.host_roots[i] == root {
+            return false;
+        }
+        self.host_roots[i] = root;
+        self.root_args[i].clear();
+        true
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -876,7 +960,7 @@ impl State {
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
-        self.host_roots = [0; 2];
+        self.lose_roots(&[0, 1]);
         self.host_heaps = [0; 2];
         if self.topology_set {
             self.set_topology(list, self.topology);
@@ -1160,6 +1244,55 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let start = std::time::Instant::now();
+        let bound = self.bind_all(list, p, compute);
+        BIND_STATS[0].fetch_add(1, Ordering::Relaxed);
+        BIND_STATS[1].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        bound
+    }
+
+    /// Root constants `values` at `param`, unless the host list holds them ([`bind_cache`]).
+    fn set_root_constants(&mut self, list: &HostList, compute: bool, param: u32, values: &[u32]) {
+        if bind_cache() && !self.root_args[usize::from(compute)].constants(param, values) {
+            BIND_STATS[3].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BIND_STATS[2].fetch_add(1, Ordering::Relaxed);
+        let dwords = values.len() as u32;
+        // SAFETY: an open list; `values` covers the parameter.
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+            } else {
+                list.list.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+            }
+        }
+    }
+
+    /// A root view (`kind` 0 CBV, 1 SRV, 2 UAV) at `param`, unless the host list holds it
+    /// ([`bind_cache`]).
+    fn set_root_view(&mut self, list: &HostList, compute: bool, kind: u8, param: u32, gpu: u64) {
+        if bind_cache() && !self.root_args[usize::from(compute)].view(param, kind, gpu) {
+            BIND_STATS[3].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        BIND_STATS[2].fetch_add(1, Ordering::Relaxed);
+        let l = &list.list;
+        // SAFETY: an open list; the address is in live memory the list keeps.
+        unsafe {
+            match (compute, kind) {
+                (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
+                (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+            }
+        }
+    }
+
+    /// [`Self::bind`].
+    fn bind_all(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         #[cfg(feature = "diagnostics")]
         crate::meshprobe::binding(if compute {
@@ -1181,7 +1314,7 @@ impl State {
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
+            self.lose_roots(&[0, 1]);
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
@@ -1192,7 +1325,7 @@ impl State {
         };
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+        if self.wants_root_signature(compute, root) {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -1201,7 +1334,6 @@ impl State {
                     l.SetGraphicsRootSignature(&p.root);
                 }
             }
-            self.host_roots[usize::from(compute)] = root;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -1273,45 +1405,24 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
+                self.set_root_constants(list, compute, param, &values);
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
+                        // (the directory lives as long as the process and the list holds it)
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            self.set_root_view(list, compute, 1, param, m.directory);
                         }
                         continue;
                     }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
+                        // (the table lives as long as the heap the list holds)
                         match self.heap_buffers(list) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
-                            },
+                            Some(gpu) => self.set_root_view(list, compute, 1, param, gpu),
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -1350,30 +1461,15 @@ impl State {
                             None,
                         ));
                     }
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    self.set_root_view(list, compute, u8::from(srv), param, gpu);
                 }
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
+                    // (the buffer lives as long as the process and the list holds it)
                     if let Some(m) = &memory {
-                        // SAFETY: an open list; the buffer lives as long as
-                        // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        self.set_root_view(list, compute, 2, param, m.faults);
                     }
                     continue;
                 }
@@ -2092,7 +2188,7 @@ impl State {
         };
         if pending.is_some() || plan.is_some() {
             self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            self.lose_roots(&[1]);
             bound = self.bind(list, p, true);
         }
         GROUPS.set(None);
@@ -2128,12 +2224,12 @@ impl State {
         if let Some(pending) = pending {
             crate::extent::check_after(list, pending);
             self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            self.lose_roots(&[1]);
         }
         if let Some(plan) = plan {
             crate::skip::after(list, plan);
             self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            self.lose_roots(&[1]);
         }
     }
 
@@ -2399,12 +2495,22 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some((first, constants)) = self.fresh_tables.get(&key) {
+                let first = *first;
                 // Its constant buffers as the table made first holds them
-                // (the whole range, as there).
-                for k in 0..n {
-                    if let Some(View::Constant(address, size)) = crate::descriptor::view(table + u64::from(k) * 32) {
-                        crate::skip::note_constant(list, address, u64::from(size));
+                // (the whole range, as there): as noted when it was made
+                // ([`bind_cache`]), or read again from its descriptors.
+                BIND_STATS[4].fetch_add(1, Ordering::Relaxed);
+                if bind_cache() {
+                    BIND_STATS[5].fetch_add(u64::from(n), Ordering::Relaxed);
+                    for &(address, size) in constants {
+                        crate::skip::note_constant(list, address, size);
+                    }
+                } else {
+                    for k in 0..n {
+                        if let Some(View::Constant(address, size)) = crate::descriptor::view(table + u64::from(k) * 32) {
+                            crate::skip::note_constant(list, address, u64::from(size));
+                        }
                     }
                 }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -2433,7 +2539,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let mut constants = Vec::new();
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -2447,6 +2553,7 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         crate::skip::note_constant(list, address, u64::from(size));
+                        constants.push((address, u64::from(size)));
                         if let Some(gpu) = constant_in_card_copy(list, address, size)
                             .or_else(|| crate::cardcopy::try_fill(list, address, u64::from(size)))
                         {
@@ -2490,6 +2597,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, (first, constants));
             made.push((slot, first * 32));
         }
         made
@@ -2945,10 +3053,10 @@ impl State {
                     return false;
                 };
                 self.host_pipeline = 0;
-                self.host_roots[1] = 0;
+                self.lose_roots(&[1]);
                 if crate::indirect::clamped_as_draw(kind, records) {
                     // The clamp was a draw of ours, with no targets.
-                    self.host_roots[0] = 0;
+                    self.lose_roots(&[0]);
                     if self.topology_set {
                         self.set_topology(list, self.topology);
                     }
@@ -3326,4 +3434,84 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+
+#[cfg(test)]
+mod bind_cache_tests {
+    use super::{RootArgs, State};
+
+    /// A bind point holding constants at 0 and a root view at 1, under signature 7.
+    fn held() -> State {
+        let mut s = State::default();
+        assert!(s.wants_root_signature(true, 7));
+        assert!(s.root_args[1].constants(0, &[1, 2, 3]));
+        assert!(s.root_args[1].view(1, 1, 0x1000));
+        s
+    }
+
+    #[test]
+    fn root_arguments_set_once_are_left_out_until_they_change() {
+        let mut a = RootArgs::default();
+        assert!(a.constants(0, &[1, 2]));
+        assert!(!a.constants(0, &[1, 2]));
+        assert!(a.constants(0, &[1, 3]));
+        assert!(a.constants(1, &[1, 3]), "another parameter");
+        assert!(a.view(2, 0, 0x100));
+        assert!(!a.view(2, 0, 0x100));
+        assert!(a.view(2, 1, 0x100), "another kind of view");
+        assert!(a.view(2, 1, 0x200));
+    }
+
+    #[test]
+    fn the_same_signature_keeps_the_arguments() {
+        let mut s = held();
+        assert!(!s.wants_root_signature(true, 7));
+        assert!(!s.root_args[1].constants(0, &[1, 2, 3]));
+        assert!(!s.root_args[1].view(1, 1, 0x1000));
+    }
+
+    #[test]
+    fn another_signature_sets_every_argument_again() {
+        let mut s = held();
+        assert!(s.wants_root_signature(true, 8));
+        assert!(s.root_args[1].constants(0, &[1, 2, 3]));
+        assert!(s.root_args[1].view(1, 1, 0x1000));
+    }
+
+    #[test]
+    fn a_clamp_or_followed_dispatch_sets_every_argument_again() {
+        // what the clamps, the extent checks and the followed dispatches do afterwards
+        let mut s = held();
+        s.lose_roots(&[1]);
+        assert!(s.wants_root_signature(true, 7));
+        assert!(s.root_args[1].constants(0, &[1, 2, 3]));
+        // a clamp that was a draw loses the graphics bind point too, and only what it lost
+        let mut s = held();
+        assert!(s.wants_root_signature(false, 9));
+        assert!(s.root_args[0].constants(0, &[4]));
+        s.lose_roots(&[0]);
+        assert!(s.root_args[0].constants(0, &[4]));
+        assert!(!s.root_args[1].constants(0, &[1, 2, 3]), "compute untouched");
+    }
+
+    #[test]
+    fn a_heap_change_or_cut_sets_both_bind_points_again() {
+        let mut s = held();
+        assert!(s.wants_root_signature(false, 9));
+        assert!(s.root_args[0].view(3, 2, 0x40));
+        s.lose_roots(&[0, 1]);
+        assert!(s.wants_root_signature(false, 9) && s.wants_root_signature(true, 7));
+        assert!(s.root_args[0].view(3, 2, 0x40));
+        assert!(s.root_args[1].constants(0, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_list_reset_holds_nothing() {
+        let mut s = held();
+        s.reset(std::ptr::null());
+        assert!(s.wants_root_signature(true, 7));
+        assert!(s.root_args[1].constants(0, &[1, 2, 3]));
+        assert!(s.root_args[1].view(1, 1, 0x1000));
+    }
 }

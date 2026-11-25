@@ -742,7 +742,8 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Device-local chunks for constants the card copies out of title
     /// buffers' card copies (`crate::cardcopy::try_fill`): the chunks, the
-    /// one in use and the bytes used of it; kept across resets.
+    /// one in use and the bytes used of it; given back at the reset
+    /// ([`CARD_SPARE`]).
     card_scratch: Mutex<(Vec<ID3D12Resource>, usize, u64)>,
     /// Blocks of title memory the list's bindings read constants from,
     /// copied once (`crate::cardcopy::FillGroup`), by block and phase.
@@ -1378,6 +1379,14 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// The size of a chunk of [`HostList::card_scratch`].
+const CARD_CHUNK: u64 = 64 << 10;
+
+/// Chunks of [`HostList::card_scratch`] no list holds, at most
+/// [`CARD_SPARE_MOST`] bytes of them.
+static CARD_SPARE: Mutex<Spare<ID3D12Resource>> = Mutex::new(Spare::new());
+const CARD_SPARE_MOST: u64 = 256 << 20;
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -1952,6 +1961,9 @@ struct Deferred {
     /// Title memory the list's shaders and card copies may write
     /// ([`Step::GpuWrite`]; start, end, in order, joined).
     gpu_written: Vec<(usize, usize)>,
+    /// Title copies done at submission recorded so far (`Copy`, `Run`):
+    /// after one, ranges are refreshed again (`refreshed` starts over).
+    title_writes: u64,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -5967,8 +5979,21 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
-            let mut card = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (card.1, card.2) = (0, 0);
+            // Every submission of the list has run: its chunks go to the
+            // next list that asks. Kept by their list, every list a title
+            // records into came to hold its largest recording's chunks
+            // (with blocks of 64 KiB copied per list, run zall12w: 51 GB
+            // committed against 23, and a new buffer made for most blocks).
+            let chunks = {
+                let mut card = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+                (card.1, card.2) = (0, 0);
+                std::mem::take(&mut card.0)
+            };
+            let mut spare = CARD_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            for chunk in chunks {
+                // (one past the limit is freed)
+                drop(spare.give(chunk, CARD_CHUNK, CARD_SPARE_MOST));
+            }
         }
         self.fill_groups.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -6413,6 +6438,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.title_writes += 1;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -6658,7 +6684,7 @@ impl HostList {
     /// starts each execution in the common state; after a first use the
     /// list left it a constant buffer).
     pub(crate) fn card_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, bool)> {
-        const CHUNK: u64 = 64 << 10;
+        const CHUNK: u64 = CARD_CHUNK;
         let len = len.max(1).next_multiple_of(256);
         if len > CHUNK {
             return None;
@@ -6668,8 +6694,15 @@ impl HostList {
             (s.1, s.2) = (s.1 + 1, 0);
         }
         if s.1 == s.0.len() {
-            let buffer = host()?.uav_buffer(CHUNK)?;
-            name(&buffer, || "list constants copied on the card".into());
+            let kept = CARD_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(CHUNK);
+            let buffer = match kept {
+                Some(buffer) => buffer,
+                None => {
+                    let buffer = host()?.uav_buffer(CHUNK)?;
+                    name(&buffer, || "list constants copied on the card".into());
+                    buffer
+                }
+            };
             s.0.push(buffer);
             s.2 = 0;
         }
@@ -6722,8 +6755,16 @@ impl HostList {
     /// work that copies `len` bytes of title memory from `src` to `dst` and
     /// writes nothing else (refreshes after it copy again).
     pub(crate) fn defer_copy_run(&self, dst: usize, src: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work), Some((dst, src, len))));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), Some((dst, src, len))));
+        deferred.refreshed.clear();
+        deferred.title_writes += 1;
+    }
+
+    /// Title copies done at submission recorded so far: a range refreshed
+    /// before the last one is refreshed again for a read after it.
+    pub(crate) fn title_writes(&self) -> u64 {
+        self.deferred().title_writes
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

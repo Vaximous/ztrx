@@ -459,12 +459,9 @@ thread_local! {
 }
 
 /// The size of a [`FillGroup`]'s block of title memory
-/// (`VICTORY_FILL_GROUP_KB`, at most 64; off by default, `=0`: each fill
-/// copies its own bytes, about 11,700 a frame and 4.3 us of CPU each in run
-/// zall11a, nearly all one constant buffer per binding). Off until fixed:
-/// with whole title buffers learned (run zall12w) the picture broke (blown
-/// out, the room gone), draws fell from about 3,400 to under 1,000 a frame,
-/// the recording of fills took 285-827 ms a frame and commit reached 51 GB.
+/// (`VICTORY_FILL_GROUP_KB`, at most 64; 0, off, by default: each
+/// fill copies its own bytes, about 11,700 a frame and 4.3 us of CPU each
+/// in run zall11a, nearly all one constant buffer per binding).
 ///
 /// The same bytes as a fill of its own: a stand-in copied at a binding
 /// holds the host copy's bytes at that place in the list's order. A later
@@ -472,12 +469,23 @@ thread_local! {
 /// would, unless the card wrote the host copy in between: the list's shaders
 /// and its title buffer copies done on the card, which declare every range
 /// they may write ([`crate::shadow::Shadow::gpu_writes`], what the copy-back
-/// takes from them too). A group is used only while no range declared since
-/// its binding began meets its block (the binding's own draw writes after
-/// the copy: its declarations count); copies in place declare nothing and
-/// are not grouped. Flights run before the list; title writes reach the host
+/// takes from them too). A group is used only while no call whose shaders
+/// may write buffers was recorded since it was made ([`group_good`]: the
+/// binding's own draw is recorded after the copy, so it counts) and no range
+/// declared since its binding began meets its block (card copies); copies
+/// in place are not grouped. Flights run before the list; title writes reach the host
 /// copy at submission, before the list, for every fill alike; each fill's
 /// own range is still refreshed.
+///
+/// Off by default: run zall12w (64 KiB) broke. Each block took a 64 KiB
+/// chunk of its list's, and lists kept their chunks across resets, so every
+/// list the title records into grew to its largest recording's (51 GB
+/// committed, a buffer made for most blocks: 827 ms a frame "recording"
+/// fills, draws dropped); the chunks now go back to a pool at the reset.
+/// And a range refreshed for a group before a title copy done at
+/// submission was not refreshed again after it (each fill's own refresh is
+/// made again after one, `HostList::title_writes`): the host copy kept the
+/// bytes from before the copy where the per-fill path took those after.
 fn group_bytes() -> u64 {
     static KB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *KB.get_or_init(|| {
@@ -497,8 +505,42 @@ pub(crate) struct FillGroup {
     hi: u64,
     /// The list's steps up to which no declared write meets `[lo, hi)`.
     checked: usize,
-    /// Ranges of it refreshed for the list (joined).
+    /// Ranges of it refreshed for the list (joined), since the list's title
+    /// copy `epoch` ([`HostList::title_writes`]).
     refreshed: Vec<(usize, usize)>,
+    epoch: u64,
+    /// The list's calls whose shaders may write buffers when it was made
+    /// ([`HostList::write_count`]).
+    writes: u64,
+}
+
+/// Whether a group still holds what a fill of its own would copy now: no
+/// call whose shaders may write buffers recorded since it was made
+/// (`writes`, `writes_now`), and no write declared since that meets it
+/// (`declared`: card copies, which count as no such call).
+///
+/// Declared ranges alone (d4c8446b) were not enough (run zall12lw: the
+/// window's fence and glass, the people in the yard gone, strips at the
+/// bottom): what a shader declares is its view, narrowed by its store
+/// extent, and what the list's later draws read of it on the card, not in
+/// title memory, a copy of its own would see whatever the extent left out.
+fn group_good(writes: u64, writes_now: u64, declared: bool) -> bool {
+    writes == writes_now && !declared
+}
+
+/// Whether `[src, src + len)` is to be refreshed for a group (noted so if
+/// it is): not refreshed for it since title copy `now` (`refreshed` and
+/// `epoch`, the group's; a later title copy starts them over).
+fn refresh_due(refreshed: &mut Vec<(usize, usize)>, epoch: &mut u64, now: u64, src: usize, len: usize) -> bool {
+    if *epoch != now {
+        refreshed.clear();
+        *epoch = now;
+    }
+    if inside(refreshed, src, len) {
+        return false;
+    }
+    learn(refreshed, src, len);
+    true
 }
 
 /// A group's first title address: the first at or after `from` that is
@@ -531,13 +573,12 @@ fn group_fill(list: &HostList, from: &std::sync::Arc<crate::shadow::Shadow>, src
         && std::sync::Arc::ptr_eq(&g.shadow, from)
     {
         let (hit, now) = list.declared_writes_overlap(g.checked, g.lo as usize, g.hi as usize);
-        if !hit {
+        if group_good(g.writes, list.write_count(), hit) {
             g.checked = now;
-            if !inside(&g.refreshed, src as usize, len as usize) {
-                if from.refresh(list, src, len) {
-                    FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
-                }
-                learn(&mut g.refreshed, src as usize, len as usize);
+            if refresh_due(&mut g.refreshed, &mut g.epoch, list.title_writes(), src as usize, len as usize)
+                && from.refresh(list, src, len)
+            {
+                FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
             }
             FILL_STATS[FILL_GROUP_USES].fetch_add(1, Ordering::Relaxed);
             return Some(g.gpu + (src - g.lo));
@@ -564,6 +605,8 @@ fn group_fill(list: &HostList, from: &std::sync::Arc<crate::shadow::Shadow>, src
             hi: be,
             checked: BIND_STEPS.get(),
             refreshed: vec![(src as usize, (src + len) as usize)],
+            epoch: list.title_writes(),
+            writes: list.write_count(),
         },
     );
     FILL_STATS[FILL_GROUPS].fetch_add(1, Ordering::Relaxed);
@@ -987,7 +1030,32 @@ fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, group_start, in_blocks, inside, learn, overlaps, plan_fills, verdict};
+    use super::{Verdict, group_good, group_start, in_blocks, inside, learn, overlaps, plan_fills, refresh_due, verdict};
+
+    /// A group is used again only while no shader that may write was
+    /// recorded since it was made and no declared write meets it.
+    #[test]
+    fn a_group_is_dropped_after_any_writing_call_or_a_declared_write() {
+        assert!(group_good(7, 7, false));
+        assert!(!group_good(7, 8, false));
+        assert!(!group_good(7, 7, true));
+    }
+
+    /// A group's range is refreshed once, and again after a title copy done
+    /// at submission (run zall12w: refreshed only before such a copy, the
+    /// group's constants were the bytes from before it).
+    #[test]
+    fn a_groups_ranges_are_refreshed_again_after_a_title_copy() {
+        let (mut refreshed, mut epoch) = (Vec::new(), 3);
+        assert!(refresh_due(&mut refreshed, &mut epoch, 3, 0x1000, 0x100));
+        assert!(!refresh_due(&mut refreshed, &mut epoch, 3, 0x1000, 0x100));
+        assert!(!refresh_due(&mut refreshed, &mut epoch, 3, 0x1040, 0x40));
+        assert!(refresh_due(&mut refreshed, &mut epoch, 3, 0x10f0, 0x20));
+        // A title copy recorded since: everything again.
+        assert!(refresh_due(&mut refreshed, &mut epoch, 4, 0x1040, 0x40));
+        assert!(refresh_due(&mut refreshed, &mut epoch, 4, 0x1000, 0x100));
+        assert!(!refresh_due(&mut refreshed, &mut epoch, 4, 0x1080, 0x10));
+    }
 
     /// A group starts at the first address of its phase in its block, so
     /// every fill of that phase is 256-byte aligned in the stand-in.

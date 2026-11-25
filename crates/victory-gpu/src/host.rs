@@ -744,6 +744,9 @@ pub(crate) struct HostList {
     /// buffers' card copies (`crate::cardcopy::try_fill`): the chunks, the
     /// one in use and the bytes used of it; kept across resets.
     card_scratch: Mutex<(Vec<ID3D12Resource>, usize, u64)>,
+    /// Blocks of title memory the list's bindings read constants from,
+    /// copied once (`crate::cardcopy::FillGroup`), by block and phase.
+    fill_groups: Mutex<std::collections::HashMap<(u64, u16), crate::cardcopy::FillGroup>>,
     /// Whether shaders recorded in the list may have written buffers since
     /// its last wait for every earlier shader write (a barrier on all
     /// unordered access): `crate::indirect` waits for those writes before
@@ -1946,6 +1949,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Title memory the list's shaders and card copies may write
+    /// ([`Step::GpuWrite`]; start, end, in order, joined).
+    gpu_written: Vec<(usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -2079,6 +2085,26 @@ fn late_stage() -> u8 {
 /// if it wrote it afterwards; settled first it was always the shader's.
 /// The title writing a byte a shader of its own is writing is a race on
 /// the console too.
+/// [`stale_under_flights`] looks at the ranges a submission refreshes, not
+/// their span per copy (`VICTORY_STALE_RANGES`; on by default, `=0` off).
+fn stale_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_RANGES").is_none_or(|v| v != "0"))
+}
+
+/// `ranges` in order, those less than `gap` apart (or overlapping) joined.
+fn join_near(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match joined.last_mut() {
+            Some(last) if a < last.1.saturating_add(gap) => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    joined
+}
+
 fn late_exact() -> bool {
     late_stage() > 1
 }
@@ -2808,21 +2834,44 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         }
     }
     let _timed = Timed(std::time::Instant::now());
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // Per copy (in the order first refreshed), whether flights may write it
+    // and the ranges refreshed.
+    let mut copies: Vec<(Arc<crate::shadow::Shadow>, bool, Vec<(usize, usize)>)> = Vec::new();
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+            if let Step::Refresh(shadow, address, len) = step {
+                let at = *index.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                    copies.push((shadow.clone(), shadow.writes_pending(), Vec::new()));
+                    copies.len() - 1
+                });
+                if copies[at].1 {
+                    copies[at].2.push((*address, *address + *len));
                 }
             }
         }
     }
+    // Per copy, the span of what is refreshed (a flush brings that much
+    // up to date at most); with `VICTORY_STALE_RANGES` (on; `=0` the span)
+    // only the ranges refreshed, joined where less than 64 KiB apart: the
+    // submission reads nothing between them, so title bytes left behind
+    // there are not read, and the copy marks them copied only once it
+    // takes them. (Card fills spread over a buffer made spans of many
+    // megabytes, run zall11a: 21 ms a frame in this check.)
+    let spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = copies
+        .into_iter()
+        .filter(|c| c.1 && !c.2.is_empty())
+        .flat_map(|(shadow, _, ranges)| {
+            let joined = if stale_ranges() {
+                join_near(ranges, 64 << 10)
+            } else {
+                let lo = ranges.iter().map(|r| r.0).min().unwrap_or(0);
+                let hi = ranges.iter().map(|r| r.1).max().unwrap_or(0);
+                vec![(lo, hi)]
+            };
+            joined.into_iter().map(move |(a, b)| (shadow.clone(), a, b))
+        })
+        .collect();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -3646,6 +3695,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 card_scratch: Mutex::default(),
+                fill_groups: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -5920,6 +5970,7 @@ impl HostList {
             let mut card = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
             (card.1, card.2) = (0, 0);
         }
+        self.fill_groups.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -6416,9 +6467,31 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        let w = &mut deferred.gpu_written;
+        let at = w.partition_point(|r| r.1 < address);
+        if !w.get(at).is_some_and(|&(a, b)| a <= address && address + len <= b) {
+            w.push((address, address + len));
+            w.sort_unstable();
+            let mut joined: Vec<(usize, usize)> = Vec::with_capacity(w.len());
+            for &(a, b) in w.iter() {
+                match joined.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => joined.push((a, b)),
+                }
+            }
+            *w = joined;
+        }
+    }
+
+    /// Whether the list's shaders or card copies recorded so far may write
+    /// title memory in `[address, address + len)` ([`HostList::defer_gpu_write`]).
+    pub(crate) fn gpu_written(&self, address: usize, len: usize) -> bool {
+        let deferred = self.deferred();
+        let w = &deferred.gpu_written;
+        let at = w.partition_point(|r| r.1 <= address);
+        w.get(at).is_some_and(|&(a, _)| a < address + len)
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -6516,6 +6589,16 @@ impl HostList {
             s.iter().any(|step| matches!(step, Step::GpuWrite(_, a, len) if *a < hi && a + len > lo))
         });
         (hit, steps.len())
+    }
+
+    /// The list's blocks of constants copied once (`crate::cardcopy::FillGroup`).
+    pub(crate) fn fill_groups(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<(u64, u16), crate::cardcopy::FillGroup>> {
+        self.fill_groups.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many steps the list holds so far (for [`HostList::declared_writes_overlap`]).
+    pub(crate) fn steps(&self) -> usize {
+        self.deferred().copies.len()
     }
 
     /// A wait for every earlier shader write was recorded.
@@ -8222,6 +8305,20 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_ranges {
+    /// Refreshed ranges are looked at joined where they overlap or lie
+    /// less than the gap apart, not as one span.
+    #[test]
+    fn near_ranges_join_and_far_ones_stay_apart() {
+        let r = vec![(0x30000, 0x30100), (0x1000, 0x1100), (0x1080, 0x1200), (0x10000, 0x10010)];
+        assert_eq!(super::join_near(r, 0x10000), [(0x1000, 0x10010), (0x30000, 0x30100)]);
+        let r = vec![(0x1000, 0x1100), (0x20000, 0x20100)];
+        assert_eq!(super::join_near(r, 0x100), [(0x1000, 0x1100), (0x20000, 0x20100)]);
+        assert!(super::join_near(Vec::new(), 1).is_empty());
     }
 }
 

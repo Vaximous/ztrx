@@ -359,7 +359,7 @@ static LEARNED_FILLS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// of all time: sources learned, compared, alike, different; since the
 /// last line: copies recorded for the fills, barrier calls recorded for
 /// them.
-static FILL_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static FILL_STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// Since the last frame-rate line, where the fills' cost may land:
 /// [`try_fill`]'s own time (us, recording), its fills from host copies
@@ -368,6 +368,10 @@ static FILL_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 const FILL_US: usize = 8;
 const FILL_UNDER_FLIGHTS: usize = 9;
 const FILL_REFRESHES: usize = 10;
+/// Since the last line: fills shown a list's [`FillGroup`] made before, and
+/// groups made.
+const FILL_GROUP_USES: usize = 11;
+const FILL_GROUPS: usize = 12;
 
 /// Since the last frame-rate line: time (us) and calls of the submission's
 /// check for refreshes of memory flights may write (`host`'s
@@ -409,6 +413,29 @@ fn fill_uav_skip_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_FILL_UAV_SKIP").is_ok_and(|v| v == "1"))
 }
 
+/// `VICTORY_FILL_AFTER_WRITE=1` (off by default): a draw's constants in
+/// title memory that the list's own shaders or card copies may write
+/// earlier in it are copied on the card ([`try_fill`]) whether or not
+/// their source was learned.
+///
+/// The staleness it closes: a fill of upload memory reads title memory when
+/// the list is submitted, before the card runs any of it, and waits only
+/// for flights in the air (earlier submissions). A range the same list
+/// writes on the card (a title buffer copy done by the card, whose
+/// destination is declared written; a shader's view) and then reads as
+/// constants is filled with the bytes from before the write. With whole
+/// buffers learned (`VICTORY_CARD_LEARN_WHOLE`) such a destination buffer
+/// was learned whole the first time a fill of it waited for a flight, so
+/// every later fill of it read the host copy in the list's order. Learned
+/// by range or block, the other places of the buffer (a ring) stay CPU
+/// fills; written and read within one submission they never wait, so they
+/// are never learned (runs zall10lw and zall11blk: the strips at the
+/// bottom of the picture, not in zall9b).
+fn after_write_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FILL_AFTER_WRITE").is_ok_and(|v| v == "1"))
+}
+
 /// A fill waiting in a [`batched`] binding to be recorded.
 struct Fill {
     stand_in: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -427,6 +454,123 @@ struct Fill {
 thread_local! {
     /// The list whose binding is [`batched`] on this thread, and its fills so far.
     static BATCH: std::cell::RefCell<Option<(usize, Vec<Fill>)>> = const { std::cell::RefCell::new(None) };
+    /// The list's steps when that binding began ([`HostList::steps`]).
+    static BIND_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The size of a [`FillGroup`]'s block of title memory
+/// (`VICTORY_FILL_GROUP_KB`, 64 by default and at most; `=0` off: each
+/// fill copies its own bytes, about 11,700 a frame and 4.3 us of CPU each
+/// in run zall11a, nearly all one constant buffer per binding).
+///
+/// The same bytes as a fill of its own: a stand-in copied at a binding
+/// holds the host copy's bytes at that place in the list's order. A later
+/// binding of the same list reads the same bytes there as a copy of its own
+/// would, unless the card wrote the host copy in between: the list's shaders
+/// and its title buffer copies done on the card, which declare every range
+/// they may write ([`crate::shadow::Shadow::gpu_writes`], what the copy-back
+/// takes from them too). A group is used only while no range declared since
+/// its binding began meets its block (the binding's own draw writes after
+/// the copy: its declarations count); copies in place declare nothing and
+/// are not grouped. Flights run before the list; title writes reach the host
+/// copy at submission, before the list, for every fill alike; each fill's
+/// own range is still refreshed.
+fn group_bytes() -> u64 {
+    static KB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KB.get_or_init(|| {
+        std::env::var("VICTORY_FILL_GROUP_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(64).min(64) << 10
+    })
+}
+
+/// A block of title memory a list's bindings read constants from, copied
+/// once into a stand-in so that addresses `phase` past a multiple of 256
+/// are 256-byte aligned there ([`group_bytes`]).
+pub(crate) struct FillGroup {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// The stand-in's address of `lo`.
+    gpu: u64,
+    /// The title memory copied.
+    lo: u64,
+    hi: u64,
+    /// The list's steps up to which no declared write meets `[lo, hi)`.
+    checked: usize,
+    /// Ranges of it refreshed for the list (joined).
+    refreshed: Vec<(usize, usize)>,
+}
+
+/// A group's first title address: the first at or after `from` that is
+/// `phase` past a multiple of 256.
+fn group_start(from: u64, phase: u64) -> u64 {
+    from + (phase + 256 - from % 256) % 256
+}
+
+/// The constants at `[src, src + len)` of `from`, in a [`FillGroup`] of the
+/// list's: its stand-in's address of `src`, the group made (its copy in the
+/// binding's batch) if there is none still good. None: filled on its own.
+fn group_fill(list: &HostList, from: &std::sync::Arc<crate::shadow::Shadow>, src: u64, len: u64) -> Option<u64> {
+    let block = group_bytes();
+    if block == 0 || from.in_place() || fills_check_on() {
+        return None;
+    }
+    let me = std::ptr::from_ref(list) as usize;
+    if !BATCH.with_borrow(|b| b.as_ref().is_some_and(|b| b.0 == me)) {
+        return None;
+    }
+    let (phase, bs) = (src % 256, src / block * block);
+    let start = from.title_start();
+    let be = (bs + block).min(start + from.left(start));
+    if src + len > be {
+        return None;
+    }
+    let mut groups = list.fill_groups();
+    let key = (bs, phase as u16);
+    if let Some(g) = groups.get_mut(&key)
+        && std::sync::Arc::ptr_eq(&g.shadow, from)
+    {
+        let (hit, now) = list.declared_writes_overlap(g.checked, g.lo as usize, g.hi as usize);
+        if !hit {
+            g.checked = now;
+            if !inside(&g.refreshed, src as usize, len as usize) {
+                if from.refresh(list, src, len) {
+                    FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
+                }
+                learn(&mut g.refreshed, src as usize, len as usize);
+            }
+            FILL_STATS[FILL_GROUP_USES].fetch_add(1, Ordering::Relaxed);
+            return Some(g.gpu + (src - g.lo));
+        }
+    }
+    let lo = group_start(bs.max(start), phase);
+    let (stand_in, at, first) = list.card_scratch(be - lo)?;
+    if from.refresh(list, src, len) {
+        FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
+    }
+    if from.writes_pending() {
+        FILL_STATS[FILL_UNDER_FLIGHTS].fetch_add(1, Ordering::Relaxed);
+    }
+    // SAFETY: a live buffer.
+    let gpu = unsafe { stand_in.GetGPUVirtualAddress() } + at;
+    let fill = Fill { stand_in, at, from: from.buffer.clone(), from_at: from.offset(lo), len: be - lo, first, src: lo, check: false };
+    BATCH.with_borrow_mut(|b| b.as_mut().map(|b| b.1.push(fill)))?;
+    groups.insert(
+        key,
+        FillGroup {
+            shadow: from.clone(),
+            gpu,
+            lo,
+            hi: be,
+            checked: BIND_STEPS.get(),
+            refreshed: vec![(src as usize, (src + len) as usize)],
+        },
+    );
+    FILL_STATS[FILL_GROUPS].fetch_add(1, Ordering::Relaxed);
+    Some(gpu + (src - lo))
+}
+
+/// Whether `[src, src + len)` lies inside one of `ranges` (in order, joined).
+fn inside(ranges: &[(usize, usize)], src: usize, len: usize) -> bool {
+    let at = ranges.partition_point(|r| r.1 <= src);
+    ranges.get(at).is_some_and(|&(a, b)| a <= src && src + len <= b)
 }
 
 /// Runs `bind`, the binding of a draw or dispatch into `list`, with its
@@ -444,6 +588,7 @@ pub(crate) fn batched<T>(list: &HostList, bind: impl FnOnce() -> T) -> T {
         return bind();
     }
     BATCH.with_borrow_mut(|b| *b = Some((std::ptr::from_ref(list) as usize, Vec::new())));
+    BIND_STEPS.set(list.steps());
     let _flush = Flush(list);
     bind()
 }
@@ -594,13 +739,21 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
 /// [`try_fill`].
 fn fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     use windows::Win32::Graphics::Direct3D12::*;
-    if !fills_on() || len == 0 || !overlaps(&LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src as usize, len as usize)
+    if !fills_on()
+        || len == 0
+        || !overlaps(&LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src as usize, len as usize)
+            && !(after_write_on() && list.gpu_written(src as usize, len as usize))
     {
         return None;
     }
     let from = crate::shadow::find(src, len)?;
     if from.left(src) < len {
         return None;
+    }
+    if let Some(gpu) = group_fill(list, &from, src, len) {
+        FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        FILL_STATS[1].fetch_add(len, Ordering::Relaxed);
+        return Some(gpu);
     }
     let me = std::ptr::from_ref(list) as usize;
     // In a batch: the same bytes filled already are shown there.
@@ -764,13 +917,14 @@ pub(crate) fn line(frames: f64) {
         let bytes = FILL_STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let copies = FILL_STATS[6].swap(0, Ordering::Relaxed) as f64 / frames;
         let barriers = FILL_STATS[7].swap(0, Ordering::Relaxed) as f64 / frames;
-        let [us, under, refreshes] =
-            [FILL_US, FILL_UNDER_FLIGHTS, FILL_REFRESHES].map(|i| FILL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let [us, under, refreshes, uses, groups] = [FILL_US, FILL_UNDER_FLIGHTS, FILL_REFRESHES, FILL_GROUP_USES, FILL_GROUPS]
+            .map(|i| FILL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let [stale_us, stale_calls] = [0, 1].map(|i| STALE_CHECK[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "card fills' cost per frame: {:.2} ms recording them; {under:.0} from host copies flights may write; \
              {refreshes:.0} refreshes they added; submissions' check of refreshes under flights {:.2} ms in \
-             {stale_calls:.1} calls",
+             {stale_calls:.1} calls; {groups:.0} blocks copied for the lists, {uses:.0} fills shown one copied \
+             before (VICTORY_FILL_GROUP_KB)",
             us / 1e3,
             stale_us / 1e3,
         );
@@ -830,7 +984,24 @@ fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, in_blocks, learn, overlaps, plan_fills, verdict};
+    use super::{Verdict, group_start, in_blocks, inside, learn, overlaps, plan_fills, verdict};
+
+    /// A group starts at the first address of its phase in its block, so
+    /// every fill of that phase is 256-byte aligned in the stand-in.
+    #[test]
+    fn a_groups_fills_of_one_phase_are_aligned_in_its_stand_in() {
+        assert_eq!(group_start(0x1_0000, 0x40), 0x1_0040);
+        assert_eq!(group_start(0x1_0080, 0x40), 0x1_0140);
+        assert_eq!(group_start(0x1_0040, 0x40), 0x1_0040);
+        assert_eq!(group_start(0x1_0000, 0), 0x1_0000);
+        for src in [0x1_0140u64, 0x1_8f40, 0x1_ff40] {
+            let lo = group_start(0x1_0000, src % 256);
+            assert!(lo <= src && (src - lo).is_multiple_of(256));
+        }
+        let r = [(0x100, 0x200), (0x400, 0x500)];
+        assert!(inside(&r, 0x100, 0x100) && inside(&r, 0x480, 0x10));
+        assert!(!inside(&r, 0x1f0, 0x20) && !inside(&r, 0x300, 0x10) && !inside(&r, 0x500, 1));
+    }
 
     /// A learned range in blocks: aligned in title memory, cut to its
     /// buffer; without a block size the whole buffer.

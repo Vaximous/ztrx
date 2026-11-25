@@ -1930,7 +1930,15 @@ impl State {
             Some(c) if bound => {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                (self.pipeline, p.pso.as_raw() as usize, &self.compute, [x, y, z]).hash(&mut h);
+                (self.pipeline, p.pso.as_raw() as usize, [x, y, z]).hash(&mut h);
+                // Root constants; tables and views by what they hold (the
+                // views' addresses are in the gathered key), not where.
+                for root in &self.compute {
+                    match root {
+                        Root::Constants(v) => v.hash(&mut h),
+                        other => std::mem::discriminant(other).hash(&mut h),
+                    }
+                }
                 crate::skip::before(list, c, h.finish(), [x, y, z], shader)
             }
             _ => None,
@@ -1953,7 +1961,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         const DISPATCH: u32 = 2;
-        let indirect = plan.as_ref().and_then(|plan| Some((plan.arguments(), host_signature(DISPATCH, 12)?)));
+        let direct = crate::skip::trying(1) && crate::skip::mode() == crate::skip::Mode::Check;
+        let indirect = plan
+            .as_ref()
+            .filter(|_| !direct)
+            .and_then(|plan| Some((plan.arguments(), host_signature(DISPATCH, 12)?)));
         // SAFETY: an open list with everything set; the arguments' buffer is
         // kept by the list.
         unsafe {

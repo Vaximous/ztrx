@@ -11,6 +11,9 @@
 //! found and write what it wrote: the card gives it no groups
 //! (`ExecuteIndirect` with the arguments it picks).
 //!
+//! `VICTORY_DISPATCH_SKIP_ONLY` (shader hash beginnings, by commas) follows
+//! only those shaders.
+//!
 //! `VICTORY_DISPATCH_SKIP=1` leaves them out; `=check` runs every one and
 //! counts, and reports, the runs that were to be left out and changed
 //! something all the same (an input the hashes do not see).
@@ -46,6 +49,14 @@ pub(crate) fn mode() -> Mode {
         Ok("check") => Mode::Check,
         _ => Mode::Off,
     })
+}
+
+/// `VICTORY_DISPATCH_SKIP_TRY` (bits, for finding what breaks): 1 runs a
+/// followed dispatch directly in the check mode, 2 leaves out the barrier
+/// before the hashes.
+pub(crate) fn trying(bit: u32) -> bool {
+    static TRY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TRY.get_or_init(|| std::env::var("VICTORY_DISPATCH_SKIP_TRY").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) & bit != 0
 }
 
 fn limit() -> u64 {
@@ -85,8 +96,8 @@ struct Span {
 #[derive(Default)]
 pub(crate) struct Collect {
     spans: Vec<Span>,
-    /// The views by address (constant buffers by the title's: their
-    /// copies are the list's) and length.
+    /// The views by address and length (constant buffers by length: their
+    /// bytes are hashed).
     key: Vec<u64>,
     bad: Option<&'static str>,
 }
@@ -122,9 +133,15 @@ pub(crate) fn note_buffer(shadow: &crate::shadow::Shadow, address: u64, len: u64
         return;
     }
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    let srv = !uav || flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0;
+    let (desc, start) = unsafe { (shadow.buffer.GetDesc(), shadow.buffer.GetGPUVirtualAddress()) };
+    let srv = !uav || desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0;
     let gpu = shadow.gpu(address);
+    // Root views have no bounds: no further than the host buffer goes.
+    let Some(left) = gpu.checked_sub(start).and_then(|at| desc.Width.checked_sub(at)) else {
+        note_bad("a view outside its host copy");
+        return;
+    };
+    let len = len.min(left);
     with(|c| {
         c.key.extend([gpu, len | u64::from(srv) << 62]);
         if len > 0 {
@@ -147,8 +164,11 @@ pub(crate) fn note_constant(list: &crate::host::HostList, address: u64, size: u6
         return;
     };
     list.defer_fill(to, address as *const u8, size as usize);
+    // By its bytes alone: the title's constants move from frame to frame
+    // (a ring), the bytes much less.
+    let _ = address;
     with(|c| {
-        c.key.extend([address, size | 1 << 63]);
+        c.key.push(size | 1 << 63);
         c.spans.push(Span { gpu, len: size, srv: true });
     });
 }
@@ -275,11 +295,20 @@ fn hasher() -> Option<&'static Hasher> {
 }
 
 /// A view's bytes as a pass reads them: the address bound (on 16 bytes),
-/// where they begin past it and how many (whole dwords).
+/// where they begin past it (on 4 bytes: raw loads are of dwords) and how
+/// many (whole dwords).
+/// shortcut: bytes of a dword the view only begins or ends inside are not
+/// all hashed.
 fn bound(span: &Span) -> (u64, u32, u32) {
-    let base = span.gpu & 15;
-    let at = span.gpu - base;
-    (at, base as u32, ((span.len + base) & !3) as u32)
+    let at = span.gpu & !15;
+    let base = (span.gpu & 15) & !3;
+    (at, base as u32, ((span.len + (span.gpu & 3)) & !3) as u32)
+}
+
+/// Whether a pass can hash the span: some bytes, all in reach of 32-bit
+/// offsets.
+fn hashable(span: &Span) -> bool {
+    span.len > 0 && span.len < 1 << 31 && bound(span).2 > 0
 }
 
 fn pieces(span: &Span) -> u32 {
@@ -299,6 +328,19 @@ fn layout(spans: &[Span]) -> (Vec<u32>, u32) {
 
 fn state_size(total: u32) -> u64 {
     HEADER + u64::from(total) * 32
+}
+
+/// A small upload buffer, never freed, for a view a pass does not read.
+fn unread() -> u64 {
+    static UNREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *UNREAD.get_or_init(|| {
+        crate::host::host().and_then(|h| h.upload_buffer(256)).map_or(0, |(buffer, _)| {
+            // SAFETY: a live buffer, kept for the process.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            std::mem::forget(buffer);
+            gpu
+        })
+    })
 }
 
 /// Records one pass over `state` (in the unordered access state).
@@ -342,7 +384,9 @@ unsafe fn pass(
         l.SetComputeRootSignature(&h.root);
         l.SetPipelineState(&h.pso);
         l.SetComputeRoot32BitConstants(0, 12, constants.as_ptr().cast(), 0);
-        l.SetComputeRootShaderResourceView(1, if srv { at } else { own });
+        // Unread, the shader resource view shows a buffer always readable
+        // (the state is in the unordered access state).
+        l.SetComputeRootShaderResourceView(1, if srv { at } else { unread() });
         l.SetComputeRootUnorderedAccessView(2, if srv { own } else { at });
         l.SetComputeRootUnorderedAccessView(3, own);
         l.Dispatch(n.div_ceil(64), 1, 1);
@@ -366,10 +410,14 @@ unsafe fn record_before(
     let (first, total) = layout(spans);
     // SAFETY: as the caller says.
     unsafe {
-        l.ResourceBarrier(&[
-            crate::extent::uav_barrier(),
-            crate::host::transition(state, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        if !trying(2) {
+            l.ResourceBarrier(&[crate::extent::uav_barrier()]);
+        }
+        l.ResourceBarrier(&[crate::host::transition(
+            state,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
         for (s, &f) in spans.iter().zip(&first) {
             pass(l, h, state, 0, Some((s, f)), (total, skipping, groups));
         }
@@ -474,6 +522,16 @@ pub(crate) fn wanted(hash: &str) -> bool {
     if mode() == Mode::Off {
         return false;
     }
+    // `VICTORY_DISPATCH_SKIP_ONLY`: shader hash beginnings, by commas.
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_DISPATCH_SKIP_ONLY")
+            .map(|v| v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect())
+            .unwrap_or_default()
+    });
+    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return false;
+    }
     let r = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     !r.as_ref().and_then(|r| r.pipelines.get(hash)).is_some_and(|p| p.1)
 }
@@ -524,6 +582,12 @@ pub(crate) fn before(list: &crate::host::HostList, c: Collect, key: u64, groups:
     let h = hasher()?;
     let host = crate::host::host()?;
     let Collect { spans, key: views, .. } = c;
+    // Nothing a pass would loop on: every span has whole dwords.
+    if !spans.iter().all(hashable) {
+        tell(r, "a view of less than a dword");
+        SEEN[1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut k = Vec::with_capacity(1 + views.len());
     k.push(key);
     k.extend(views);
@@ -693,6 +757,14 @@ mod tests {
     #[test]
     fn views_are_hashed_in_whole_dwords_from_16_bytes() {
         let s = Span { gpu: 0x1_0008, len: 4096 * 2 + 2, srv: false };
+        assert_eq!(bound(&s), (0x1_0000, 8, 4096 * 2));
+        // Not on 4 bytes: from the dword it begins in.
+        let u = Span { gpu: 0x1_0006, len: 7, srv: false };
+        assert_eq!(bound(&u), (0x1_0000, 4, 8));
+        assert!(!hashable(&Span { gpu: 0x1_0000, len: 3, srv: false }));
+        assert!(!hashable(&Span { gpu: 0x1_0000, len: 0, srv: false }));
+        assert!(hashable(&Span { gpu: 0x1_0001, len: 3, srv: false }));
+        let s = Span { gpu: 0x1_0008, len: 4096 * 2 + 8, srv: false };
         assert_eq!(bound(&s), (0x1_0000, 8, 4096 * 2 + 8));
         assert_eq!(pieces(&s), 3);
         let t = Span { gpu: 0x2_0000, len: 16, srv: true };
@@ -706,6 +778,23 @@ mod tests {
     /// something is counted wrong.
     #[test]
     fn the_card_leaves_out_a_run_after_one_that_changed_nothing() {
+        run_steps(4096 * 2 + 64, |gpu, len| vec![Span { gpu, len, srv: false }]);
+    }
+
+    /// As above, over views of a few bytes, not on 16 bytes or 4, and one
+    /// reaching a piece past a 4 KiB one.
+    #[test]
+    fn small_and_unaligned_views_are_hashed_and_left_out() {
+        run_steps(4096 * 2 + 64, |gpu, _| {
+            vec![
+                Span { gpu: gpu + 4, len: 4, srv: false },
+                Span { gpu: gpu + 0x26, len: 13, srv: false },
+                Span { gpu: gpu + 0x40, len: 4097, srv: false },
+            ]
+        });
+    }
+
+    fn run_steps(len: u64, spans: impl Fn(u64, u64) -> Vec<Span>) {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -713,9 +802,11 @@ mod tests {
             panic!("no hasher");
         };
         let device = &host.device;
-        let len = 4096 * 2 + 64;
         let data = host.uav_buffer(len).unwrap();
-        let state = host.uav_buffer(state_size(3)).unwrap();
+        // SAFETY: a live buffer.
+        let spans = spans(unsafe { data.GetGPUVirtualAddress() }, len);
+        assert!(spans.iter().all(hashable));
+        let state = host.uav_buffer(state_size(layout(&spans).1)).unwrap();
         let (upload, at) = host.upload_buffer(len).unwrap();
         let back = host.read_back_buffer(HEADER).unwrap();
         // SAFETY: plain objects; each list waited for before the next.
@@ -729,7 +820,6 @@ mod tests {
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             let mut value = 0;
-            let span = Span { gpu: data.GetGPUVirtualAddress(), len, srv: false };
             // One list: bytes changed first (`before`), a run that changes
             // them (`during`), as the skip mode or the check; the header.
             let mut run = |before: Option<u8>, during: Option<u8>, skipping: bool| -> [u32; 16] {
@@ -758,7 +848,7 @@ mod tests {
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
-                record_before(&l, h, &state, &[span], skipping, [5, 1, 1]);
+                record_before(&l, h, &state, &spans, skipping, [5, 1, 1]);
                 l.ResourceBarrier(&[crate::host::transition(
                     &data,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -772,7 +862,7 @@ mod tests {
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
-                record_after(&l, h, &state, &[span], skipping, Some(&back));
+                record_after(&l, h, &state, &spans, skipping, Some(&back));
                 l.ResourceBarrier(&[crate::host::transition(
                     &data,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

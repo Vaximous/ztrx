@@ -132,6 +132,7 @@ fn collecting() -> bool {
 
 /// A buffer view the dispatch reads, or writes (`uav`), in a host copy.
 pub(crate) fn note_buffer(shadow: &crate::shadow::Shadow, address: u64, len: u64, uav: bool) {
+    crate::hot::note_buffer(shadow, address, len, uav);
     if !collecting() {
         return;
     }

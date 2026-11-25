@@ -91,14 +91,23 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Shaders whose wave-wide form is exact where the forms tried before it are not, though it
+/// meets in a loop (which keeps it for last otherwise):
+/// shortcut: by hash, until their exact forms come without it.
+/// - `CS_GenerateShadowMasks_HairOnly`: its local-waves form takes each host wave's own
+///   lanes for the console wave's light-tile reductions, which leaves 32-lane blocks of hair
+///   in shadow or out of it.
+const WIDE_FIRST: &str = "0a5ecfee6b79e13b";
+
 /// `VICTORY_WAVE_WIDE_FIRST=<hash>,...`: these shaders (16-digit hashes, as the log names
 /// them) get the wave-wide form of a wave64 program first, as `VICTORY_WAVE_WIDE=1` gives
-/// every shader: to find which of them a difference between the two comes from.
+/// every shader: to find which of them a difference between the two comes from. Unset,
+/// [`WIDE_FIRST`]; empty, none.
 fn wide_first(container: &[u8]) -> bool {
     static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         std::env::var("VICTORY_WAVE_WIDE_FIRST")
-            .unwrap_or_default()
+            .unwrap_or_else(|_| WIDE_FIRST.to_owned())
             .split(',')
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty())

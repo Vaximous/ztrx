@@ -7279,6 +7279,9 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    /// Frames since the bind line was last logged (every 5 s, where `frames` counts the
+    /// last second's).
+    bind_frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -7299,6 +7302,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
+            bind_frames: 0,
             logged: now,
             caption: None,
             hud: None,
@@ -7312,6 +7316,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.bind_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -7524,8 +7529,10 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            // (over the frames since this line was last logged, not the last second's)
             let b = crate::draw::take_bind_stats();
-            let per_frame = |i: usize| b[i] as f64 / frames;
+            let bind_frames = f64::from(std::mem::take(&mut self.bind_frames).max(1));
+            let per_frame = |i: usize| b[i] as f64 / bind_frames;
             tracing::info!(
                 "binds per frame: {:.0} ({:.1} us each, {:.1} ms); root arguments {:.0} set, {:.0} \
                  left as the list held them; tables reused {:.0}, {:.0} of their descriptors not read again",

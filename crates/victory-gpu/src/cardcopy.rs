@@ -333,8 +333,186 @@ fn fills_check_on() -> bool {
 static LEARNED_FILLS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills done by the card, their bytes;
-/// of all time: sources learned, compared, alike, different.
-static FILL_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// of all time: sources learned, compared, alike, different; since the
+/// last line: copies recorded for the fills, barrier calls recorded for
+/// them.
+static FILL_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Whether a draw's or dispatch's fills on the card ([`try_fill`]) are
+/// recorded together when its binding is done ([`batched`]): one wait for
+/// earlier shader writes, one transition into a copy destination per
+/// stand-in buffer, the copies (fills that follow on in both buffers made
+/// one), one transition back per buffer (`VICTORY_FILL_BATCH`; on by
+/// default, `=0` off: each fill its own wait, transitions and copy, about
+/// 10,600 a frame in run zall10).
+///
+/// The same work in the list: a binding records no other GPU work between
+/// its fills (root arguments, and descriptors written by the CPU), so the
+/// copies may move to its end: each reads a host copy no command between
+/// writes, and writes a fresh range of a stand-in that only the draw after
+/// the binding reads. A barrier for all unordered access orders the same
+/// earlier work before every copy as one before each did. A stand-in
+/// buffer starts the batch in the common state (its first use in the
+/// recording) or a constant buffer, ends it a constant buffer, as before;
+/// a fill of the same bytes as an earlier one in the batch is shown the
+/// earlier one's stand-in, which holds the same bytes.
+pub(crate) fn fill_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_FILL_UAV_SKIP=1` (off by default): a batch of fills records no
+/// barrier for earlier writes when no shader that may write buffers was
+/// recorded since the list's last such barrier ([`HostList::writes_unwaited`]).
+/// Not known equivalent: copies of ours that write host copies on the card
+/// (title texture copies, whose memory a buffer's host copy may share) are
+/// not counted as writes there.
+fn fill_uav_skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FILL_UAV_SKIP").is_ok_and(|v| v == "1"))
+}
+
+/// A fill waiting in a [`batched`] binding to be recorded.
+struct Fill {
+    stand_in: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    at: u64,
+    from: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from_at: u64,
+    len: u64,
+    /// The stand-in's first use in the recording ([`HostList::card_scratch`]).
+    first: bool,
+    /// Title memory the fill reads.
+    src: u64,
+    /// Compared with the CPU's fill ([`fills_check_on`]).
+    check: bool,
+}
+
+thread_local! {
+    /// The list whose binding is [`batched`] on this thread, and its fills so far.
+    static BATCH: std::cell::RefCell<Option<(usize, Vec<Fill>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `bind`, the binding of a draw or dispatch into `list`, with its
+/// fills on the card recorded together at its end ([`fill_batch_on`]).
+pub(crate) fn batched<T>(list: &HostList, bind: impl FnOnce() -> T) -> T {
+    struct Flush<'a>(&'a HostList);
+    impl Drop for Flush<'_> {
+        fn drop(&mut self) {
+            if let Some((_, fills)) = BATCH.with_borrow_mut(Option::take) {
+                record_fills(self.0, &fills);
+            }
+        }
+    }
+    if !fills_on() || !fill_batch_on() || BATCH.with_borrow(Option::is_some) {
+        return bind();
+    }
+    BATCH.with_borrow_mut(|b| *b = Some((std::ptr::from_ref(list) as usize, Vec::new())));
+    let _flush = Flush(list);
+    bind()
+}
+
+/// How a batch of fills is recorded: the stand-ins (by index of their
+/// first fill) to take from constant reads to a copy destination first,
+/// the copies (index of the fill, bytes from there), and the stand-ins to
+/// take back to constant reads after. `fills`: stand-in, offset in it,
+/// source buffer, offset in it, bytes, first use of the stand-in.
+fn plan_fills(fills: &[(usize, u64, usize, u64, u64, bool)]) -> (Vec<usize>, Vec<(usize, u64)>, Vec<usize>) {
+    let mut buffers: Vec<usize> = Vec::new();
+    let mut before = Vec::new();
+    for (i, f) in fills.iter().enumerate() {
+        if fills[..i].iter().any(|g| g.0 == f.0) {
+            continue;
+        }
+        buffers.push(i);
+        // A stand-in first used in the batch starts it in the common state.
+        if !fills.iter().any(|g| g.0 == f.0 && g.5) {
+            before.push(i);
+        }
+    }
+    let mut copies: Vec<(usize, u64)> = Vec::new();
+    for (i, f) in fills.iter().enumerate() {
+        if let Some((j, len)) = copies.last_mut() {
+            let g = &fills[*j];
+            if g.0 == f.0 && g.2 == f.2 && g.1 + *len == f.1 && g.3 + *len == f.3 {
+                *len += f.4;
+                continue;
+            }
+        }
+        copies.push((i, f.4));
+    }
+    (before, copies, buffers)
+}
+
+fn transition(
+    resource: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    before: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+    after: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+    use windows::Win32::Graphics::Direct3D12::*;
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                // SAFETY: a borrowed pointer the barrier never releases.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    }
+}
+
+/// Records `fills` into `list` ([`fill_batch_on`]).
+fn record_fills(list: &HostList, fills: &[Fill]) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if fills.is_empty() {
+        return;
+    }
+    let key: Vec<_> = fills
+        .iter()
+        .map(|f| (windows::core::Interface::as_raw(&f.stand_in) as usize, f.at, windows::core::Interface::as_raw(&f.from) as usize, f.from_at, f.len, f.first))
+        .collect();
+    let (before, copies, after) = plan_fills(&key);
+    let mut barriers = Vec::with_capacity(before.len() + 1);
+    let wait = !fill_uav_skip_on() || list.writes_unwaited();
+    if wait {
+        barriers.push(uav_barrier());
+    }
+    barriers.extend(before.iter().map(|&i| {
+        transition(&fills[i].stand_in, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_DEST)
+    }));
+    let back: Vec<_> = after
+        .iter()
+        .map(|&i| {
+            transition(&fills[i].stand_in, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+        })
+        .collect();
+    let l = &list.list;
+    // SAFETY: an open list; live buffers (the list keeps the stand-ins,
+    // its steps the host copies, until it is reset), the ranges inside
+    // them (a merged copy covers two fills' ranges that meet in both).
+    unsafe {
+        if !barriers.is_empty() {
+            l.ResourceBarrier(&barriers);
+        }
+        for &(i, len) in &copies {
+            let f = &fills[i];
+            l.CopyBufferRegion(&f.stand_in, f.at, &f.from, f.from_at, len);
+        }
+        l.ResourceBarrier(&back);
+    }
+    if wait {
+        // A barrier for all unordered access: every earlier shader write waited for.
+        list.waited();
+    }
+    FILL_STATS[6].fetch_add(copies.len() as u64, Ordering::Relaxed);
+    FILL_STATS[7].fetch_add(1 + u64::from(!barriers.is_empty()), Ordering::Relaxed);
+    for f in fills.iter().filter(|f| f.check) {
+        compare_fill(list, &f.stand_in, f.at, f.src, f.len);
+    }
+}
 
 /// A fill of upload memory from `[src, src + len)` made a submission wait.
 pub(crate) fn fill_blocked(src: usize, len: usize) {
@@ -377,10 +555,38 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     if from.left(src) < len {
         return None;
     }
+    let me = std::ptr::from_ref(list) as usize;
+    // In a batch: the same bytes filled already are shown there.
+    let same = BATCH.with_borrow(|b| {
+        let (_, fills) = b.as_ref().filter(|b| b.0 == me)?;
+        let f = fills.iter().find(|f| f.src == src && f.len == len && f.from == from.buffer)?;
+        // SAFETY: a live buffer.
+        Some(unsafe { f.stand_in.GetGPUVirtualAddress() } + f.at)
+    });
+    if let Some(gpu) = same {
+        FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        FILL_STATS[1].fetch_add(len, Ordering::Relaxed);
+        return Some(gpu);
+    }
     let (stand_in, at, first) = list.card_scratch(len)?;
     // The title's bytes sent up before the submission (where flights write
     // the memory, the refresh leaves their bytes alone).
     from.refresh(list, src, len);
+    let check = fills_check_on() && FILL_STATS[3].load(Ordering::Relaxed) < CHECKS_MOST;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { stand_in.GetGPUVirtualAddress() } + at;
+    let fill = Fill { stand_in, at, from: from.buffer.clone(), from_at: from.offset(src), len, first, src, check };
+    let Some(Fill { stand_in, at, first, .. }) = BATCH.with_borrow_mut(|b| match b {
+        Some((of, fills)) if *of == me => {
+            fills.push(fill);
+            None
+        }
+        _ => Some(fill),
+    }) else {
+        FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        FILL_STATS[1].fetch_add(len, Ordering::Relaxed);
+        return Some(gpu);
+    };
     let l = &list.list;
     let transition = |before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -414,11 +620,12 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     }
     FILL_STATS[0].fetch_add(1, Ordering::Relaxed);
     FILL_STATS[1].fetch_add(len, Ordering::Relaxed);
-    if fills_check_on() && FILL_STATS[3].load(Ordering::Relaxed) < CHECKS_MOST {
+    FILL_STATS[6].fetch_add(1, Ordering::Relaxed);
+    FILL_STATS[7].fetch_add(2, Ordering::Relaxed);
+    if check {
         compare_fill(list, &stand_in, at, src, len);
     }
-    // SAFETY: a live buffer.
-    Some(unsafe { stand_in.GetGPUVirtualAddress() } + at)
+    Some(gpu)
 }
 
 /// [`fills_check_on`]: the stand-in read back after the draws that read it,
@@ -503,8 +710,12 @@ pub(crate) fn line(frames: f64) {
     if fills_on() {
         let made = FILL_STATS[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let bytes = FILL_STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let copies = FILL_STATS[6].swap(0, Ordering::Relaxed) as f64 / frames;
+        let barriers = FILL_STATS[7].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "constants copied on the card instead of filled per frame (VICTORY_CARD_FILLS=1): {made:.1}, {:.1} KB;              sources learned {}; compared {} (alike {}, different {})",
+            "constants copied on the card instead of filled per frame (VICTORY_CARD_FILLS=1): {made:.1}, {:.1} KB, in \
+             {copies:.1} copies and {barriers:.1} barrier calls (VICTORY_FILL_BATCH); sources learned {}; compared {} \
+             (alike {}, different {})",
             bytes / 1024.0,
             FILL_STATS[2].load(Ordering::Relaxed),
             FILL_STATS[3].load(Ordering::Relaxed),
@@ -557,7 +768,30 @@ fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, learn, overlaps, verdict};
+    use super::{Verdict, learn, overlaps, plan_fills, verdict};
+
+    /// A batch of fills: each stand-in buffer taken to a copy destination
+    /// once (not at all where the batch has its first use: the common
+    /// state) and back once; fills that follow on in both buffers one copy.
+    #[test]
+    fn a_batch_of_fills_transitions_each_stand_in_once_and_joins_fills_that_follow_on() {
+        // (stand-in, at, source, at, bytes, first use)
+        let fills = [
+            (1, 0x100, 7, 0x1000, 0x100, false),
+            (1, 0x200, 7, 0x1100, 0x100, false),
+            (1, 0x300, 7, 0x1300, 0x40, false),
+            (2, 0x0, 7, 0x1340, 0x40, true),
+            (2, 0x100, 8, 0x0, 0x100, false),
+        ];
+        let (before, copies, after) = plan_fills(&fills);
+        assert_eq!(before, [0]);
+        assert_eq!(copies, [(0, 0x200), (2, 0x40), (3, 0x40), (4, 0x100)]);
+        assert_eq!(after, [0, 3]);
+        // One stand-in used before, another first used in the batch (common state).
+        let (before, _, after) = plan_fills(&[(3, 0x100, 7, 0, 0x100, false), (4, 0, 7, 0x100, 0x100, true)]);
+        assert_eq!((before, after), (vec![0], vec![0, 1]));
+        assert_eq!(plan_fills(&[]), (vec![], vec![], vec![]));
+    }
 
     /// A copy whose place a later landed copy wrote is not counted
     /// different; one wrong on the card already is told apart.

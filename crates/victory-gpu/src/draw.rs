@@ -1245,7 +1245,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let start = std::time::Instant::now();
-        let bound = self.bind_all(list, p, compute);
+        // (its fills on the card recorded together at its end)
+        let bound = crate::cardcopy::batched(list, || self.bind_all(list, p, compute));
         BIND_STATS[0].fetch_add(1, Ordering::Relaxed);
         BIND_STATS[1].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         bound

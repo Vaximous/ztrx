@@ -289,6 +289,9 @@ struct Lower<'a> {
     answered: Option<(usize, V, V)>,
     /// Stores left to the console's highest lane ([`Self::last_lane_store`]), by offset.
     store_gates: Vec<usize>,
+    /// IR blocks of the loops each host wave runs on its own lanes ([`super::half_local`]):
+    /// their wave-wide branches and first-lane reads are the host wave's own.
+    half_local: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1521,6 +1524,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let half_local = match &exchange {
+            Some((_, false, _)) if !LOCAL_WAVES.get() && !x.st.wide.is_empty() && super::half_local::on() => {
+                let (set, heads) = super::half_local::find(p, x.st);
+                // (a loop whose blocks meet for their LDS accesses is not taken)
+                let meets = lds_meet.as_ref().is_some_and(|(_, m)| set.iter().any(|&b| m.get(b).is_some_and(|f| f.0 || f.1)));
+                if std::env::var_os("VICTORY_WAVE_WHY").is_some() && !heads.is_empty() {
+                    let at: Vec<String> = heads.iter().map(|&h| format!("{:#x}", p.blocks[h].offset)).collect();
+                    eprintln!("WAVE64-HALF-LOCAL loops at {}{}", at.join(" "), if meets { ": not taken (LDS meetings)" } else { "" });
+                }
+                if meets { HashSet::new() } else { set }
+            }
+            _ => HashSet::new(),
+        };
         Lower {
             s,
             x,
@@ -1614,6 +1630,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            half_local,
             ring_next: 0,
             ring_barriers: Vec::new(),
             ring_stores: Vec::new(),
@@ -4037,7 +4054,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if !self.exchange.as_ref().is_some_and(|e| !e.1) || made.is_some_and(|b| self.half_local.contains(&b)) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
@@ -4056,7 +4073,8 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
+        let own = self.half_local.contains(&b);
+        if own || self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
@@ -7740,7 +7758,9 @@ impl<'a> Lower<'a> {
                     }
                     _ => true,
                 };
-                let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
+                let halves = self.exchange.as_ref().is_some_and(|e| !e.1)
+                    && !self.local
+                    && !self.half_local.contains(&self.cur_ir);
                 let r = if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
                         need(self.cur_ir);

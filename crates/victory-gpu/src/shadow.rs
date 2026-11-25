@@ -463,6 +463,17 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// The copy in the card's memory that holds title memory `[address,
+/// address + len)`, if one does; none is made (`crate::host`'s
+/// `VICTORY_WRITTEN_PROBE`).
+pub(crate) fn carded_at(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .find(|s| s.start <= address && address.saturating_add(len) <= s.start + s.len)
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();

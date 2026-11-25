@@ -509,7 +509,7 @@ thread_local! {
 }
 
 /// The size of a [`FillGroup`]'s block of title memory
-/// (`VICTORY_FILL_GROUP_KB`, at most 64; 0, off, by default: each
+/// (`VICTORY_FILL_GROUP_KB`, at most 64, by default; 0 turns it off: each
 /// fill copies its own bytes, about 11,700 a frame and 4.3 us of CPU each
 /// in run zall11a, nearly all one constant buffer per binding).
 ///
@@ -527,7 +527,12 @@ thread_local! {
 /// copy at submission, before the list, for every fill alike; each fill's
 /// own range is still refreshed.
 ///
-/// Off by default: run zall12w (64 KiB) broke. Each block took a 64 KiB
+/// On (64) by default since runs zall15g, zall15d (300 s, defaults
+/// otherwise): 126 ms a frame with it against 128 without, and without it
+/// the hair at frame 2400 drew as black blocks; with it the picture was
+/// no worse than before.
+///
+/// Once off by default: run zall12w (64 KiB) broke. Each block took a 64 KiB
 /// chunk of its list's, and lists kept their chunks across resets, so every
 /// list the title records into grew to its largest recording's (51 GB
 /// committed, a buffer made for most blocks: 827 ms a frame "recording"
@@ -539,7 +544,7 @@ thread_local! {
 fn group_bytes() -> u64 {
     static KB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *KB.get_or_init(|| {
-        std::env::var("VICTORY_FILL_GROUP_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(64) << 10
+        std::env::var("VICTORY_FILL_GROUP_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(64).min(64) << 10
     })
 }
 

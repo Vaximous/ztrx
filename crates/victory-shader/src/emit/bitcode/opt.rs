@@ -26,6 +26,14 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`LEGACY`]: a `0 × anything = 0` product (`v_mul_legacy_f32` and its
+//!   kin: a compare with zero and a select around the multiply) whose
+//!   other factor is a finite non-zero constant differs from the plain
+//!   product only in the sign of a zero result (`c × -0` is `-0`, the
+//!   legacy product `+0`). Where everything that reads it cannot tell the
+//!   zeros apart (a conversion to an integer, a float comparison, a sum
+//!   with a non-zero constant, the product of a multiply-add whose addend
+//!   is a non-zero constant), the plain product is taken.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -47,13 +55,15 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// Legacy products whose zero check cannot matter.
+pub const LEGACY: u32 = 64;
 /// Not a pass over the module: the lowering of a first-lane read in a
 /// wave64 program run as two host waves skips the exchange that asks which
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | LEGACY;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
 
@@ -229,9 +239,136 @@ impl Module {
                 }
             }
         }
+        if passes & LEGACY != 0 {
+            // Reads that nothing uses (a register's integer form no later
+            // instruction takes) must not count against a product.
+            if passes & DEAD != 0 {
+                self.drop_dead();
+            }
+            self.legacy();
+        }
         if passes & DEAD != 0 {
             self.drop_dead();
         }
+    }
+
+    /// A float constant's value.
+    fn float_k(&self, v: V) -> Option<f32> {
+        let V::Const(i) = v else { return None };
+        match self.consts[i as usize].1 {
+            Const::Float(bits) if matches!(self.types[self.consts[i as usize].0.0 as usize], TypeDef::Float) => {
+                Some(f32::from_bits(bits))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_float(&self, ty: Ty) -> bool {
+        matches!(self.types[ty.0 as usize], TypeDef::Float)
+    }
+
+    /// Whether instruction `u`, reading `s` (a float that may be either
+    /// zero), gives the same whichever zero it is ([`LEGACY`]).
+    fn zero_sign_blind(&self, u: u32, s: V) -> bool {
+        let k_nonzero = |v: V| v != s && self.float_k(v).is_some_and(|k| k != 0.0);
+        match &self.insts[u as usize].op {
+            Op::Cast(Cast::FpToUi | Cast::FpToSi, _) => true,
+            // Both zeros compare equal to everything alike.
+            Op::Cmp(p, ..) => *p <= pred::TRUE,
+            // `±0 + k` and `k - ±0` are `k`, `±0 - k` is `-k`, for k ≠ 0.
+            Op::Bin(Bin::Add | Bin::Sub, a, b) if self.is_float(self.insts[u as usize].ty) => {
+                (*a == s && k_nonzero(*b)) || (*b == s && k_nonzero(*a))
+            }
+            // FMad (46): `±0 × y + k` is `k` for finite y and NaN for the
+            // others either way, for k ≠ 0.
+            Op::Call(f, args) => {
+                self.funcs[*f as usize].name.starts_with("dx.op.tertiary.f32")
+                    && args.len() == 4
+                    && self.int_k(args[0]).is_some_and(|k| k.1 == 46)
+                    && args[3] != s
+                    && k_nonzero(args[3])
+            }
+            _ => false,
+        }
+    }
+
+    /// [`LEGACY`]. Returns whether anything changed.
+    fn legacy(&mut self) -> bool {
+        let reached = self.reached();
+        let n = self.insts.len();
+        // Who reads each instruction (a branch condition or a join: kept).
+        let mut users: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut pinned = vec![false; n];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &i in blk.phis.iter().chain(&blk.body) {
+                let phi = matches!(self.insts[i as usize].op, Op::Phi(_));
+                for_each_operand(&self.insts[i as usize].op, |v| {
+                    if let V::Inst(j) = v {
+                        if phi {
+                            pinned[j as usize] = true;
+                        } else {
+                            users[j as usize].push(i);
+                        }
+                    }
+                });
+            }
+            if let Some(Term::CondBr(V::Inst(j), ..)) = blk.term {
+                pinned[j as usize] = true;
+            }
+        }
+        let mut repl: Vec<Option<V>> = vec![None; n];
+        let mut changed = false;
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            for &i in &blk.body {
+                let Op::Select(c, t, f) = self.insts[i as usize].op else { continue };
+                if pinned[i as usize] || users[i as usize].is_empty() {
+                    continue;
+                }
+                // `select(x == 0, +0, k × x)`.
+                if self.float_k(t).map(f32::to_bits) != Some(0) {
+                    continue;
+                }
+                let (V::Inst(m), V::Inst(z)) = (f, c) else { continue };
+                let Op::Bin(Bin::Mul, a, bb) = self.insts[m as usize].op else { continue };
+                if !self.is_float(self.insts[m as usize].ty) {
+                    continue;
+                }
+                let Op::Cmp(pred::OEQ, x, zero) = self.insts[z as usize].op else { continue };
+                if self.float_k(zero) != Some(0.0) {
+                    continue;
+                }
+                let other = if x == a {
+                    bb
+                } else if x == bb {
+                    a
+                } else {
+                    continue;
+                };
+                if !self.float_k(other).is_some_and(|k| k.is_finite() && k != 0.0) {
+                    continue;
+                }
+                if users[i as usize].iter().all(|&u| self.zero_sign_blind(u, V::Inst(i))) {
+                    repl[i as usize] = Some(V::Inst(m));
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+        let (blocks, insts) = (&self.blocks, &mut self.insts);
+        for blk in blocks {
+            for &i in blk.phis.iter().chain(&blk.body) {
+                map_operands(&mut insts[i as usize].op, |v| resolve(&repl, v));
+            }
+        }
+        true
     }
 
     /// Per function: what a call of it does.
@@ -1158,6 +1295,38 @@ mod tests {
 
     fn body(m: &Module, b: usize) -> usize {
         m.blocks[b].body.len()
+    }
+
+    #[test]
+    fn legacy_products_whose_zero_sign_cannot_matter_are_plain() {
+        let Kit {
+            mut m, b, reads, writes, ..
+        } = kit();
+        let (i32t, f32t) = (m.int(32), m.float());
+        let one = m.i32(1);
+        let raw = m.call(b, reads, vec![one, one]);
+        let x = m.cast(b, Cast::Bitcast, raw, f32t);
+        let (k, zero) = (m.f32(255.0f32.to_bits()), m.f32(0));
+        let legacy = |m: &mut Module| {
+            let p = m.bin(b, Bin::Mul, k, x);
+            let z = m.cmp(b, pred::OEQ, x, zero);
+            (p, m.select(b, z, zero, p))
+        };
+        // To an integer: either zero gives 0.
+        let (plain, read) = legacy(&mut m);
+        let int = m.cast(b, Cast::FpToUi, read, i32t);
+        m.call(b, writes, vec![int, one]);
+        // Into a plain product: the zero's sign carries on, so it stays.
+        let (_, kept) = legacy(&mut m);
+        let again = m.bin(b, Bin::Mul, kept, x);
+        let bits = m.cast(b, Cast::Bitcast, again, i32t);
+        m.call(b, writes, vec![bits, one]);
+        m.terminate(b, Term::Ret);
+        m.optimise(DEAD | LEGACY);
+        let ops: Vec<&Op> = m.blocks[b].body.iter().map(|&i| &m.insts[i as usize].op).collect();
+        assert!(ops.iter().any(|op| matches!(op, Op::Cast(Cast::FpToUi, v) if *v == plain)));
+        assert_eq!(ops.iter().filter(|op| matches!(op, Op::Select(..))).count(), 1);
+        m.write();
     }
 
     #[test]

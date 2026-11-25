@@ -65,7 +65,8 @@ pub(crate) fn scale(height: u32) -> i32 {
 
 /// The overlay for `lines` with its box's corner at (`x`, `y`) and cells
 /// `scale` pixels wide, kept inside a `width` x `height` target: the dark
-/// box, then the lit cells (a run of lit cells in a row is one rectangle).
+/// box, then the lit cells: a run of lit cells in a row is one rectangle,
+/// and the same run in the rows below joins it.
 /// `None` if there is no text or nothing of it is inside the target.
 pub(crate) fn layout(lines: &[&str], x: i32, y: i32, scale: i32, width: i32, height: i32) -> Option<(Rect, Vec<Rect>)> {
     let columns = lines.iter().map(|l| l.chars().count() as i32).max().unwrap_or(0);
@@ -88,6 +89,7 @@ pub(crate) fn layout(lines: &[&str], x: i32, y: i32, scale: i32, width: i32, hei
         for (column, c) in line.chars().enumerate() {
             let Some(rows) = glyph(c) else { continue };
             let left = x + (PAD + column as i32 * ADVANCE) * scale;
+            let first = lit.len();
             for (row, bits) in rows.iter().enumerate() {
                 let mut cell = 0;
                 while cell < WIDTH {
@@ -105,12 +107,18 @@ pub(crate) fn layout(lines: &[&str], x: i32, y: i32, scale: i32, width: i32, hei
                         right: left + cell * scale,
                         bottom: top + (row as i32 + 1) * scale,
                     };
-                    lit.extend(clip(r));
+                    // The same run in the row above: grow it down instead.
+                    match lit[first..].iter_mut().find(|a: &&mut Rect| {
+                        (a.left, a.right, a.bottom) == (r.left, r.right, r.top)
+                    }) {
+                        Some(above) => above.bottom = r.bottom,
+                        None => lit.push(r),
+                    }
                 }
             }
         }
     }
-    Some((backing, lit))
+    Some((backing, lit.into_iter().filter_map(clip).collect()))
 }
 
 /// The overlay's lines for a second's stats: frames a second and ms a
@@ -127,28 +135,22 @@ mod tests {
 
     #[test]
     fn one_cell_glyph_rows_become_runs() {
-        // '.': two rows of one run two cells wide, cells 1 and 2.
+        // '.': rows 5 and 6 hold one run two cells wide (cells 1 and 2),
+        // joined into one rectangle two rows tall.
         let (backing, lit) = layout(&["."], 10, 20, 3, BIG, BIG).unwrap();
         let top = 20 + PAD * 3;
         let left = 10 + PAD * 3;
-        assert_eq!(
-            lit,
-            vec![
-                Rect { left: left + 3, top: top + 15, right: left + 9, bottom: top + 18 },
-                Rect { left: left + 3, top: top + 18, right: left + 9, bottom: top + 21 },
-            ]
-        );
+        assert_eq!(lit, vec![Rect { left: left + 3, top: top + 15, right: left + 9, bottom: top + 21 }]);
         assert_eq!(backing, Rect { left: 10, top: 20, right: 10 + (2 * PAD + 5) * 3, bottom: 20 + (2 * PAD + 7) * 3 });
     }
 
     #[test]
-    fn runs_split_on_gaps() {
-        // '0' row 2 is 10011: a run of one, then a run of two.
+    fn runs_split_on_gaps_and_join_down() {
+        // '0' rows 1-3 are 10001, 10011, 10101: the left cell joins down
+        // through them; row 2's run of two (cells 3 and 4) stands alone.
         let (_, lit) = layout(&["0"], 0, 0, 1, BIG, BIG).unwrap();
-        let row2: Vec<_> = lit.iter().filter(|r| r.top == PAD + 2).collect();
-        assert_eq!(row2.len(), 2);
-        assert_eq!((row2[0].left, row2[0].right), (PAD, PAD + 1));
-        assert_eq!((row2[1].left, row2[1].right), (PAD + 3, PAD + 5));
+        assert!(lit.contains(&Rect { left: PAD, top: PAD + 1, right: PAD + 1, bottom: PAD + 4 }));
+        assert!(lit.contains(&Rect { left: PAD + 3, top: PAD + 2, right: PAD + 5, bottom: PAD + 3 }));
     }
 
     #[test]
@@ -161,10 +163,10 @@ mod tests {
             assert!(r.top >= backing.top && r.bottom <= backing.bottom, "{r:?}");
             assert!(r.left < r.right && r.top < r.bottom);
             assert_eq!((r.right - r.left) % 2, 0);
-            assert_eq!(r.bottom - r.top, 2);
+            assert_eq!((r.bottom - r.top) % 2, 0);
         }
-        // The number of lit cells matches the font's bits.
-        let cells: i32 = lit.iter().map(|r| (r.right - r.left) / 2).sum();
+        // The number of lit cells matches the font's bits, none drawn twice.
+        let cells: i32 = lit.iter().map(|r| (r.right - r.left) / 2 * (r.bottom - r.top) / 2).sum();
         let bits: u32 = text.chars().filter_map(glyph).flatten().map(u8::count_ones).sum();
         assert_eq!(cells as u32, bits);
     }
@@ -175,7 +177,8 @@ mod tests {
         // The top row of '1' (00100) on each line.
         assert!(lit.iter().any(|r| r.top == PAD && r.left == PAD + 2));
         assert!(lit.iter().any(|r| r.top == PAD + LINE && r.left == PAD + ADVANCE + 2));
-        assert_eq!(lit.len(), 2 * 7);
+        // '1': row 0, row 1, rows 2-5 joined, row 6: four rectangles each.
+        assert_eq!(lit.len(), 2 * 4);
     }
 
     #[test]

@@ -6046,9 +6046,11 @@ impl Host {
             ]);
             if let Some((backing, lit)) = hud {
                 let rtv = self.rtv(Some(&back), None);
+                // One rectangle a call: the NVIDIA driver fast-failed (a stack
+                // buffer overrun in nvwgf2umx.dll) on one call with ~300.
                 list.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0], Some(std::slice::from_ref(backing)));
-                if !lit.is_empty() {
-                    list.ClearRenderTargetView(rtv, &[1.0, 1.0, 0.2, 1.0], Some(lit));
+                for r in lit {
+                    list.ClearRenderTargetView(rtv, &[1.0, 1.0, 0.2, 1.0], Some(std::slice::from_ref(r)));
                 }
                 list.ResourceBarrier(&[transition(
                     &back,

@@ -476,18 +476,19 @@ fn need(block: usize) {
 /// VGPR the instruction reads from that register up: a destination's old value (read for the
 /// lanes a guard leaves) made a scalar's reciprocal through VGPRs, the compiler's idiom before
 /// `v_readfirstlane`, count as differing between lanes, so each such read was exchanged between
-/// the host waves through LDS (two group barriers). `VICTORY_UNIFORM_PRECISE=0` restores the
-/// old rule.
+/// the host waves through LDS (two group barriers). Off by default (`VICTORY_UNIFORM_PRECISE=1`
+/// turns it on): with both uniform rules on, the world drew wrong (run zall2: banded dark
+/// walls, blotchy cloth, textures gone), and clean with both off (run zb1).
 fn uniform_precise() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_PRECISE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_PRECISE").is_some_and(|v| v == "1"))
 }
 
 /// Whether [`lane_uniform`] takes a plain buffer load from an address every lane makes alike
-/// as alike in every lane (`VICTORY_UNIFORM_LOADS=0`: never).
+/// as alike in every lane (`VICTORY_UNIFORM_LOADS=1`; off by default, as [`uniform_precise`]).
 fn uniform_loads() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_some_and(|v| v == "1"))
 }
 
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
@@ -541,6 +542,8 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
             // half, reads its destination as well.
             let keeps = name.contains("mac") || name.contains("16") || name.contains("pk");
             let precise = uniform_precise();
+            #[cfg(test)]
+            audit_reads(inst, name, &ops, dst.or(match &inst.fields { Fields::Buffer { data, .. } => *data, _ => None }));
             let alike = ops.iter().chain(dst.iter().filter(|_| keeps)).all(|op| match *op {
                 Operand::Vector { reg, dwords } => {
                     // every dword of the operand the instruction reads (`precise`: only those; else
@@ -566,6 +569,64 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`audit_reads`]: instructions by name, and how many VGPRs they read past their operands.
+    static AUDIT: std::cell::RefCell<std::collections::BTreeMap<String, (u64, u64)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// For [`uniform_precise`]: counts each VGPR an instruction reads that lies in none of its
+/// operands' dwords nor its destination's (an operand whose width the decoder understates).
+#[cfg(test)]
+fn audit_reads(inst: &Inst, name: &str, ops: &[Operand], dst: Option<Operand>) {
+    let spans: Vec<(u16, u16)> = ops
+        .iter()
+        .chain(dst.iter())
+        .filter_map(|op| match *op {
+            Operand::Vector { reg, dwords } => Some((u16::from(reg), u16::from(reg) + u16::from(dwords.max(1)))),
+            _ => None,
+        })
+        .collect();
+    let stray = inst
+        .reads
+        .iter()
+        .filter(|r| matches!(r.0, Reg::V(x) if !spans.iter().any(|&(a, b)| u16::from(x) >= a && u16::from(x) < b)))
+        .count() as u64;
+    AUDIT.with_borrow_mut(|m| {
+        let e = m.entry(name.to_string()).or_default();
+        e.0 += 1;
+        e.1 += stray;
+    });
+}
+
+/// `VICTORY_AUDIT_DIR=<dir>` (ignored test): every saved console shader translated, and the
+/// instructions [`audit_reads`] found reading VGPRs outside their operands listed.
+#[test]
+#[ignore = "needs saved shaders"]
+fn audit_operand_widths() {
+    let Ok(dir) = std::env::var("VICTORY_AUDIT_DIR") else { return };
+    // As on the 4070 Ti: console wave64 programs in host waves of 32.
+    TEST_HOST_WAVE.set(Some(32));
+    let mut n = 0;
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "cdxil") {
+            let _ = super::translate(&std::fs::read(&path).unwrap());
+            n += 1;
+        }
+    }
+    println!("{n} shaders");
+    AUDIT.with_borrow(|m| {
+        println!("{} names, {} instructions seen", m.len(), m.values().map(|v| v.0).sum::<u64>());
+        for (name, (seen, stray)) in m {
+            if *stray > 0 {
+                println!("{name}: {seen} seen, {stray} stray reads");
+            }
+        }
+    });
 }
 
 /// What a register value holds, for [`wave_local`].

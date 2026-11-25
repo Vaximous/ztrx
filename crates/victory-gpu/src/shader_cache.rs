@@ -69,6 +69,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_EXCHANGE_BARRIERS",
                     "VICTORY_HALF_LOCAL",
                     "VICTORY_F16_NEAREST",
+                    // Which lanes the translation takes for alike.
+                    "VICTORY_UNIFORM_PRECISE",
+                    "VICTORY_UNIFORM_LOADS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

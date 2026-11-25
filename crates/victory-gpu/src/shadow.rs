@@ -164,6 +164,30 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// Whether the card's room for title buffers' copies is kept from the
+/// textures ([`card_reserve`]): on unless `VICTORY_CARD_RESERVE=0`.
+fn card_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RESERVE").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of the card's memory kept from host copies of textures
+/// (`resource::room`) for copies of title buffers not made yet: what
+/// [`card_limits`] still allows of them. 0 without [`cards`] or with
+/// `VICTORY_CARD_RESERVE=0`.
+///
+/// Title buffers' copies are made when a buffer is first used, and on a
+/// base that makes textures' host copies sooner the textures had filled the
+/// card to their line by then: the copies were refused, the big buffers
+/// stayed in the PC's memory with their snapshots and compares on the CPU
+/// (run fxdef1: 2 copies, 175 MB, 678 MB snapshotted a frame, 2.0 fps).
+pub(crate) fn card_reserve() -> u64 {
+    if !cards() || !card_reserve_on() {
+        return 0;
+    }
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -211,16 +235,17 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
+    // Only while the card has room: with this copy on it, the card's use
+    // must stay under the textures' line (`resource::room_line`, nine
+    // tenths of the budget). The textures stop `card_reserve` below that
+    // line, so the copies find their room even when the textures came
+    // first (with a fifth kept free instead, run fxdef1 made 2 copies
+    // against 96, and snapshotted 678 MB a frame on the CPU).
+    if let Some([budget, used, ..]) = host.video_memory() {
+        let line = if card_reserve_on() { crate::resource::room_line(budget) } else { budget / 10 * 8 };
+        if used + size > line {
+            return None;
+        }
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);

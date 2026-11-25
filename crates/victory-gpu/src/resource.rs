@@ -1379,9 +1379,18 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        Some([budget, used, ..]) => used + crate::shadow::card_reserve() < room_line(budget),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The share of the card's budget, in bytes, up to which the card's memory
+/// may be in use with a host copy of a texture made there ([`room`]) or a
+/// title buffer's copy (`crate::shadow::card_for`): nine tenths. The
+/// textures stop [`crate::shadow::card_reserve`] below it.
+#[cfg(windows)]
+pub(crate) fn room_line(budget: u64) -> u64 {
+    budget / 10 * 9
 }
 
 /// Lets go of the host copies of textures the title fills that nothing

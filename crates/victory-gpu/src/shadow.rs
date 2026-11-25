@@ -2619,10 +2619,10 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             #[cfg(feature = "diagnostics")]
-            let asking = std::time::Instant::now();
+            let asking = crate::copystat::detail().then(std::time::Instant::now);
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 #[cfg(feature = "diagnostics")]
-                let (watch_us, copying) = (asking.elapsed().as_micros() as u64, std::time::Instant::now());
+                let timed = asking.map(|asking| (asking.elapsed().as_micros() as u64, std::time::Instant::now()));
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
@@ -2631,10 +2631,12 @@ impl Shadow {
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                     let changed = COPY_CHANGED.take();
-                    crate::copystat::refresh(
-                        (self.start, self.len, self.window),
-                        [(to - from) as u64, copied as u64, changed, watch_us, copying.elapsed().as_micros() as u64],
-                    );
+                    if let Some((watch_us, copying)) = timed {
+                        crate::copystat::refresh(
+                            (self.start, self.len, self.window),
+                            [(to - from) as u64, copied as u64, changed, watch_us, copying.elapsed().as_micros() as u64],
+                        );
+                    }
                 }
                 return copied;
             }

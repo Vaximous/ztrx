@@ -75,9 +75,12 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let known = known_views(ranges);
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        .filter(|r| r.0 < r.1 && !known_view(r.0))
+        .zip(&known)
+        .filter(|&(r, &known)| r.0 < r.1 && !known)
+        .map(|(r, _)| r)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -194,12 +197,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    let known = known_views(ranges);
+    for (&(start, end), &known) in ranges.iter().zip(&known) {
         if start >= end {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !known_view(start) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && !known && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -352,7 +356,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let started = std::time::Instant::now();
     // View memory the guards know: the kernel would only fail.
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = known_view(start) || unsafe {
+    let known = known_view(start);
+    let failed = known || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -369,7 +374,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
+        let written = guard_known(first * PAGE, last * PAGE, known);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
         written?
@@ -614,13 +619,40 @@ mod bits_tests {
 /// ([`title_memory_remapped`]). `VICTORY_KNOWN_VIEWS=0` asks first, as
 /// before.
 fn known_view(at: usize) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_VIEWS").is_none_or(|v| v != "0")) {
+    if !known_views_on() {
         return false;
     }
     let g = guards();
     let block = at / BLOCK;
     g.protected.contains(&block) || g.absent.contains(&block)
+}
+
+fn known_views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// [`known_view`] of each range's start, under one taking of the guards'
+/// lock: taken once per range, the lock was contended with the guards'
+/// fault handler and other refreshers (Mutex::lock_contended under
+/// known_view, 2.9% of the submitting thread, run zall18p2).
+/// `VICTORY_KNOWN_VIEWS_EACH=1` takes it per range, as before.
+fn known_views(ranges: &[(usize, usize)]) -> Vec<bool> {
+    static EACH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !known_views_on() || ranges.is_empty() {
+        return vec![false; ranges.len()];
+    }
+    if *EACH.get_or_init(|| std::env::var_os("VICTORY_KNOWN_VIEWS_EACH").is_some_and(|v| v == "1")) {
+        return ranges.iter().map(|r| known_view(r.0)).collect();
+    }
+    let g = guards();
+    ranges
+        .iter()
+        .map(|r| {
+            let block = r.0 / BLOCK;
+            g.protected.contains(&block) || g.absent.contains(&block)
+        })
+        .collect()
 }
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -630,7 +662,16 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_known(start, end, false)
+}
+
+/// [`guard`], `known` if [`known_view`] said the range's first block is
+/// one the guards hold: not asked again under the guards' lock (a third
+/// taking of it per refresh of view memory, contended with the guards'
+/// fault handler: run zall18p2).
+fn guard_known(start: usize, end: usize, known: bool) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -639,11 +680,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && (known || {
         let g = guards();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
-    };
+    });
     if !known && !is_view(start, end) {
         return None;
     }
@@ -1034,10 +1075,19 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// answers kept per frame (run zall6p). `VICTORY_HOLES_FORGET_ALL=1`
 /// forgets all of them, as before.
 fn forget_holes(at: usize, len: usize) {
-    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_HOLES_FORGET_ALL").is_some_and(|v| v == "1"));
+    let (from, to) = if all { (0, usize::MAX) } else { (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)) };
     let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    // Bumped under the lock with the note of what was forgotten: an answer
+    // asked meanwhile sees every forgetting since its question.
+    let epoch = COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    if holes_exact() {
+        if q.2.len() >= FORGOTTEN_KEPT {
+            q.2.drain(..FORGOTTEN_KEPT / 2);
+        }
+        q.2.push((epoch, from, to));
+    }
     let Some(m) = q.1.as_mut() else {
         return;
     };
@@ -1045,7 +1095,22 @@ fn forget_holes(at: usize, len: usize) {
         m.clear();
         return;
     }
-    forget_runs(m, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    forget_runs(m, from, to);
+}
+
+/// The most forgettings [`forget_holes`] notes for [`holes_exact`]; an
+/// answer older than the oldest noted is not kept.
+const FORGOTTEN_KEPT: usize = 1024;
+
+/// Whether an answer of Windows about a hole is kept when the runtime
+/// committed or mapped title memory while it was asked, if not there
+/// (`VICTORY_HOLES_EXACT`, on by default; `=0`: not kept after any, as
+/// before). The runtime maps views all frame long, and an answer asked
+/// across any mapping was thrown away: VirtualQuery under `watch::writes`
+/// stayed 7.4% of the submitting thread (run zall18p2).
+fn holes_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_EXACT").is_none_or(|v| v != "0"))
 }
 
 /// Takes out of `m` (runs by first block, to their end; an empty run is a
@@ -1071,7 +1136,10 @@ fn forget_runs(m: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
 
 /// [`holes_per_frame`]'s answers, as [`QUERIED`]'s, by frame.
 #[allow(clippy::type_complexity)]
-static QUERIED_FRAME: Mutex<(u64, Option<BTreeMap<usize, usize>>)> = Mutex::new((0, None));
+/// The third: what [`forget_holes`] forgot this frame (epoch after,
+/// blocks), for [`holes_exact`].
+static QUERIED_FRAME: Mutex<(u64, Option<BTreeMap<usize, usize>>, Vec<(u64, usize, usize)>)> =
+    Mutex::new((0, None, Vec::new()));
 
 fn uncommitted_end_framed(block: usize) -> usize {
     let key = crate::queue::presented();
@@ -1079,7 +1147,9 @@ fn uncommitted_end_framed(block: usize) -> usize {
     {
         let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
         if q.0 != key {
-            *q = (key, None);
+            q.0 = key;
+            q.1 = None;
+            q.2.clear();
         }
         if let Some(m) = q.1.as_ref() {
             if let Some(&end) = m.get(&block) {
@@ -1096,7 +1166,20 @@ fn uncommitted_end_framed(block: usize) -> usize {
     let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
     // Not kept if the runtime committed or mapped anything since the
     // question (under the lock: [`forget_holes`] takes it after the bump).
-    if q.0 == key && COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire) == epoch {
+    let now = COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let keep = now == epoch || {
+        // Forgotten since the question, but elsewhere: the answer stands.
+        // (The notes of this frame alone: one cleared by a new frame, or
+        // dropped as too many, leaves the answer unkept.)
+        let (from, to) = (block, end.max(block + 1));
+        let (mut seen, mut apart) = (0u64, true);
+        for &(_, a, b) in q.2.iter().rev().take_while(|f| f.0 > epoch) {
+            seen += 1;
+            apart &= b <= from || to <= a;
+        }
+        holes_exact() && seen == now - epoch && apart
+    };
+    if q.0 == key && keep {
         q.1.get_or_insert_with(Default::default).insert(block, end);
     }
     end
@@ -1109,8 +1192,15 @@ fn uncommitted_end_now(block: usize) -> usize {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::Queries, 1);
+        crate::copystat::add(crate::copystat::C::QueryUs, started.elapsed().as_micros() as u64);
+    }
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {

@@ -159,6 +159,17 @@ pub(crate) fn diff_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_COPY_DIFF").is_ok_and(|v| v == "1"))
 }
 
+/// `VICTORY_COPY_DETAIL=1` (or [`diff_on`]): the tables by host copy and
+/// by range ([`range`], [`whole`], [`refresh`]) are kept, and the timers
+/// that feed them run. Off, each refresh skips a global lock, a hashed
+/// lookup and three clock reads: timers and stats bookkeeping were about
+/// 8% of the submitting thread (Instant::now 5.3%, elapsed 2.8%, the maps
+/// 2.8%, run zall18p2). The per-frame counters stay.
+pub(crate) fn detail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| diff_on() || std::env::var("VICTORY_COPY_DETAIL").is_ok_and(|v| v == "1"))
+}
+
 /// Per host copy (start, length, window): refreshes, bytes asked, bytes
 /// copied, 64-byte lines that changed (with [`diff_on`]), microseconds
 /// asking write watching, microseconds copying.
@@ -170,6 +181,9 @@ static REFRESHES: Mutex<Option<Refreshes>> = Mutex::new(None);
 /// 64-byte lines that differed, `watch_us` asking write watching, `copy_us`
 /// copying.
 pub(crate) fn refresh(copy: (u64, u64, bool), [asked, copied, changed, watch_us, copy_us]: [u64; 5]) {
+    if !detail() {
+        return;
+    }
     let mut map = REFRESHES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map.get_or_insert_with(HashMap::new).entry(copy).or_insert([0; 6]);
     for (at, v) in e.iter_mut().zip([1, asked, copied, changed, watch_us, copy_us]) {
@@ -256,6 +270,9 @@ static WHOLE: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(No
 /// `us`.
 pub(crate) fn whole(src: usize, len: usize, us: u64) {
     add(C::WholeUs, us);
+    if !detail() {
+        return;
+    }
     let mut map = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
     let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
     e.0 += 1;
@@ -356,6 +373,9 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
 
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+    if !detail() {
+        return;
+    }
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)

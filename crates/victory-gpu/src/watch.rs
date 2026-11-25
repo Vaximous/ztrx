@@ -775,7 +775,12 @@ thread_local! {
 }
 
 /// [`uncommitted_end`]'s answers by block, and the epoch they were given in.
-static QUERIED: Mutex<(u64, Option<std::collections::HashMap<usize, usize>>)> = Mutex::new((0, None));
+/// Holes are kept as runs (first block, end), so that a block inside a
+/// hole another range asked about is answered too: the guards' ranges
+/// start at many blocks of the same holes, and asking by the exact block
+/// left VirtualQuery at 10.5% of the submitting thread (run zl7). A
+/// committed block is kept as an empty run.
+static QUERIED: Mutex<(u64, Option<BTreeMap<usize, usize>>)> = Mutex::new((0, None));
 
 /// Whether [`uncommitted_end`] answers from what it was told earlier in the
 /// same submission (`VICTORY_QUERY_ONCE=0`: asks every time, as before).
@@ -808,8 +813,15 @@ fn uncommitted_end(block: usize) -> usize {
         if q.0 != epoch {
             *q = (epoch, None);
         }
-        if let Some(&end) = q.1.as_ref().and_then(|m| m.get(&block)) {
-            return end;
+        if let Some(m) = q.1.as_ref() {
+            if let Some(&end) = m.get(&block) {
+                return end;
+            }
+            if let Some((_, &end)) = m.range(..block).next_back()
+                && end > block
+            {
+                return end;
+            }
         }
     }
     let end = uncommitted_end_now(block);

@@ -3300,21 +3300,37 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
+/// Ranges gathered per host copy, each once, in the order first seen:
+/// a copy's place and its ranges looked up by hash (a linear search of the
+/// copies and of each copy's ranges was quadratic in a submission's
+/// declared writes).
+#[derive(Default)]
+struct Gathered {
+    at: std::collections::HashMap<usize, (usize, std::collections::HashSet<(usize, usize)>)>,
+}
+
+impl Gathered {
+    fn add(&mut self, into: &mut Vec<Declared>, shadow: &std::sync::Arc<crate::shadow::Shadow>, range: (usize, usize)) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let (place, seen) = self.at.entry(key).or_insert_with(|| {
+            into.push((shadow.clone(), Vec::new()));
+            (into.len() - 1, std::collections::HashSet::new())
+        });
+        if seen.insert(range) {
+            into[*place].1.push(range);
+        }
+    }
+}
+
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let mut gathered = Gathered::default();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                gathered.add(&mut back, shadow, range);
             }
         }
     }
@@ -3741,20 +3757,14 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut gathered = Gathered::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
+                    gathered.add(&mut declared, shadow, range);
                 }
             }
         }
@@ -4498,17 +4508,11 @@ impl Host {
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
+                let mut gathered = Gathered::default();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        for &range in ranges {
+                            gathered.add(&mut back, shadow, range);
                         }
                     }
                 }
@@ -4912,6 +4916,7 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut gathered = Gathered::default();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
@@ -4920,15 +4925,8 @@ impl Host {
                         self.card_back(card, submitted, &mut seen);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                        for &range in ranges {
+                            gathered.add(&mut back, shadow, range);
                         }
                     }
                 }

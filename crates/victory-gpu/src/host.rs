@@ -735,7 +735,7 @@ pub(crate) struct HostList {
     /// Fills of upload memory a submission's preparing sends to the card
     /// instead ([`read_fixup`]): destination (scratch chunk, offset), host
     /// copy and offset, bytes; the list's prelude records them.
-    fixups: Mutex<Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>>,
+    fixups: Mutex<Vec<Fixup>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -2607,56 +2607,206 @@ pub(crate) fn read_fixup() -> bool {
 }
 
 /// Since the last frame-rate line ([`read_fixup`]): fills sent to the card
-/// at submission, submissions that did not wait for it.
-static FIXUP_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// at submission, submissions that did not wait for it, title copies sent
+/// to the card at submission.
+static FIXUP_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line ([`read_fixup`]): submissions that
+/// waited all the same, as a fill or copy had no host copy or upload
+/// place, a texture's bytes touched what flights write (or a copy's), a
+/// run said nothing of what it touches, or something else still waited
+/// after the fix-up.
+static FIXUP_BAIL: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Since the last frame-rate line ([`read_fixup`]): submissions spared a
+/// read's wait that waited for title bytes refreshed under flights' writes
+/// all the same (`stale_under_flights`).
+static FIXUP_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`FIXUP_BAIL`]'s last: what still made the submission wait after the
+/// fix-up (the first 40, logged).
+fn note_still_blocked(written: &[(usize, usize)], runs: &[&HostList]) {
+    FIXUP_BAIL[4].fetch_add(1, Ordering::Relaxed);
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let what = runs.iter().enumerate().find_map(|(l, list)| {
+        list.deferred().copies.iter().enumerate().find_map(|(i, step)| {
+            let hit = |a: usize, b: usize| touches(written, a, b);
+            let what = match *step {
+                Step::Fill(_, src, len) if hit(src, src + len) => format!("a fill of {src:#x}+{len:#x}"),
+                Step::Copy(dst, src, len) if hit(src, src + len) || hit(dst, dst + len) => {
+                    format!("a buffer copy {src:#x} to {dst:#x}+{len:#x}")
+                }
+                Step::Texture(ref staging) => {
+                    let (at, len) = staging.memory();
+                    if !hit(at, at + len) {
+                        return None;
+                    }
+                    format!("a texture's bytes {at:#x}+{len:#x}")
+                }
+                Step::Run(_, Some((dst, src, len))) if known_writes() => {
+                    if !hit(src, src.saturating_add(len)) && !hit(dst, dst.saturating_add(len)) {
+                        return None;
+                    }
+                    format!("a run {src:#x} to {dst:#x}+{len:#x}")
+                }
+                Step::Run(..) => "a run of unknown reach".to_owned(),
+                _ => return None,
+            };
+            Some(format!("{what} (list {l} of {}, step {i})", runs.len()))
+        })
+    });
+    tracing::info!("READ_FIXUP: still waited after the fix-up for {}", what.unwrap_or_else(|| "(nothing found)".to_owned()));
+}
+
+/// A copy in a list's prelude ([`read_fixup`]): `len` bytes from `from`
+/// at `from_at` to `to` at `at`. `card`: between host copies (a title
+/// copy), waited for on both sides; else into the list's upload memory.
+#[derive(Clone)]
+struct Fixup {
+    to: ID3D12Resource,
+    at: u64,
+    from: ID3D12Resource,
+    from_at: u64,
+    len: u64,
+    card: bool,
+}
 
 /// [`read_fixup`] for `runs`, about to wait for flights for what they read:
-/// whether every fill that would wait was sent to the card (the caller
-/// asks again whether anything else would).
+/// whether every fill and title copy that would wait was sent to the card
+/// (the caller asks again whether anything else would). Nothing is
+/// changed unless all of them can be.
+///
+/// In the steps' order, from what flights may write: a fill that reads it
+/// becomes a copy, in its list's prelude, from the host copy into the
+/// upload memory its view shows. A title copy that reads or writes it
+/// becomes a copy on the card between the two host copies there (behind
+/// the flights, as `crate::cardcopy::try_copy`'s), its destination
+/// declared written (the copy-back brings it to the title); both its ends
+/// join what later steps are checked against, so a later fill of them, or
+/// a later copy reading or writing them, goes to the card after it rather
+/// than to the CPU before it. The title's memory-to-memory copies (runs
+/// that say where they copy) are title copies here too. A texture's bytes
+/// that touch any of it leave the submission waiting.
 fn fix_up_reads(runs: &[&HostList]) -> bool {
-    let written = line().written.clone();
-    // (list, step, upload destination, source, bytes)
-    let mut found = Vec::new();
+    use std::sync::Arc;
+    enum Seen {
+        Fill(usize, usize, usize),
+        Copy(usize, usize, usize),
+        /// A texture's title bytes.
+        Other(usize, usize),
+        /// A run that does not say what it touches.
+        Unknown,
+    }
+    enum Plan {
+        Fill(Arc<crate::shadow::Shadow>, ID3D12Resource, u64, usize, usize),
+        Copy(Arc<crate::shadow::Shadow>, Arc<crate::shadow::Shadow>, usize, usize, usize),
+    }
+    let bail = |why: usize| {
+        FIXUP_BAIL[why].fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let mut pending = line().written.clone();
+    // (list, step, what)
+    let mut plans: Vec<(usize, usize, Plan)> = Vec::new();
     for (l, list) in runs.iter().enumerate() {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
-            match step {
-                &Step::Fill(dst, src, len) if touches(&written, src, src + len) => found.push((l, i, dst, src, len)),
-                // (anything else that would wait still makes the submission wait)
-                _ => {}
+        let seen: Vec<(usize, Seen)> = list
+            .deferred()
+            .copies
+            .iter()
+            .enumerate()
+            .filter_map(|(i, step)| {
+                let seen = match *step {
+                    Step::Fill(dst, src, len) => Seen::Fill(dst, src, len),
+                    Step::Copy(dst, src, len) => Seen::Copy(dst, src, len),
+                    Step::Texture(ref staging) => {
+                        let (at, len) = staging.memory();
+                        Seen::Other(at, at + len)
+                    }
+                    // The title's memory-to-memory copies: copies too.
+                    Step::Run(_, Some((dst, src, len))) if known_writes() => Seen::Copy(dst, src, len),
+                    Step::Run(..) => Seen::Unknown,
+                    _ => return None,
+                };
+                Some((i, seen))
+            })
+            .collect();
+        for (i, seen) in seen {
+            match seen {
+                Seen::Fill(dst, src, len) => {
+                    if !touches(&pending, src, src + len) {
+                        continue;
+                    }
+                    let Some(shadow) = crate::shadow::find(src as u64, len as u64).filter(|s| s.left(src as u64) >= len as u64)
+                    else {
+                        return bail(0);
+                    };
+                    let Some((to, at)) = list.scratch_place(dst) else {
+                        return bail(1);
+                    };
+                    plans.push((l, i, Plan::Fill(shadow, to, at, src, len)));
+                }
+                Seen::Copy(dst, src, len) => {
+                    if !touches(&pending, src, src + len) && !touches(&pending, dst, dst + len) {
+                        continue;
+                    }
+                    let found = |at: usize| crate::shadow::find(at as u64, len as u64).filter(|s| s.left(at as u64) >= len as u64);
+                    let (Some(from), Some(to)) = (found(src), found(dst)) else {
+                        return bail(0);
+                    };
+                    plans.push((l, i, Plan::Copy(from, to, dst, src, len)));
+                    join_ranges(&mut pending, [(src, src + len), (dst, dst + len)]);
+                }
+                Seen::Other(a, b) => {
+                    if touches(&pending, a, b) {
+                        return bail(2);
+                    }
+                }
+                // (it makes the submission wait whatever it touches)
+                Seen::Unknown => return bail(3),
             }
         }
     }
-    let mut fixes = Vec::with_capacity(found.len());
-    for &(l, i, dst, src, len) in &found {
-        let Some(shadow) = crate::shadow::find(src as u64, len as u64) else {
-            return false;
-        };
-        if shadow.left(src as u64) < len as u64 {
-            return false;
-        }
-        let Some((to, at)) = runs[l].scratch_place(dst) else {
-            return false;
-        };
-        fixes.push((l, i, to, at, shadow, src, len));
-    }
-    for (l, i, to, at, shadow, src, len) in fixes {
+    for (l, i, plan) in plans {
         let list = runs[l];
-        {
-            let mut deferred = list.deferred();
-            deferred.copies[i] = Step::Host(Box::new(|| {}));
-            // Brought up to date as a card fill's source, last.
-            deferred.copies.push(Step::Refresh(shadow.clone(), src, len));
+        list.deferred().copies[i] = Step::Host(Box::new(|| {}));
+        match plan {
+            Plan::Fill(shadow, to, at, src, len) => {
+                // Brought up to date as a card fill's source.
+                shadow.refresh(list, src as u64, len as u64);
+                list.fixups.lock().unwrap_or_else(|e| e.into_inner()).push(Fixup {
+                    to,
+                    at,
+                    from: shadow.buffer.clone(),
+                    from_at: shadow.offset(src as u64),
+                    len: len as u64,
+                    card: false,
+                });
+                FIXUP_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            Plan::Copy(from, to, dst, src, len) => {
+                // As `crate::cardcopy::try_copy`: both ends up to date with
+                // the title's bytes (where flights write them, the refresh
+                // leaves their bytes alone), the destination written by the
+                // card.
+                from.refresh(list, src as u64, len as u64);
+                to.refresh(list, dst as u64, len as u64);
+                to.gpu_writes(list, dst as u64, len as u64, crate::shadow::Declarer::View);
+                crate::extent::card_wrote(dst, len);
+                list.fixups.lock().unwrap_or_else(|e| e.into_inner()).push(Fixup {
+                    to: to.buffer.clone(),
+                    at: to.offset(dst as u64),
+                    from: from.buffer.clone(),
+                    from_at: from.offset(src as u64),
+                    len: len as u64,
+                    card: true,
+                });
+                FIXUP_STATS[2].fetch_add(1, Ordering::Relaxed);
+            }
         }
-        list.fixups.lock().unwrap_or_else(|e| e.into_inner()).push((
-            to,
-            at,
-            shadow.buffer.clone(),
-            shadow.offset(src as u64),
-            len as u64,
-        ));
-        FIXUP_STATS[0].fetch_add(1, Ordering::Relaxed);
     }
-    FIXUP_STATS[1].fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -2708,16 +2858,22 @@ fn note_read_flight(list: &HostList, step: usize, what: &str, lo: usize, hi: usi
 /// For the frame-rate line: [`READ_FLIGHT`] and [`FIXUP_STATS`].
 pub(crate) fn read_flight_line(frames: f64) {
     let [after, before, unknown] = [0, 1, 2].map(|i| READ_FLIGHT[i].swap(0, Ordering::Relaxed) as f64 / frames);
-    let [fixed, spared] = [0, 1].map(|i| FIXUP_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [fixed, spared, copies] = [0, 1, 2].map(|i| FIXUP_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let bail = FIXUP_BAIL.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+    let stale = FIXUP_STALE.swap(0, Ordering::Relaxed) as f64 / frames;
     tracing::info!(
         "reads that waited for flights per frame: {after:.1} whose flight was sent after the read was recorded, \
-         {before:.1} before, {unknown:.1} being landed; fills sent to the card at submission {fixed:.1}, waits spared \
-         {spared:.1} (VICTORY_READ_FIXUP)"
+         {before:.1} before, {unknown:.1} being landed; fills sent to the card at submission {fixed:.1}, title copies \
+         {copies:.1}, waits spared {spared:.1}; waited all the same: no host copy {:.1}, no upload place {:.1}, \
+         texture {:.1}, run of unknown reach {:.1}, still blocked {:.1}; spared, then waited for stale \
+         refreshes {stale:.1} (VICTORY_READ_FIXUP)",
+        bail[0], bail[1], bail[2], bail[3], bail[4]
     );
     if crate::cardcopy::fills_check_on() {
         let [fills, bytes] = [0, 1].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
-            "CPU fills per frame of what an earlier list of the same submission may write on the card: {fills:.1},              {bytes:.0} bytes (they read the bytes from before)"
+            "CPU fills per frame of what an earlier list of the same submission may write on the card: {fills:.1}, \
+             {bytes:.0} bytes (they read the bytes from before)"
         );
     }
 }
@@ -5597,12 +5753,20 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Spared a wait by [`fix_up_reads`] (for [`FIXUP_STALE`]).
+        let fixed_up = std::cell::Cell::new(false);
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs)
             && !(why == WHY_READ && read_fixup() && fix_up_reads(runs) && {
                 let written = line().written.clone();
-                blocked_by(&written, runs, false).is_none()
+                let clear = blocked_by(&written, runs, false).is_none();
+                FIXUP_STATS[1].fetch_add(u64::from(clear), Ordering::Relaxed);
+                if !clear {
+                    note_still_blocked(&written, runs);
+                }
+                fixed_up.set(clear);
+                clear
             })
         {
             if relay_exact() && why == WHY_READ {
@@ -5678,12 +5842,14 @@ impl Host {
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
             if behind && stale_under_flights(runs) {
+                FIXUP_STALE.fetch_add(u64::from(fixed_up.get()), Ordering::Relaxed);
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
+            FIXUP_STALE.fetch_add(u64::from(fixed_up.get()), Ordering::Relaxed);
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -6555,9 +6721,9 @@ impl HostList {
         // copies, behind the flights on the queue, into the upload memory
         // the list's views show, which is then readable again.
         let mut fixed: Vec<&ID3D12Resource> = Vec::new();
-        for (to, ..) in &fixups {
-            if !fixed.contains(&to) {
-                fixed.push(to);
+        for f in fixups.iter().filter(|f| !f.card) {
+            if !fixed.contains(&&f.to) {
+                fixed.push(&f.to);
             }
         }
         let readable: Vec<_> = fixed
@@ -6585,8 +6751,17 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
-                for (to, at, from, from_at, len) in &fixups {
-                    list.CopyBufferRegion(to, *at, from, *from_at, *len);
+                // In the steps' order; a title copy waited for on both
+                // sides (the host copies' other users, the reads after it).
+                let wait = [crate::cardcopy::uav_barrier()];
+                for f in &fixups {
+                    if f.card {
+                        list.ResourceBarrier(&wait);
+                    }
+                    list.CopyBufferRegion(&f.to, f.at, &f.from, f.from_at, f.len);
+                    if f.card {
+                        list.ResourceBarrier(&wait);
+                    }
                 }
                 if !readable.is_empty() {
                     list.ResourceBarrier(&readable);

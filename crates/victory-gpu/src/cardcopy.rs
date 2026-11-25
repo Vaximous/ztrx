@@ -157,7 +157,7 @@ struct Compared {
 
 static COMPARED: Mutex<Vec<Compared>> = Mutex::new(Vec::new());
 
-fn uav_barrier() -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
     use windows::Win32::Graphics::Direct3D12::*;
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

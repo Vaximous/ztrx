@@ -306,28 +306,114 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// newer sent; the next send ends that idle stretch.
 static CARD_CLOCK_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// The steps of the thread that holds the submission lock, for the card's
+/// idle time behind it by step ([`work_stage`], [`CARD_IDLE_BY`]).
+const STAGES: usize = 8;
+const STAGE_BEFORE: usize = 0;
+const STAGE_STALE: usize = 1;
+const STAGE_LISTS: usize = 2;
+const STAGE_SNAPSHOTS: usize = 3;
+const STAGE_CARD: usize = 4;
+const STAGE_AFTER: usize = 5;
+const STAGE_REST: usize = 6;
+/// Not work: waiting for flights to be landed ([`relay_wait`]); outside
+/// the card clock's "behind us".
+const STAGE_WAIT: usize = 7;
+const STAGE_NAMES: [&str; STAGES] = [
+    "before preparing (settles, the sweep)",
+    "the stale check and the write-watch asking",
+    "the lists' own steps (title copies, fills, refreshes, preludes)",
+    "snapshots",
+    "copies in the card's memory sent up",
+    "after a waited submission (copying back)",
+    "the rest (sending)",
+    "(not counted above) waiting for flights to be landed",
+];
+
 /// Of the thread that holds the submission lock: the microseconds it has
-/// worked so far (preparing, copying back; not its waits for the card), and
-/// since when it works now ([`now_us`] plus one; 0: it does not).
-static WORKING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// worked so far (preparing, copying back; not its waits for the card) by
+/// step, the step it is at, and since when it works now ([`now_us`] plus
+/// one; 0: it does not).
+struct Work {
+    by: [u64; STAGES],
+    stage: usize,
+    since: u64,
+}
+
+static WORK: Mutex<Work> = Mutex::new(Work {
+    by: [0; STAGES],
+    stage: STAGE_REST,
+    since: 0,
+});
+
+fn work() -> std::sync::MutexGuard<'static, Work> {
+    WORK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Work {
+    /// What was worked since `since` goes to the step it was at.
+    fn flush(&mut self, now: u64) {
+        if self.since != 0 {
+            self.by[self.stage] += now.saturating_sub(self.since);
+            self.since = now;
+        }
+    }
+}
 
 /// The thread that holds the submission lock starts (`on`) or stops
 /// working; whether it worked until now.
 fn working(on: bool) -> bool {
     let now = now_us() + 1;
-    let since = WORKING[1].swap(if on { now } else { 0 }, Ordering::Relaxed);
-    if since != 0 {
-        WORKING[0].fetch_add(now.saturating_sub(since), Ordering::Relaxed);
-    }
-    since != 0
+    let mut work = work();
+    work.flush(now);
+    let was = work.since != 0;
+    work.since = if on { now } else { 0 };
+    was
 }
 
-/// [`WORKING`] as of now: microseconds worked so far.
-fn worked() -> u64 {
-    let since = WORKING[1].load(Ordering::Relaxed);
-    let now = if since != 0 { (now_us() + 1).saturating_sub(since) } else { 0 };
-    WORKING[0].load(Ordering::Relaxed) + now
+/// The thread that holds the submission lock goes on to `stage` (one of
+/// the `STAGE_`s).
+fn work_stage(stage: usize) {
+    let now = now_us() + 1;
+    let mut work = work();
+    work.flush(now);
+    work.stage = stage.min(STAGES - 1);
 }
+
+/// The thread that holds the submission lock waits for flights to be
+/// landed: counted as [`STAGE_WAIT`]; the step it was at, for
+/// [`wait_ends`].
+fn wait_begins() -> usize {
+    let now = now_us() + 1;
+    let mut work = work();
+    work.flush(now);
+    work.since = now;
+    std::mem::replace(&mut work.stage, STAGE_WAIT)
+}
+
+fn wait_ends(stage: usize) {
+    let now = now_us() + 1;
+    let mut work = work();
+    work.flush(now);
+    work.since = 0;
+    work.stage = stage;
+}
+
+/// [`WORK`] as of now: microseconds worked so far, by step.
+fn worked() -> [u64; STAGES] {
+    let now = now_us() + 1;
+    let work = work();
+    let mut by = work.by;
+    if work.since != 0 {
+        by[work.stage] += now.saturating_sub(work.since);
+    }
+    by
+}
+
+/// The card's idle time behind the submitting thread ([`CARD_CLOCK_US`]'s
+/// second) by the step that thread was at (`STAGE_NAMES`), microseconds
+/// since the last frame-rate line.
+static CARD_IDLE_BY: [std::sync::atomic::AtomicU64; STAGES] = [const { std::sync::atomic::AtomicU64::new(0) }; STAGES];
 
 /// The thread that holds the submission lock stood waiting for the card
 /// from `since` until now ([`CARD_CLOCK_US`]).
@@ -340,7 +426,7 @@ struct CardClock {
     fence: ID3D12Fence,
     /// Signals sent so far; and, while the card has reached the last of
     /// them, since when and what [`worked`] said then.
-    state: Mutex<(u64, Option<(std::time::Instant, u64)>)>,
+    state: Mutex<(u64, Option<(std::time::Instant, [u64; STAGES])>)>,
     sent: std::sync::Condvar,
 }
 
@@ -389,6 +475,13 @@ fn card_clock_line(frames: f64, ms: f64) {
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
+    let by: Vec<String> = CARD_IDLE_BY
+        .iter()
+        .zip(STAGE_NAMES)
+        .map(|(us, name)| format!("{name} {:.1}", us.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames))
+        .collect();
+    tracing::info!("the card idle behind us per frame by the submitting thread's step, ms: {}", by.join(", "));
+    cut_line(frames);
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -2514,6 +2607,51 @@ fn late_most() -> usize {
     })
 }
 
+/// Whether a submission sent ahead ([`late`]) may go to the card in parts,
+/// its first list ahead of the rest, so that the card runs it while the
+/// rest is prepared (`VICTORY_EARLY_SEND`): 0 (the default) no; 1 when
+/// the card has nothing of ours to run, or preparing the submission waits
+/// for flights (it stands then); 2 every list on its own (for trying).
+/// Each part is a flight as a submission of the title's own would be;
+/// a part is cut off only if the rest prepared behind it would not wait
+/// for it ([`Host::early_cut`]).
+fn early_send() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_EARLY_SEND").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// [`early_send`]: lists sent ahead of their submission's rest as the card
+/// was idle, as the submission would wait for flights, as every list goes
+/// alone; cuts left undone as the rest would have waited for the list.
+static CUT_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// For the frame-rate line: [`CUT_STATS`] per frame.
+fn cut_line(frames: f64) {
+    if early_send() == 0 {
+        return;
+    }
+    let [idle, blocked, every, refused] = [0, 1, 2, 3].map(|i| CUT_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "lists sent ahead of their submission's rest per frame (VICTORY_EARLY_SEND={}): {idle:.1} as the card was idle, \
+         {blocked:.1} as the submission would wait for flights, {every:.1} each alone; {refused:.1} not, as the rest would wait for them",
+        early_send()
+    );
+}
+
+/// The lists `order` holds (indexes into `lists`, each once) cut after the
+/// `at`th: the first part and the rest, each with its own order. Lists no
+/// order names go with the rest (they are let go when it lands).
+#[allow(clippy::type_complexity)]
+fn cut_flight<T>(lists: Vec<T>, order: &[usize], at: usize) -> ((Vec<T>, Vec<usize>), (Vec<T>, Vec<usize>)) {
+    let mut slots: Vec<Option<T>> = lists.into_iter().map(Some).collect();
+    let first: Vec<T> = order[..at].iter().filter_map(|&i| slots[i].take()).collect();
+    let mut rest: Vec<T> = order[at..].iter().filter_map(|&i| slots[i].take()).collect();
+    let ran = rest.len();
+    rest.extend(slots.into_iter().flatten());
+    let first_order = (0..first.len()).collect();
+    ((first, first_order), (rest, (0..ran).collect()))
+}
+
 /// Whether a submission with bottom-of-pipe writes may fly
 /// (`VICTORY_LATE_WAIT_WRITES=0`: it is settled as soon as it is sent, so
 /// the title is told at once, as before; for telling a title that polls
@@ -3717,12 +3855,14 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
+    let stage = wait_begins();
     let waiting = std::time::Instant::now();
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
     stood(waiting);
+    wait_ends(stage);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
@@ -4388,7 +4528,16 @@ impl Host {
         let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
-            CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
+            let now = worked();
+            let mut behind = 0;
+            for (i, (now, then)) in now.iter().zip(worked_then).enumerate() {
+                let us = now.saturating_sub(then);
+                if i != STAGE_WAIT {
+                    behind += us;
+                }
+                CARD_IDLE_BY[i].fetch_add(us, Ordering::Relaxed);
+            }
+            CARD_CLOCK_US[1].fetch_add(behind, Ordering::Relaxed);
         }
         drop(state);
         clock.sent.notify_one();
@@ -5801,6 +5950,15 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
+        // [`early_send`]: the first list goes on its own while the card
+        // has nothing to do, the rest behind it (cut again if the card is
+        // idle once more by then).
+        if self.early_cut(&lists, &order) {
+            let (first, rest) = cut_flight(lists, &order, 1);
+            self.execute_late(first.0, first.1);
+            self.execute_late(rest.0, rest.1);
+            return;
+        }
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -5851,6 +6009,76 @@ impl Host {
             line().poke = true;
             LINE_MOVED.notify_one();
         }
+    }
+
+    /// Whether the card has run everything of ours sent so far (as the
+    /// card's clock last saw it).
+    fn card_idle(&self) -> bool {
+        let Some(clock) = self.card_clock() else {
+            return false;
+        };
+        let state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 == 0 || state.1.is_some()
+    }
+
+    /// [`early_send`]: whether the first of a submission's lists (`order`
+    /// into `lists`) goes to the card as a flight of its own ahead of the
+    /// rest. Only when the card would stand while the rest is prepared
+    /// (it is idle now, or preparing the submission waits for flights),
+    /// and only when the rest prepared behind it would not wait for it:
+    /// no step of the rest reads, copies over or refreshes a range the
+    /// first list's shaders may write, and the first list tells the title
+    /// nothing at its bottom of pipe that would settle it at once.
+    fn early_cut(&self, lists: &[crate::list::Detached], order: &[usize]) -> bool {
+        let mode = early_send();
+        if mode == 0 || order.len() < 2 || order.iter().any(|&i| i >= lists.len()) {
+            return false;
+        }
+        let mut seen = order.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != order.len() {
+            return false;
+        }
+        let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+        let why = if mode >= 2 {
+            2
+        } else if self.card_idle() {
+            0
+        } else {
+            let written = line().written.clone();
+            if blocked_by(&written, &runs, false).is_none() {
+                return false;
+            }
+            1
+        };
+        let (first, rest) = (runs[0], &runs[1..]);
+        let mut written = Vec::new();
+        let tells = {
+            let deferred = first.deferred();
+            join_ranges(
+                &mut written,
+                deferred.copies.iter().filter_map(|step| match step {
+                    Step::GpuWrite(_, address, len) => Some((*address, *address + *len)),
+                    _ => None,
+                }),
+            );
+            !deferred.writes.is_empty()
+        };
+        let reaches = (tells && !late_writes())
+            || blocked_by(&written, rest, false).is_some()
+            || rest.iter().any(|list| {
+                list.deferred()
+                    .copies
+                    .iter()
+                    .any(|step| matches!(step, Step::Refresh(_, address, len) if touches(&written, *address, *address + *len)))
+            });
+        if reaches {
+            CUT_STATS[3].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        CUT_STATS[why].fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -6049,6 +6277,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = lock_submitted(self);
         let was_working = working(true);
+        work_stage(STAGE_BEFORE);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6119,6 +6348,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        work_stage(STAGE_STALE);
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6157,6 +6387,7 @@ impl Host {
         if crate::cardcopy::fills_check_on() {
             count_cross_list(runs);
         }
+        work_stage(STAGE_LISTS);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6170,6 +6401,7 @@ impl Host {
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
+        work_stage(STAGE_SNAPSHOTS);
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
@@ -6181,7 +6413,9 @@ impl Host {
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
+        work_stage(STAGE_CARD);
         let mut card = self.card_before(runs, flown);
+        work_stage(STAGE_REST);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -6344,6 +6578,7 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
+        work_stage(STAGE_AFTER);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -6382,6 +6617,7 @@ impl Host {
             }
         }
         self.log_messages();
+        work_stage(STAGE_REST);
         submitting(0, 0);
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
@@ -9246,6 +9482,23 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod cut_flight {
+    /// A submission cut for [`super::early_send`]: the first part holds the
+    /// lists its order names first, in that order; the rest the others in
+    /// theirs, then the lists no order names (let go with it).
+    #[test]
+    fn parts_keep_their_order_and_unnamed_lists_go_with_the_rest() {
+        let lists = vec!['a', 'b', 'c', 'd', 'e'];
+        let ((first, first_order), (rest, rest_order)) = super::cut_flight(lists, &[3, 0, 4, 1], 1);
+        assert_eq!((first, first_order), (vec!['d'], vec![0]));
+        assert_eq!(rest, vec!['a', 'e', 'b', 'c']);
+        assert_eq!(rest_order, vec![0, 1, 2]);
+        let ((first, first_order), (rest, rest_order)) = super::cut_flight(vec![1, 2, 3], &[0, 1, 2], 2);
+        assert_eq!((first, first_order, rest, rest_order), (vec![1, 2], vec![0, 1], vec![3], vec![0]));
     }
 }
 

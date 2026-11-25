@@ -149,6 +149,103 @@ pub(crate) fn mode() -> u8 {
 type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
+/// `VICTORY_COPY_DIFF=1`: each refresh of a host copy also compares the
+/// title's bytes with the copy's before it copies them, to count the bytes
+/// that changed (in 64-byte lines) against the bytes copied.
+pub(crate) fn diff_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COPY_DIFF").is_ok_and(|v| v == "1"))
+}
+
+/// Per host copy (start, length, window): refreshes, bytes asked, bytes
+/// copied, 64-byte lines that changed (with [`diff_on`]), microseconds
+/// asking write watching, microseconds copying.
+type Refreshes = HashMap<(u64, u64, bool), [u64; 6]>;
+static REFRESHES: Mutex<Option<Refreshes>> = Mutex::new(None);
+
+/// A refresh of the host copy (start, length, `window`: a window
+/// outside buffers): `asked` bytes asked for, `copied` copied, `changed`
+/// 64-byte lines that differed, `watch_us` asking write watching, `copy_us`
+/// copying.
+pub(crate) fn refresh(copy: (u64, u64, bool), [asked, copied, changed, watch_us, copy_us]: [u64; 5]) {
+    let mut map = REFRESHES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry(copy).or_insert([0; 6]);
+    for (at, v) in e.iter_mut().zip([1, asked, copied, changed, watch_us, copy_us]) {
+        *at += v;
+    }
+}
+
+/// The refresh lines: by kind and size of copy, and the copies that copied
+/// most.
+fn log_refreshes(frames: f64) {
+    let map = REFRESHES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if map.is_empty() {
+        return;
+    }
+    const CLASSES: [&str; 5] = ["under 64 KiB", "64 KiB-1 MiB", "1-16 MiB", "16-64 MiB", "64 MiB and over"];
+    let class = |len: u64| match len {
+        0..0x1_0000 => 0,
+        0x1_0000..0x10_0000 => 1,
+        0x10_0000..0x100_0000 => 2,
+        0x100_0000..0x400_0000 => 3,
+        _ => 4,
+    };
+    let mut by: std::collections::BTreeMap<(bool, usize), ([u64; 6], u64)> = std::collections::BTreeMap::new();
+    for (&(_, len, window), v) in &map {
+        let e = by.entry((window, class(len))).or_insert(([0; 6], 0));
+        for (a, b) in e.0.iter_mut().zip(v) {
+            *a += b;
+        }
+        e.1 += 1;
+    }
+    let mb = |b: u64| b as f64 / 1e6 / frames;
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    let diff = if diff_on() { "" } else { " (changed not measured: VICTORY_COPY_DIFF=1)" };
+    let all = map.values().fold([0u64; 6], |mut a, v| {
+        for (x, y) in a.iter_mut().zip(v) {
+            *x += y;
+        }
+        a
+    });
+    tracing::info!(
+        "refreshes of host copies per frame: {:.0} in {} copies; {:.1} MB asked, {:.1} MB copied, {:.1} MB of it changed in 64-byte lines{diff};          {:.2} ms asking write watching, {:.2} ms copying",
+        all[0] as f64 / frames,
+        map.len(),
+        mb(all[1]),
+        mb(all[2]),
+        mb(all[3] * 64),
+        ms(all[4]),
+        ms(all[5])
+    );
+    for ((window, c), (v, copies)) in by {
+        tracing::info!(
+            "  refreshes of {} {}: {copies} copies, {:.0} refreshes, {:.1} MB asked, {:.1} MB copied, {:.1} MB changed, {:.2} ms asking, {:.2} ms copying",
+            if window { "windows" } else { "title buffers" },
+            CLASSES[c],
+            v[0] as f64 / frames,
+            mb(v[1]),
+            mb(v[2]),
+            mb(v[3] * 64),
+            ms(v[4]),
+            ms(v[5])
+        );
+    }
+    let mut top: Vec<_> = map.into_iter().collect();
+    top.sort_by_key(|(_, v)| std::cmp::Reverse(v[2]));
+    for ((start, len, window), v) in top.into_iter().take(20) {
+        tracing::info!(
+            "  refreshed {start:#x}+{len:#x} ({}): {:.1}x, {:.2} MB asked, {:.2} MB copied, {:.2} MB changed, {:.2} ms asking, {:.2} ms copying",
+            if window { "window" } else { "title buffer" },
+            v[0] as f64 / frames,
+            mb(v[1]),
+            mb(v[2]),
+            mb(v[3] * 64),
+            ms(v[4]),
+            ms(v[5])
+        );
+    }
+}
+
 /// Per range copied whole because its memory is not watched (start,
 /// length): copies and microseconds.
 static WHOLE: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
@@ -1283,6 +1380,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
     log_memory();
+    log_refreshes(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

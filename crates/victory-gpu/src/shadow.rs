@@ -2607,7 +2607,11 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
+                #[cfg(feature = "diagnostics")]
+                let (watch_us, copying) = (asking.elapsed().as_micros() as u64, std::time::Instant::now());
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
@@ -2615,6 +2619,11 @@ impl Shadow {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    let changed = COPY_CHANGED.take();
+                    crate::copystat::refresh(
+                        (self.start, self.len, self.window),
+                        [(to - from) as u64, copied as u64, changed, watch_us, copying.elapsed().as_micros() as u64],
+                    );
                 }
                 return copied;
             }
@@ -2673,6 +2682,10 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::diff_on() {
+            COPY_CHANGED.set(COPY_CHANGED.get() + changed_lines(at, from, to - from));
+        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -2983,6 +2996,32 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// `VICTORY_COPY_DIFF`: 64-byte lines that differed in this thread's
+    /// copies since the refresh began.
+    static COPY_CHANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `VICTORY_COPY_DIFF`: of `len` bytes of title memory at `src`, the 64-byte
+/// lines (counted from `src`) whose bytes differ from the copy's at `held`.
+/// The title's bytes are read the way a refresh reads them, into a buffer of
+/// this thread's own.
+#[cfg(feature = "diagnostics")]
+fn changed_lines(held: *const u8, src: usize, len: usize) -> u64 {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with_borrow_mut(|scratch| {
+        scratch.clear();
+        scratch.resize(len, 0);
+        crate::host::copy_mapped(scratch.as_mut_ptr(), src as *const u8, len, false);
+        // SAFETY: `len` bytes of the copy's mapping, read only.
+        let held = unsafe { std::slice::from_raw_parts(held, len) };
+        scratch.chunks(64).zip(held.chunks(64)).filter(|(a, b)| a != b).count() as u64
+    })
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,

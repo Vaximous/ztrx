@@ -414,6 +414,10 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Guarded blocks a landing's [`Window`] holds writable, and the other
+    /// views of their pages (a count of windows each): written as long as
+    /// it stands, so never noted clean ([`guard`]).
+    windowed: BTreeMap<usize, u32>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -421,6 +425,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: Bits(BTreeMap::new()),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    windowed: BTreeMap::new(),
 });
 
 /// A set of block numbers, a bit each, in chunks of 16 GB of address
@@ -598,8 +603,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.set(block, true);
+                // Written through the runtime, still read-only; or held
+                // writable by a landing, which may write it (and the title
+                // with it, without a fault) until it ends: not clean then.
+                if !g.windowed.contains_key(&block) {
+                    g.clean.set(block, true);
+                }
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1128,20 +1137,40 @@ struct Window {
     seen: BTreeSet<usize>,
     /// Blocks made writable, still guarded.
     opened: BTreeSet<usize>,
+    /// Blocks in [`Guards::windowed`] for this window: `opened` and the
+    /// other views of their pages.
+    held: BTreeSet<usize>,
 }
 
 impl Window {
     /// [`writing`] of `[start, end)` within the window: its guarded blocks
-    /// made writable, once each, and left guarded (and clean if so).
+    /// made writable, once each, and left guarded, but not clean until the
+    /// window closes: a copy refreshed meanwhile (on the submitting thread,
+    /// beside the landing) takes them again, with what the landing wrote,
+    /// what the title wrote there without a fault, and the same pages at
+    /// their other views. Left clean, such a copy kept its old bytes for
+    /// that submission (the journal says they were written only at
+    /// [`Window::close`]).
     fn open(&mut self, start: usize, end: usize) {
         use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
         let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
         if first >= last || self.seen.range(first..last).count() == last - first {
             return;
         }
-        let g = guards();
+        let mut g = guards();
         let blocks: Vec<usize> =
             g.protected.range(first..last).copied().filter(|b| !self.opened.contains(b)).collect();
+        let aliased: Vec<usize> = blocks.iter().copied().filter(|b| g.aliased.contains(b)).collect();
+        let mut held: Vec<usize> = blocks.clone();
+        if !aliased.is_empty() {
+            held.extend(crate::inplace::pages_of_blocks(&aliased).into_iter().map(|a| a / BLOCK));
+        }
+        for block in held {
+            if self.held.insert(block) {
+                *g.windowed.entry(block).or_insert(0) += 1;
+                g.clean.set(block, false);
+            }
+        }
         for run in blocks.chunk_by(|a, b| a + 1 == *b) {
             let mut old = 0;
             // SAFETY: blocks we made read-only.
@@ -1173,6 +1202,14 @@ impl Window {
         let mut written = opened.clone();
         {
             let mut g = guards();
+            for block in &self.held {
+                if let Some(n) = g.windowed.get_mut(block) {
+                    *n -= 1;
+                    if *n == 0 {
+                        g.windowed.remove(block);
+                    }
+                }
+            }
             let still: Vec<usize> = opened.iter().copied().filter(|b| g.protected.contains(b)).collect();
             for run in still.chunk_by(|a, b| a + 1 == *b) {
                 let mut old = 0;
@@ -1910,6 +1947,42 @@ mod tests {
         drop_views(section, &[one, two], SIZE);
         // The journal forgets nothing: memory allocated there by the next
         // test would start out written.
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for view in [one, two] {
+            let pages: Vec<usize> = j.written.range(view / PAGE..(view + SIZE) / PAGE).map(|(&p, _)| p).collect();
+            for page in pages {
+                j.written.remove(&page);
+            }
+        }
+    }
+
+    /// While a landing stands, the blocks it holds writable and the same
+    /// pages at their other view are reported written at every check (a
+    /// copy refreshed beside the landing takes them again); the block beside
+    /// them is not.
+    #[test]
+    fn a_landings_blocks_are_not_clean_while_it_stands() {
+        let _serial = serial();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let page = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert!(guard(one, one + SIZE).is_some());
+        assert!(guard(two, two + SIZE).is_some());
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "nothing written yet");
+        {
+            let _landing = landing_writes();
+            writing(one + BLOCK + 8, 4);
+            for _ in 0..2 {
+                assert_eq!(guard(one, one + SIZE), Some(vec![page(one, 1)]));
+                assert_eq!(guard(two, two + SIZE), Some(vec![page(two, 1)]), "the other view");
+            }
+        }
+        assert!(!writable(one + BLOCK), "read-only again");
+        assert!(guard(one, one + SIZE).is_some());
+        assert!(guard(two, two + SIZE).is_some());
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "clean again once taken");
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        drop_views(section, &[one, two], SIZE);
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
         for view in [one, two] {
             let pages: Vec<usize> = j.written.range(view / PAGE..(view + SIZE) / PAGE).map(|(&p, _)| p).collect();

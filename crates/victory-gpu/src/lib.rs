@@ -66,6 +66,8 @@ mod lazy;
 mod shadow;
 #[cfg(windows)]
 mod skip;
+#[cfg(windows)]
+mod hot;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

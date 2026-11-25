@@ -8155,6 +8155,15 @@ impl Meter {
                 per_frame(4),
                 per_frame(5)
             );
+            {
+                let phases = crate::draw::take_bind_phases();
+                let text: Vec<String> = crate::draw::BIND_PHASES
+                    .iter()
+                    .zip(phases)
+                    .map(|(name, ns)| format!("{name} {:.1}", ns as f64 / 1e6 / bind_frames))
+                    .collect();
+                tracing::info!("binds' time per frame by phase, ms (all threads): {}", text.join(", "));
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

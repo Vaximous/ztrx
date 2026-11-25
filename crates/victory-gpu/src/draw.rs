@@ -565,6 +565,60 @@ pub(crate) fn bind_cache() -> bool {
 /// reuse did not decode again. For the per-frame line ([`take_bind_stats`]).
 pub(crate) static BIND_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Nanoseconds of the binds by phase, since the last frame-rate line
+/// ([`take_bind_phases`]); [`BIND_PHASES`] names them. The last three
+/// are inside others: the views made readable (refreshes, declared
+/// writes, texture uploads and states), the constant buffers filled (on
+/// the card or the CPU), and `crate::shadow::find` (all its callers).
+pub(crate) static BIND_PHASE_NS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+/// [`BIND_PHASE_NS`]'s phases.
+pub(crate) const BIND_PHASES: [&str; 12] = [
+    "heaps, root signature, pipeline",
+    "store extents",
+    "descriptor tables",
+    "title memory by address",
+    "root constants",
+    "root CBVs and SRVs",
+    "root UAVs",
+    "depth twins",
+    "card fills recorded at the end",
+    "views made readable",
+    "constant buffers filled",
+    "host copies looked up",
+];
+
+/// [`BIND_PHASE_NS`] since the last call.
+pub(crate) fn take_bind_phases() -> [u64; 12] {
+    std::array::from_fn(|i| BIND_PHASE_NS[i].swap(0, Ordering::Relaxed))
+}
+
+/// Adds the time since the last lap to a bind phase ([`BIND_PHASE_NS`]).
+struct Lap(std::time::Instant);
+
+impl Lap {
+    fn at(&mut self, phase: usize) {
+        let now = std::time::Instant::now();
+        BIND_PHASE_NS[phase].fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed);
+        self.0 = now;
+    }
+}
+
+/// Adds its lifetime to a bind phase ([`BIND_PHASE_NS`]) when dropped.
+pub(crate) struct PhaseTimer(usize, std::time::Instant);
+
+impl PhaseTimer {
+    pub(crate) fn new(phase: usize) -> Self {
+        PhaseTimer(phase, std::time::Instant::now())
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        BIND_PHASE_NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 /// [`BIND_STATS`] since the last call.
 pub(crate) fn take_bind_stats() -> [u64; 6] {
     std::array::from_fn(|i| BIND_STATS[i].swap(0, Ordering::Relaxed))
@@ -687,10 +741,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    let _timer = PhaseTimer::new(10);
     crate::skip::note_constant(list, address, len);
     if let Some(gpu) = crate::cardcopy::try_fill(list, address, len) {
+        crate::hot::note_constant(address, len, true);
         return Some(gpu);
     }
+    crate::hot::note_constant(address, len, false);
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -1249,10 +1306,18 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let start = std::time::Instant::now();
+        let mut inner = std::time::Duration::ZERO;
         // (its fills on the card recorded together at its end)
-        let bound = crate::cardcopy::batched(list, || self.bind_all(list, p, compute));
+        let bound = crate::cardcopy::batched(list, || {
+            let start = std::time::Instant::now();
+            let bound = self.bind_all(list, p, compute);
+            inner = start.elapsed();
+            bound
+        });
+        let all = start.elapsed();
+        BIND_PHASE_NS[8].fetch_add(all.saturating_sub(inner).as_nanos() as u64, Ordering::Relaxed);
         BIND_STATS[0].fetch_add(1, Ordering::Relaxed);
-        BIND_STATS[1].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        BIND_STATS[1].fetch_add(all.as_micros() as u64, Ordering::Relaxed);
         bound
     }
 
@@ -1299,6 +1364,7 @@ impl State {
     /// [`Self::bind`].
     fn bind_all(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let mut lap = Lap(std::time::Instant::now());
         #[cfg(feature = "diagnostics")]
         crate::meshprobe::binding(if compute {
             p.stages.first().map_or(0, |s| u64::from_str_radix(s.shader.hash.get(..16).unwrap_or(""), 16).unwrap_or(0))
@@ -1352,6 +1418,7 @@ impl State {
             list.keep(&p.root);
         }
         self.stores = p.stages.iter().any(|stage| stage.translated().stores);
+        lap.at(0);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1371,7 +1438,9 @@ impl State {
                 }
                 EXTENT.with_borrow_mut(|x| *x = Some((e.clone(), ranges)));
             }
+            lap.at(1);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            lap.at(2);
             STORES.set(true);
             BOUNDED.set(false);
             EXTENT.with_borrow_mut(|x| *x = None);
@@ -1394,6 +1463,7 @@ impl State {
             } else {
                 None
             };
+            lap.at(3);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -1412,6 +1482,7 @@ impl State {
                 }
                 self.set_root_constants(list, compute, param, &values);
             }
+            lap.at(4);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1469,6 +1540,7 @@ impl State {
                     self.set_root_view(list, compute, u8::from(srv), param, gpu);
                 }
             }
+            lap.at(5);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -1489,10 +1561,12 @@ impl State {
                     return false;
                 }
             }
+            lap.at(6);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        lap.at(7);
         true
     }
 
@@ -2161,7 +2235,14 @@ impl State {
             crate::skip::start();
         }
         GROUPS.set(Some([x, y, z]));
+        let hot = p.stages.first().filter(|s| crate::hot::wanted(&s.shader.hash));
+        if hot.is_some() {
+            crate::hot::start();
+        }
         let mut bound = self.bind(list, p, true);
+        if let Some(stage) = hot {
+            crate::hot::finish(&stage.shader, Some([x, y, z]));
+        }
         let collected = crate::skip::take();
         let views = CHECK_VIEWS.with_borrow_mut(Option::take).unwrap_or_default();
         // Checked: the views' bytes hashed before and after, around the
@@ -2557,14 +2638,17 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        let _timer = PhaseTimer::new(10);
                         crate::skip::note_constant(list, address, u64::from(size));
                         constants.push((address, u64::from(size)));
                         if let Some(gpu) = constant_in_card_copy(list, address, size)
                             .or_else(|| crate::cardcopy::try_fill(list, address, u64::from(size)))
                         {
+                            crate::hot::note_constant(address, u64::from(size), true);
                             host.constant_at(index, gpu, size);
                             continue;
                         }
+                        crate::hot::note_constant(address, u64::from(size), false);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -3261,6 +3345,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 /// `at`: the table entry the view is at (root slot, dword in the table).
 fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u32)>) {
+    let _timer = PhaseTimer::new(9);
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);

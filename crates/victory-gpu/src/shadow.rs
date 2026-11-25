@@ -1862,6 +1862,11 @@ impl Shadow {
         self.start
     }
 
+    /// The title bytes the copy holds.
+    pub(crate) fn title_len(&self) -> u64 {
+        self.len
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -3001,6 +3006,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let _timer = crate::draw::PhaseTimer::new(11);
     lookup(address, len, false)
 }
 

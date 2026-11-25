@@ -224,10 +224,13 @@ pub(crate) fn landed() {
 /// the card: where a flight in the air declared that memory written (a
 /// table view of 174 MB declared whole for an append buffer, run fxprod2),
 /// the submission waits for the flight to land, about twice a frame, 30-90
-/// ms each. When the memory has a copy in the card's memory, the card can
-/// take the constants from there itself, in the list's order, after the
-/// flight on the one host queue: a copy into a stand-in of the list's own
-/// that the view shows instead. No CPU step is left to wait.
+/// ms each. When the memory has a host copy, the card can take the
+/// constants from there itself, in the list's order, after the flight on
+/// the one host queue: a copy into a stand-in of the list's own that the
+/// view shows instead. No CPU step is left to wait. Any host copy will do,
+/// in the card's memory or the PC's: with [`on`] the fills that wait read
+/// the small destinations of title buffer copies done on the card (run
+/// zl3cc: 3.8 a frame, 97 ms), which are copies in the PC's memory.
 ///
 /// Which fills: those whose source once made a submission wait
 /// ([`fill_blocked`]).
@@ -287,7 +290,7 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
         return None;
     }
     let from = crate::shadow::find(src, len)?;
-    if !from.carded() || from.left(src) < len {
+    if from.left(src) < len {
         return None;
     }
     let (stand_in, at, first) = list.card_scratch(len)?;

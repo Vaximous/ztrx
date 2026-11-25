@@ -4762,6 +4762,9 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The landing's writes into guarded title memory, guarded again at
+        // its end (`crate::watch::landing_writes`).
+        let _window = crate::watch::landing_writes();
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -7025,6 +7028,17 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// Whether title memory is written with a plain copy that a fault stops
+/// (`crate::guarded::write`), not through the kernel: the kernel's write
+/// was 15.6% of the copy-back thread (run zall6p), and it was held under
+/// the copy's lock the submitting thread waits for in
+/// `Shadow::merge_under_writes`. `VICTORY_USER_WRITES=0` writes through the
+/// kernel, as before.
+fn user_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_USER_WRITES").is_none_or(|v| v != "0") && crate::guarded::on())
+}
+
 /// Whether title memory is written with the kernel's own call
 /// (`NtWriteVirtualMemory`) and not `WriteProcessMemory`, which first asks
 /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
@@ -7043,9 +7057,15 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    let user = user_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
+        if user {
+            // SAFETY: the source is our host copy; a destination page that
+            // does not take the bytes stops the write (`crate::guarded`).
+            return unsafe { crate::guarded::write(at as *mut u8, from, n) };
+        }
         if direct {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:

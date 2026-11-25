@@ -818,11 +818,21 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         note(g, from, to);
         return;
     }
-    for block in from..to {
+    // Block by block, but a hole whole: one question, no failing call per
+    // block of it.
+    let mut block = from;
+    while block < to {
         if set(block, block + 1) {
             note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+            block += 1;
+            continue;
+        }
+        let hole = uncommitted_end(block).min(to);
+        if hole > block {
+            g.absent.extend(block..hole);
+            block = hole;
+        } else {
+            block += 1;
         }
     }
 }
@@ -918,23 +928,67 @@ fn holes_per_frame() -> bool {
     !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_PER_FRAME").is_none_or(|v| v != "0"))
 }
 
-/// Bumped when the runtime commits or maps title memory: [`holes_per_frame`]'s
-/// answers stand while it and the frame are the same.
+/// Bumped when the runtime commits or maps title memory: an answer
+/// [`holes_per_frame`] asked of Windows meanwhile is not kept (it may be
+/// from before).
 static COMMIT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The runtime committed title memory `[at, at + len)` (pages of a view it
 /// mapped): what was said of holes there is asked again.
 pub fn title_memory_committed(at: usize, len: usize) {
-    let _ = (at, len);
-    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    forget_holes(at, len);
 }
 
-/// [`holes_per_frame`]'s answers, as [`QUERIED`]'s, by (commit epoch, frame).
+/// What [`holes_per_frame`] was told of `[at, at + len)` is asked again.
+/// Only there: the runtime maps and unmaps views of the title's streamed
+/// memory all frame long (a view per GPU page mapping), and each forgot
+/// every hole of the frame, so the refreshes asked Windows anew: VirtualQuery
+/// under `watch::writes` stayed 9.2% of the submitting thread with the
+/// answers kept per frame (run zall6p). `VICTORY_HOLES_FORGET_ALL=1`
+/// forgets all of them, as before.
+fn forget_holes(at: usize, len: usize) {
+    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_HOLES_FORGET_ALL").is_some_and(|v| v == "1"));
+    let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = q.1.as_mut() else {
+        return;
+    };
+    if all {
+        m.clear();
+        return;
+    }
+    forget_runs(m, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+}
+
+/// Takes out of `m` (runs by first block, to their end; an empty run is a
+/// committed block) those that meet blocks `[from, to)`.
+fn forget_runs(m: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let mut gone: Vec<usize> = m.range(from..to).map(|(&k, _)| k).collect();
+    // Runs from before `from` reaching into it. The runs told in one frame
+    // are of the same holes, so they end in order: the first one found
+    // ending before `from` ends the search.
+    for (&k, &end) in m.range(..from).rev() {
+        if end <= from {
+            break;
+        }
+        gone.push(k);
+    }
+    for k in gone {
+        m.remove(&k);
+    }
+}
+
+/// [`holes_per_frame`]'s answers, as [`QUERIED`]'s, by frame.
 #[allow(clippy::type_complexity)]
-static QUERIED_FRAME: Mutex<((u64, u64), Option<BTreeMap<usize, usize>>)> = Mutex::new(((0, 0), None));
+static QUERIED_FRAME: Mutex<(u64, Option<BTreeMap<usize, usize>>)> = Mutex::new((0, None));
 
 fn uncommitted_end_framed(block: usize) -> usize {
-    let key = (COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire), crate::queue::presented());
+    let key = crate::queue::presented();
+    let epoch = COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     {
         let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
         if q.0 != key {
@@ -953,7 +1007,9 @@ fn uncommitted_end_framed(block: usize) -> usize {
     }
     let end = uncommitted_end_now(block);
     let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    if q.0 == key {
+    // Not kept if the runtime committed or mapped anything since the
+    // question (under the lock: [`forget_holes`] takes it after the bump).
+    if q.0 == key && COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire) == epoch {
         q.1.get_or_insert_with(Default::default).insert(block, end);
     }
     end
@@ -1052,11 +1108,147 @@ pub fn writing(at: usize, len: usize) {
     crate::lazy::opening(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     // Memory where nothing was ever guarded is left alone without the lock.
-    if may_be_guarded(at, at.saturating_add(len)) {
-        open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    if may_be_guarded(at, end) && !LANDING.with_borrow_mut(|w| w.as_mut().map(|w| w.open(at, end)).is_some()) {
+        open(&mut guards(), at, end);
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+thread_local! {
+    /// This thread's [`LandingWrites`], while one stands.
+    static LANDING: std::cell::RefCell<Option<Window>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Guarded blocks a landing writes into ([`landing_writes`]).
+#[derive(Default)]
+struct Window {
+    /// Blocks looked at (opened, or not guarded then).
+    seen: BTreeSet<usize>,
+    /// Blocks made writable, still guarded.
+    opened: BTreeSet<usize>,
+}
+
+impl Window {
+    /// [`writing`] of `[start, end)` within the window: its guarded blocks
+    /// made writable, once each, and left guarded (and clean if so).
+    fn open(&mut self, start: usize, end: usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+        if first >= last || self.seen.range(first..last).count() == last - first {
+            return;
+        }
+        let g = guards();
+        let blocks: Vec<usize> =
+            g.protected.range(first..last).copied().filter(|b| !self.opened.contains(b)).collect();
+        for run in blocks.chunk_by(|a, b| a + 1 == *b) {
+            let mut old = 0;
+            // SAFETY: blocks we made read-only.
+            let whole = run.len() > 1
+                && unsafe { VirtualProtect((run[0] * BLOCK) as *const _, run.len() * BLOCK, PAGE_READWRITE, &mut old) }
+                    != 0;
+            if !whole {
+                for &block in run {
+                    // SAFETY: a block we made read-only.
+                    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+                }
+            }
+        }
+        drop(g);
+        self.opened.extend(blocks);
+        self.seen.extend(first..last);
+    }
+
+    /// The landing is done: the blocks still guarded are read-only again,
+    /// and they and their other views count as written now (in the journal),
+    /// so that every copy of them takes them again: what we wrote, and what
+    /// the title wrote there meanwhile without a fault.
+    fn close(self) {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        if self.opened.is_empty() {
+            return;
+        }
+        let opened: Vec<usize> = self.opened.into_iter().collect();
+        let mut written = opened.clone();
+        {
+            let mut g = guards();
+            let still: Vec<usize> = opened.iter().copied().filter(|b| g.protected.contains(b)).collect();
+            for run in still.chunk_by(|a, b| a + 1 == *b) {
+                let mut old = 0;
+                // SAFETY: blocks we made read-only, and writable for the
+                // landing.
+                let whole = run.len() > 1
+                    && unsafe { VirtualProtect((run[0] * BLOCK) as *const _, run.len() * BLOCK, PAGE_READONLY, &mut old) }
+                        != 0;
+                if !whole {
+                    for &block in run {
+                        // SAFETY: as above.
+                        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } == 0 {
+                            // Gone meanwhile: not guarded.
+                            g.protected.remove(&block);
+                            g.clean.set(block, false);
+                        }
+                    }
+                }
+            }
+            let aliased: Vec<usize> = opened.iter().copied().filter(|b| g.aliased.contains(b)).collect();
+            if !aliased.is_empty() {
+                written.extend(crate::inplace::pages_of_blocks(&aliased).into_iter().map(|a| a / BLOCK));
+            }
+        }
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for block in written {
+            for page in block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE {
+                j.written.insert(page, now);
+            }
+        }
+    }
+}
+
+/// While it stands, this thread's writes into guarded title memory
+/// ([`writing`]) leave the blocks guarded: made writable once for the
+/// whole landing, read-only again at its end, and noted written then
+/// ([`Window::close`]). Opened as other writes are, each merge of the
+/// copy-back made its blocks writable (8.9% of the copy-back thread in
+/// VirtualProtect), and the next refresh made them read-only again (much
+/// of the submitting thread's 13.2%, run zall6p). `VICTORY_LANDING_WINDOW=0`
+/// opens them as before.
+pub(crate) struct LandingWrites(bool);
+
+pub(crate) fn landing_writes() -> LandingWrites {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_LANDING_WINDOW").is_none_or(|v| v != "0"));
+    // One standing already (a landing inside a landing): that one closes.
+    LandingWrites(
+        on && LANDING.with_borrow_mut(|w| {
+            let first = w.is_none();
+            if first {
+                *w = Some(Window::default());
+            }
+            first
+        }),
+    )
+}
+
+impl Drop for LandingWrites {
+    fn drop(&mut self) {
+        if self.0
+            && let Some(w) = LANDING.with_borrow_mut(Option::take)
+        {
+            w.close();
+        }
+    }
+}
+
+/// A write of ours faulted at `at` (`crate::guarded`'s write): opens the
+/// guarded block there, as a write of the title's; true if it is writable
+/// now.
+pub(crate) fn fault_open(at: usize) -> bool {
+    let mut g = guards();
+    open(&mut g, at, at + 1) || writable(at)
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1136,7 +1328,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::lazy::forget(at, len);
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    forget_holes(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1683,6 +1875,74 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A landing's writes (`landing_writes`): the block written is writable
+    /// for the landing and read-only again after it, and it and its other
+    /// view count as written then, the block beside it not.
+    #[test]
+    fn a_landing_writes_through_the_guard_and_reports_its_blocks() {
+        let _serial = serial();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let (before, _) = writes(one, one + SIZE, true).unwrap();
+        assert!(writes(two, two + SIZE, true).is_some());
+        assert!(!writable(one + BLOCK));
+        {
+            let _landing = landing_writes();
+            writing(one + BLOCK + 8, 4);
+            // SAFETY: made writable for the landing.
+            unsafe { ((one + BLOCK + 8) as *mut u8).write(5) };
+            writing(one + BLOCK + 100, 4);
+            assert!(writable(one + BLOCK));
+            assert!(!writable(one));
+        }
+        assert!(!writable(one + BLOCK), "read-only again");
+        let newer = |view: usize, block: usize| {
+            let (_, written) = writes(view, view + SIZE, true).unwrap();
+            written.iter().any(|&(page, at)| page == (view + block * BLOCK) / PAGE && at > before)
+        };
+        assert!(newer(one, 1));
+        assert!(!newer(one, 0));
+        assert!(newer(two, 1), "the other view");
+        // SAFETY: the other view of the byte written.
+        assert_eq!(unsafe { ((two + BLOCK + 8) as *const u8).read() }, 5);
+        drop_views(section, &[one, two], SIZE);
+        // The journal forgets nothing: memory allocated there by the next
+        // test would start out written.
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for view in [one, two] {
+            let pages: Vec<usize> = j.written.range(view / PAGE..(view + SIZE) / PAGE).map(|(&p, _)| p).collect();
+            for page in pages {
+                j.written.remove(&page);
+            }
+        }
+    }
+
+    /// Our plain write into a guarded block opens it, as the title's does.
+    #[test]
+    fn a_guarded_write_opens_a_guarded_block() {
+        let _serial = serial();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        assert!(crate::guarded::on());
+        assert!(guard(one, one + SIZE).is_some());
+        let data = [7u8; 16];
+        // SAFETY: our view; the guard's block is opened by the fault.
+        assert!(unsafe { crate::guarded::write((one + 4) as *mut u8, data.as_ptr(), 16) });
+        assert_eq!(guard(one, one + SIZE), Some(vec![one / PAGE]));
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// Hole answers are forgotten where the runtime committed or mapped,
+    /// not elsewhere.
+    #[test]
+    fn hole_answers_are_forgotten_by_range() {
+        let mut m: BTreeMap<usize, usize> = [(10, 20), (12, 20), (30, 30), (40, 50)].into_iter().collect();
+        forget_runs(&mut m, 0, 5);
+        assert_eq!(m.len(), 4);
+        forget_runs(&mut m, 15, 31);
+        assert_eq!(m.into_iter().collect::<Vec<_>>(), vec![(40, 50)]);
     }
 
     /// A write of the runtime's own, told at one view of the pages

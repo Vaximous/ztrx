@@ -2174,7 +2174,8 @@ fn fetch_queue() -> bool {
     *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").map_or(true, |v| v == "1" || v == "2"))
 }
 
-/// `VICTORY_FETCH_QUEUE=2`, the default: as [`fetch_queue`], and the pieces a flight
+/// `VICTORY_FETCH_QUEUE=2` (not the default while stale blocks in the
+/// world are not explained: zall4 at frame 2400): as [`fetch_queue`], and the pieces a flight
 /// sent after the landed ones declares written go to the copy queue too,
 /// read while that flight may be running. In the world about 19 such
 /// pieces a landing kept the fetch on the one queue, behind every flight in
@@ -2198,7 +2199,7 @@ fn fetch_queue() -> bool {
 /// against 79.
 fn fetch_queue_loose() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE").map_or(true, |v| v == "2"))
+    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "2"))
 }
 
 /// `VICTORY_FETCH_QUEUE_CHECK=1`: until [`QUICK_CHECKS`] pieces have been

@@ -221,8 +221,39 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+///
+/// Up to `VICTORY_LATE_WAIT_LISTS` (512) lists are in the air at once,
+/// and a settle lands them together: with 128 kept, the rest of a landing
+/// was thrown away and made anew by the next submissions (zall17d: 15,320
+/// host lists made and 12,393 preludes for them, about 40 a frame, 312 ms
+/// in 8 s of the submitting thread's time in `CreateCommandList`).
+/// `VICTORY_LIST_POOL_MOST`: the most lists kept (512).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+fn idle_most() -> (usize, u64) {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let lists = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512)
+    });
+    (lists, 256 << 20)
+}
+
+/// Host lists taken idle by [`fresh_list`], made new there for want of
+/// one, kept idle by [`recycle`], and those it let go: not run, more than
+/// [`idle_most`] lists, more than its bytes. Since the last call of
+/// [`take_pool_stats`].
+#[cfg(windows)]
+static POOL_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// [`POOL_STATS`] since the last call.
+#[cfg(windows)]
+pub(crate) fn take_pool_stats() -> [u64; 6] {
+    std::array::from_fn(|i| POOL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(windows)]
+fn pool_stat(i: usize) {
+    POOL_STATS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -245,8 +276,14 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        Some(Idle(list, _)) => {
+            pool_stat(0);
+            Some(list)
+        }
+        None => {
+            pool_stat(1);
+            crate::host::host().and_then(|h| h.new_list().ok())
+        }
     }
 }
 
@@ -259,11 +296,17 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let most = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) {
+            pool_stat(3);
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
+            pool_stat(4);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -271,7 +314,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() >= most.0 {
+            pool_stat(4);
+        } else if idle.1 + bytes > most.1 {
+            pool_stat(5);
+        } else {
+            pool_stat(2);
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

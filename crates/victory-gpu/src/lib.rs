@@ -68,6 +68,8 @@ mod shadow;
 mod skip;
 #[cfg(windows)]
 mod hot;
+#[cfg(windows)]
+mod scatter;
 pub mod signature;
 #[cfg(windows)]
 mod texture;

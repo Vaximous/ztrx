@@ -1767,6 +1767,41 @@ void main() {
     }
 
     #[test]
+    fn warp_scatter_copy_writes_only_its_ranges_bytes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const SIZE: usize = 128 << 10;
+        let pass = crate::scatter::make(&warp.device).expect("scatter shader must compile on WARP");
+        let (src, src_ptr, _) = warp.shared_buffer(SIZE as u64);
+        let (dst, dst_ptr, _) = warp.shared_buffer(SIZE as u64);
+        // Ranges that share words with each other, begin and end inside
+        // words, one byte long, and longer than a group's stride many times.
+        let ranges = [(1, 2), (3, 7), (9, 10), (11, 12), (13, 300), (301, 302), (2000, 2000 + 70_001), (100_000, 100_004)];
+        let (entries, copies) = crate::scatter::split(&ranges, SIZE as u64, u64::MAX);
+        assert!(copies.is_empty());
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(entries.len() as u64 * 16);
+        // SAFETY: mappings of the sizes made.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(src_ptr, SIZE);
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3] | 1;
+            }
+            std::ptr::write_bytes(dst_ptr, 0, SIZE);
+            std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), table_ptr, entries.len() * 16);
+            crate::scatter::record(&warp.list, &pass, &src, &dst, table_gpu, entries.len() as u32);
+        }
+        warp.submit_and_wait();
+        // SAFETY: mappings of the sizes made; the card is done.
+        let (src, dst) = unsafe { (std::slice::from_raw_parts(src_ptr, SIZE), std::slice::from_raw_parts(dst_ptr, SIZE)) };
+        for i in 0..SIZE {
+            let inside = ranges.iter().any(|&(a, b)| (a..b).contains(&i));
+            let want = if inside { src[i] } else { 0 };
+            assert_eq!(dst[i], want, "byte {i} (in a range: {inside})");
+        }
+    }
+
+    #[test]
     fn warp_hoisted_clamps_run_ahead_into_their_own_places() {
         let Some(mut warp) = WarpHarness::new() else {
             return;

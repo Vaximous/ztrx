@@ -130,6 +130,9 @@ pub(crate) struct Translated {
     /// the lane's place in the dispatch (`victory_shader::stores`): false
     /// when its code is not known or it has no stores.
     pub(crate) bounded: bool,
+    /// Where a compute program's buffer stores can reach (`crate::extent`),
+    /// if every one is followed.
+    pub(crate) extents: Option<std::sync::Arc<crate::extent::StoreExtents>>,
 }
 
 #[cfg(windows)]
@@ -196,6 +199,16 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                 terms.total() == 0 || terms.bounded()
             })
         });
+    let extents = programs
+        .iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .and_then(|p| match crate::extent::StoreExtents::of(p) {
+            Ok(e) => Some(std::sync::Arc::new(e)),
+            Err(why) => {
+                tracing::debug!(why, "a compute program without store extents");
+                None
+            }
+        });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -206,7 +219,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, bounded })
+    Ok(Translated { host, used, stores, bounded, extents })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

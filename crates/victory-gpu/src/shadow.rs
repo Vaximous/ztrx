@@ -1260,6 +1260,31 @@ pub(crate) fn declared_by_bounded(len: u64) {
     DECLARED_BOUNDED[1].fetch_add(len, Ordering::Relaxed);
 }
 
+/// Since the last frame-rate line, of the ranges table views declare
+/// (`crate::extent`): views whose shader has store extents, their bytes,
+/// the bytes the extents leave, views the shader writes nowhere, and
+/// views whose extent is unbounded (a leaf the call does not bound).
+static EXTENTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// A table view's range of `len` bytes, of which the store extents leave
+/// `left` (None: unbounded).
+pub(crate) fn extent_seen(len: u64, left: Option<u64>) {
+    EXTENTS[0].fetch_add(1, Ordering::Relaxed);
+    EXTENTS[1].fetch_add(len, Ordering::Relaxed);
+    match left {
+        Some(0) => {
+            EXTENTS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        Some(left) => {
+            EXTENTS[2].fetch_add(left, Ordering::Relaxed);
+        }
+        None => {
+            EXTENTS[2].fetch_add(len, Ordering::Relaxed);
+            EXTENTS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
@@ -1283,6 +1308,18 @@ pub(crate) fn back_line(frames: f64) {
             d[6],
             mb(d[7]),
             d[8],
+        );
+        crate::extent::check_line();
+        let e: Vec<f64> = EXTENTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "store extents per frame: {:.0} table views of shaders with extents ({:.0} MB), {:.0} MB of them left by the \
+             extents{}; {:.0} written nowhere, {:.0} unbounded",
+            e[0],
+            mb(e[1]),
+            mb(e[2]),
+            if crate::extent::narrow() { "" } else { " (VICTORY_EXTENTS=1 declares only those)" },
+            e[3],
+            e[4],
         );
     }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -1749,6 +1786,11 @@ impl Shadow {
     }
 
     /// Offset of a title address from the buffer's start.
+    /// Whether shaders write title memory itself (no copy to bring back).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
     }

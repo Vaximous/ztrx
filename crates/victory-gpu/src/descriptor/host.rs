@@ -1480,6 +1480,27 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
 }
 
+/// The element size of a buffer unordered access view (the structure
+/// stride, 4 for a raw view, else the format's), what an indexed store's
+/// index counts in.
+pub(crate) fn unordered_element(view: &View) -> Option<u64> {
+    let words: &[u32; 10] = match view {
+        View::Unordered(_, _, Some(desc)) => desc,
+        View::Placed(true, resource, desc) if resource[0] == 1 => desc[..10].try_into().ok()?,
+        _ => return None,
+    };
+    let desc = uav_desc(words);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    if buffer.StructureByteStride > 0 {
+        Some(u64::from(buffer.StructureByteStride))
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        Some(4)
+    } else {
+        Some(crate::resource::element(desc.Format.0 as u32)?.0)
+    }
+}
+
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);

@@ -268,6 +268,8 @@ pub enum Op {
     Add,
     Sub,
     Mul,
+    /// The high 32 bits of the 64-bit unsigned product.
+    MulHi,
     Shl,
     Shr,
     And,
@@ -459,6 +461,7 @@ impl<'a> Builder<'a> {
                     "s_add_u32" | "s_add_i32" => two(self, Op::Add, &mut src_n),
                     "s_sub_u32" | "s_sub_i32" => two(self, Op::Sub, &mut src_n),
                     "s_mul_i32" => two(self, Op::Mul, &mut src_n),
+                    "s_mul_hi_u32" => two(self, Op::MulHi, &mut src_n),
                     "s_lshl_b32" => two(self, Op::Shl, &mut src_n),
                     "s_lshr_b32" => two(self, Op::Shr, &mut src_n),
                     "s_and_b32" => two(self, Op::And, &mut src_n),
@@ -539,6 +542,10 @@ impl<'a> Builder<'a> {
                     "v_and_b32" => two(self, Op::And, 0, 1),
                     "v_or_b32" => two(self, Op::Or, 0, 1),
                     "v_mul_lo_u32" => two(self, Op::Mul, 0, 1),
+                    "v_mul_hi_u32" => two(self, Op::MulHi, 0, 1),
+                    // Any value: bounded only where that is enough
+                    // (`Op::MulHi`).
+                    "v_cvt_u32_f32" => Ok(self.node(Node::Range(0, u32::MAX))),
                     "v_min_u32" => two(self, Op::Min, 0, 1),
                     "v_max_u32" => two(self, Op::Max, 0, 1),
                     "v_min3_u32" => three(self, Op::Min, Op::Min),
@@ -683,6 +690,15 @@ fn range(
                 let (lo, hi) = leaf(node)?;
                 (i128::from(lo), i128::from(hi))
             }
+            // The high half of a product is at most the other factor,
+            // whatever 32-bit value one factor holds (a division by a
+            // reciprocal computed in floats, say).
+            Node::Op(Op::MulHi, a, b) => {
+                let any = |r: Option<(i128, i128)>| r.and_then(normal).unwrap_or((0, i128::from(u32::MAX)));
+                let a = any(range(nodes, a, leaf, memo));
+                let b = any(range(nodes, b, leaf, memo));
+                ((a.0 * b.0) >> 32, (a.1 * b.1) >> 32)
+            }
             Node::Op(op, a, b) => {
                 let a = range(nodes, a, leaf, memo)?;
                 let b = range(nodes, b, leaf, memo)?;
@@ -779,6 +795,18 @@ mod tests {
         };
         assert_eq!(bounds(&e.nodes, root, &mut leaf), Some((0, 252)));
         assert_eq!(bounds(&e.nodes, root, &mut |_| None), None);
+    }
+
+    /// `v_mul_hi_u32` (a division by a constant, say): the high half of the
+    /// product of the ranges' ends.
+    #[test]
+    fn the_high_half_of_a_product_is_bounded() {
+        // x * 0xAAAA_AAAB >> 32 with x in 0..=3000: x / 1.5 rounded down.
+        let nodes = [Node::Range(0, 3000), Node::Const(0xAAAA_AAAB), Node::Op(Op::MulHi, 0, 1)];
+        assert_eq!(bounds(&nodes, 2, &mut |_| None), Some((0, 2000)));
+        // By a factor not known: at most the other one.
+        let nodes = [Node::Range(0, 3000), Node::Input(Reg::S(0)), Node::Op(Op::MulHi, 0, 1)];
+        assert_eq!(bounds(&nodes, 2, &mut |_| None), Some((0, 2999)));
     }
 
     #[test]

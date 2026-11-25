@@ -890,6 +890,9 @@ pub(crate) struct HostList {
     /// Where the next clamp of indirect records goes in the list's scratch
     /// buffer ([`crate::indirect::clamp_ring`]).
     ring_at: std::sync::atomic::AtomicU64,
+    /// The keys of the clamps recorded since the list's last first use of
+    /// its budget, by trust word ([`HostList::clamp_slot`]).
+    clamp_keys: Mutex<Vec<u64>>,
     /// Calls recorded whose shaders may write buffers ([`HostList::wrote`]),
     /// since the reset.
     writes: std::sync::atomic::AtomicU64,
@@ -3149,6 +3152,13 @@ pub(crate) fn read_flight_line(frames: f64) {
     }
 }
 
+/// Bytes of a list's budget buffer: the budget and the clamp's notes in
+/// the first 16 words, then the trust words of its clamps
+/// (`crate::indirect::trust_mode`; the clamp writes them from byte 64 on).
+const BUDGET_BYTES: u64 = 4096;
+/// The first trust word.
+const TRUST_WORDS: usize = 16;
+
 /// Since the last frame-rate line, with `VICTORY_CARD_FILLS_CHECK`: CPU
 /// fills (and their bytes) of a list that read what an earlier list of
 /// the same submission declared written on the card. The fill runs at
@@ -4453,6 +4463,7 @@ impl Host {
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
                 since_wait: std::sync::atomic::AtomicU8::new(3),
                 ring_at: std::sync::atomic::AtomicU64::new(0),
+                clamp_keys: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5595,6 +5606,8 @@ impl Host {
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&lists);
+                crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+                crate::list::switch_count(crate::list::SW_LISTS, 1);
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -6416,6 +6429,8 @@ impl Host {
             // With the relay the flight takes a place in the order of the
             // queue: what its compare pushes down is merged as of there.
             let order = flown.then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+            crate::list::switch_count(crate::list::SW_LISTS, lists.len() as u64);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -6492,6 +6507,8 @@ impl Host {
                 SYNC_IN_AIR.fetch_add(1, Ordering::AcqRel);
                 InAir
             });
+            crate::list::switch_count(crate::list::SW_EXECUTES, 1);
+            crate::list::switch_count(crate::list::SW_LISTS, group.len() as u64);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -7677,7 +7694,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer(BUDGET_BYTES)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7685,6 +7702,9 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
+            // The clamps of the list's last recording, by trust word: what
+            // its run noted in them (`crate::indirect::trust_note`).
+            let keys = std::mem::take(&mut *self.clamp_keys.lock().unwrap_or_else(|e| e.into_inner()));
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -7704,10 +7724,31 @@ impl HostList {
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
                 }
+                for (i, &key) in keys.iter().enumerate() {
+                    let word = words.add(TRUST_WORDS + i);
+                    let noted = word.read_volatile();
+                    if noted & 1 != 0 {
+                        crate::indirect::trust_note(key, noted & 2 != 0);
+                    }
+                    word.write_volatile(0);
+                }
             })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A trust word in the budget buffer for a clamp of `key` recorded next
+    /// (`crate::indirect::trust_mode`); `None` when the words are all taken.
+    pub(crate) fn clamp_slot(&self, key: u64) -> Option<u32> {
+        // The last recording's keys are taken first.
+        self.budget()?;
+        let mut keys = self.clamp_keys.lock().unwrap_or_else(|e| e.into_inner());
+        if TRUST_WORDS + keys.len() >= BUDGET_BYTES as usize / 4 {
+            return None;
+        }
+        keys.push(key);
+        Some((keys.len() - 1) as u32)
     }
 
     /// `len` bytes (at most 64 KiB) of device-local memory, 256-byte
@@ -8606,6 +8647,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::list::barrier_line(frames);
+        crate::indirect::trust_line(frames);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

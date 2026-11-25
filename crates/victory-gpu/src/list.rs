@@ -830,7 +830,30 @@ pub(crate) fn barrier_count(kind: usize, n: u64) {
 }
 
 /// For the frame-rate line: [`BARRIERS`] per frame.
+/// Since the last frame-rate line, what may part the card's work besides
+/// barriers: `ExecuteCommandLists` calls of submissions, the lists in
+/// them, pipelines and root signatures set for the title's draws and
+/// dispatches, and pipelines set for the clamps of indirect calls (each
+/// a switch to a compute pipeline of ours and back).
+pub(crate) static SWITCHES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) const SW_EXECUTES: usize = 0;
+pub(crate) const SW_LISTS: usize = 1;
+pub(crate) const SW_PIPELINES: usize = 2;
+pub(crate) const SW_ROOTS: usize = 3;
+pub(crate) const SW_CLAMP_PIPELINES: usize = 4;
+
+/// Counts `n` of switch `i` ([`SWITCHES`]).
+pub(crate) fn switch_count(i: usize, n: u64) {
+    SWITCHES[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn barrier_line(frames: f64) {
+    let [executes, lists, pipelines, roots, clamps] =
+        [0, 1, 2, 3, 4].map(|i| SWITCHES[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "card work parted per frame: {executes:.1} ExecuteCommandLists calls with {lists:.1} lists; \
+         {pipelines:.0} pipelines and {roots:.0} root signatures set for the title's work; {clamps:.0} clamp pipelines set"
+    );
     let text: Vec<String> = BARRIERS
         .iter()
         .zip(BARRIER_NAMES)

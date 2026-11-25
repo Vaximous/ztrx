@@ -25,7 +25,177 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, s};
 
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::host::{HostList, host, transition};
+
+thread_local! {
+    /// The trust word of the clamp being recorded on this thread
+    /// ([`slot_for`]), all ones for none: the clamp's seventh constant.
+    static SLOT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+}
+
+/// `VICTORY_CLAMP_TRUST`: whether indirect calls whose clamps have passed
+/// their records on unchanged for long are left unclamped. `check` (1):
+/// every call is clamped, and the calls that would be left out are
+/// counted, with the clamps that changed records after their key was
+/// trusted. `1` (2): such calls read the title's records themselves (as
+/// with `VICTORY_CLAMP=0`), except one in 16 of them, which is clamped
+/// still to see whether its key keeps the trust. Off (0) by default: the
+/// clamps note nothing.
+///
+/// The clamp's work is a pass of ours before each call (1,303 a frame
+/// clamped alone in run zall24gt, 5.9 ms of the card's time, 2.6 ms more
+/// waiting) and the barriers around it. A record it changes is one asking
+/// for more than the card may run (more than 65,535 groups along an axis,
+/// a draw past 2^24 vertices) or past the list's budget: on a buffer whose
+/// clamps have never changed a record in [`trust_runs`] runs, the title is
+/// taken to fill it in range. Each time a trusted key's clamp changes a
+/// record it needs twice as many runs again.
+pub(crate) fn trust_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_TRUST").as_deref() {
+        Ok("check") => 1,
+        Ok("1") => 2,
+        _ => 0,
+    })
+}
+
+/// Runs of a key's clamps without a changed record before it is trusted
+/// (`VICTORY_CLAMP_TRUST_RUNS`, 240 by default).
+fn trust_runs() -> u64 {
+    static RUNS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_CLAMP_TRUST_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(240)
+    })
+}
+
+/// Per key ([`trust_key`]): clamps that ran in a row without changing a
+/// record, and times one changed a record while the key was trusted.
+#[derive(Default, Clone, Copy)]
+struct Trust {
+    clean: u64,
+    broken: u32,
+}
+
+static TRUST: Mutex<Option<std::collections::HashMap<u64, Trust>>> = Mutex::new(None);
+
+/// Since the last frame-rate line: clamps that noted their run, of them
+/// with a changed record; calls of trusted keys (left unclamped, or with
+/// `check` that would be); trusted calls clamped to keep watch; clamps of
+/// trusted keys that changed a record (since the start).
+static TRUST_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+impl Trust {
+    fn trusted(&self) -> bool {
+        self.clean >= trust_runs() << self.broken.min(16)
+    }
+}
+
+/// The key a clamp's trust is kept by: the host copy the records are in
+/// (a buffer of the title's), the kind of record, its stride and whether a
+/// count bounds the records.
+pub(crate) fn trust_key(copy: u64, kind: u32, stride: u32, counted: bool) -> u64 {
+    let mut h = copy.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for v in [u64::from(kind), u64::from(stride), u64::from(counted)] {
+        h = (h ^ v).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    }
+    h
+}
+
+/// A clamp of `key` ran (its trust word said so): `changed` if it passed a
+/// record on other than the title wrote it.
+pub(crate) fn trust_note(key: u64, changed: bool) {
+    TRUST_STATS[0].fetch_add(1, Ordering::Relaxed);
+    if changed {
+        TRUST_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let mut map = TRUST.lock().unwrap_or_else(|e| e.into_inner());
+    let t = map.get_or_insert_with(Default::default).entry(key).or_default();
+    if !changed {
+        t.clean += 1;
+        return;
+    }
+    if t.trusted() {
+        let n = TRUST_STATS[4].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 {
+            tracing::info!(n, key = format_args!("{key:016x}"), runs = t.clean, "a trusted indirect key's clamp changed a record (VICTORY_CLAMP_TRUST)");
+        }
+        t.broken += 1;
+    }
+    t.clean = 0;
+}
+
+/// Whether the indirect call of `key` goes unclamped ([`trust_mode`] `1`
+/// and its key trusted, but for one call in 16). Counts the calls a trusted
+/// key would leave out with `check`.
+pub(crate) fn trust_skip(key: u64) -> bool {
+    let mode = trust_mode();
+    if mode == 0 {
+        return false;
+    }
+    let trusted = TRUST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key).copied())
+        .is_some_and(|t| t.trusted());
+    if !trusted {
+        return false;
+    }
+    TRUST_STATS[2].fetch_add(1, Ordering::Relaxed);
+    if mode == 1 {
+        return false;
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(16) {
+        TRUST_STATS[3].fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// While the returned guard lives, the clamps recorded on this thread note
+/// their run in `list`'s trust word for `key` (with [`trust_mode`] on).
+pub(crate) fn slot_for(list: &HostList, key: u64) -> SlotGuard {
+    if trust_mode() != 0
+        && let Some(slot) = list.clamp_slot(key)
+    {
+        SLOT.set(slot);
+    }
+    SlotGuard
+}
+
+/// Clears this thread's trust word when dropped ([`slot_for`]).
+pub(crate) struct SlotGuard;
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        SLOT.set(u32::MAX);
+    }
+}
+
+/// The trust line ([`trust_mode`]).
+pub(crate) fn trust_line(frames: f64) {
+    if trust_mode() == 0 {
+        return;
+    }
+    let [noted, changed, trusted, watched] = [0, 1, 2, 3].map(|i| TRUST_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let broken = TRUST_STATS[4].load(Ordering::Relaxed);
+    let keys = TRUST.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or((0, 0), |m| {
+        (m.len(), m.values().filter(|t| t.trusted()).count())
+    });
+    tracing::info!(
+        "indirect clamps per frame (VICTORY_CLAMP_TRUST={}): {noted:.0} noted their run, {changed:.1} of them changed a record; \
+         {trusted:.0} calls of trusted keys ({}), {watched:.0} of them clamped to keep watch; keys {} of which {} trusted; \
+         {broken} clamps of trusted keys changed a record since the start",
+        ["off", "check", "1"][usize::from(trust_mode())],
+        if trust_mode() == 1 { "would be left unclamped" } else { "left unclamped but those watched" },
+        keys.0,
+        keys.1
+    );
+}
 
 /// The most groups along each axis a clamped indirect dispatch record runs
 /// (the clamp's `min(asked, 65535)` per axis, kept in step by a test): what
@@ -33,7 +203,7 @@ use crate::host::{HostList, host, transition};
 pub(crate) const MOST_GROUPS: [u32; 3] = [MAX_GROUPS_PER_AXIS; 3];
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -45,6 +215,9 @@ cbuffer Record : register(b0) {
     // charged to the budget on its own (`VICTORY_CLAMP_GROUP_CHARGE=0`).
     uint has_count;
     uint count_offset;
+    // The clamp's place in the list's trust words (`crate::indirect`'s
+    // `trust`), or all ones for none.
+    uint slot;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -152,14 +325,26 @@ uint charge(uint cost) {
 bool past(uint before, uint cost) {
     return cost > 0 && (before >= BUDGET || BUDGET - before < cost);
 }
+// The clamp's trust word, from byte 64 of the budget buffer on: bit 0 it
+// ran, bit 1 it passed on a record other than the title wrote it.
+void noted(uint bit) {
+    if (slot != 0xffffffffu) {
+        uint was;
+        budget.InterlockedOr(64u + slot * 4u, bit, was);
+    }
+}
 void store(Rec r, bool over) {
     if (kind <= 1) {
-        dst_args.Store2(r.dst_at, over ? uint2(0, 0) : r.draw_counts);
+        uint2 out2 = over ? uint2(0, 0) : r.draw_counts;
+        if (any(out2 != src_args.Load2(r.src_at))) noted(2u);
+        dst_args.Store2(r.dst_at, out2);
         for (uint off = 8; off < stride; off += 4) {
             dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
     } else {
-        dst_args.Store3(r.dst_at, over ? uint3(0, 0, 0) : r.groups);
+        uint3 out3 = over ? uint3(0, 0, 0) : r.groups;
+        if (any(out3 != src_args.Load3(r.src_at))) noted(2u);
+        dst_args.Store3(r.dst_at, out3);
         for (uint off = 12; off < stride; off += 4) {
             dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
@@ -180,6 +365,9 @@ void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {
     // by one.
     if (at == 0) {
         group_cost = 0;
+    }
+    if (id.x == 0) {
+        noted(1u);
     }
     GroupMemoryBarrierWithGroupSync();
     Rec r = measure(id.x);
@@ -216,6 +404,9 @@ void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {
 // calls of one record.
 [RootSignature(RS)]
 float4 vertex(uint i : SV_VertexID) : SV_Position {
+    if (i == 0) {
+        noted(1u);
+    }
     Rec r = measure(i);
     if (r.live) {
         store(r, past(r.cost > 0 ? charge(r.cost) : 0, r.cost));
@@ -422,6 +613,7 @@ static uint args_offset;
 static uint has_count;
 static uint count_offset;
 static uint dst_offset;
+static uint slot = 0xffffffffu;
 {body}"
     )
 }
@@ -587,6 +779,14 @@ pub(crate) fn bound(
 /// records there: the barrier that waited for that is left out, and the
 /// clamp may run beside the call before it. When the ring goes round the
 /// wait is made, for every place used before.
+///
+/// Not to be used: it removed the device at world start (run zall24cr).
+/// A buffer barrier covers the whole buffer, so after a clamp's barrier
+/// into indirect-argument access, the next clamp's unordered writes need a
+/// barrier back from that access. Its sync waits for every earlier
+/// indirect call on the queue, not just those reading the same places, so
+/// no barrier that obeys the rules can leave the wait out. A ring of
+/// separate buffers would not help for the same reason.
 pub(crate) fn clamp_ring() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_RING").is_some_and(|v| v == "1") && enhanced_barriers())
@@ -802,7 +1002,7 @@ pub(crate) fn hoist_clamps() -> u8 {
 /// A clamp recorded ahead of its list ([`hoist_clamps`]).
 #[derive(Clone)]
 pub(crate) struct Hoisted {
-    constants: [u32; 6],
+    constants: [u32; 7],
     src_gpu: u64,
     count_gpu: u64,
     dst_gpu: u64,
@@ -1037,7 +1237,7 @@ unsafe fn record_hoisted_with(
             l.SetPipelineState(&c.pso);
         }
         for h in alone {
-            l.SetComputeRoot32BitConstants(0, 6, h.constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 7, h.constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, h.src_gpu);
             l.SetComputeRootShaderResourceView(2, h.count_gpu);
             l.SetComputeRootUnorderedAccessView(3, h.dst_gpu);
@@ -1117,7 +1317,7 @@ fn clamp_inputs(
     ahead: bool,
     dst_gpu: u64,
     budget: u64,
-) -> Option<([u32; 6], u64, u64)> {
+) -> Option<([u32; 7], u64, u64)> {
     let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
     // SAFETY: a live D3D12 buffer resource.
     let src_base = unsafe { src.GetGPUVirtualAddress() };
@@ -1143,7 +1343,7 @@ fn clamp_inputs(
         None => (src_gpu, 0u32, 0u32),
     };
     let flags = has_count | (u32::from(ahead) << 1) | (u32::from(!group_charge()) << 2);
-    Some(([kind, stride, records, args_offset, flags, count_offset], src_gpu, count_gpu))
+    Some(([kind, stride, records, args_offset, flags, count_offset, SLOT.get()], src_gpu, count_gpu))
 }
 
 /// [`record_clamp_as`]; `scoped`: the wait for earlier shader writes is on
@@ -1224,7 +1424,8 @@ fn record_clamp_scoped(
                 l.OMSetRenderTargets(0, None, false, None);
                 l.SetGraphicsRootSignature(&c.root);
                 l.SetPipelineState(pso);
-                l.SetGraphicsRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                crate::list::switch_count(crate::list::SW_CLAMP_PIPELINES, 1);
+                l.SetGraphicsRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 l.SetGraphicsRootShaderResourceView(1, src_gpu);
                 l.SetGraphicsRootShaderResourceView(2, count_gpu);
                 l.SetGraphicsRootUnorderedAccessView(3, dst_gpu);
@@ -1236,7 +1437,8 @@ fn record_clamp_scoped(
             (true, None) => {
                 l.SetComputeRootSignature(&c.root);
                 l.SetPipelineState(&c.pso);
-                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                crate::list::switch_count(crate::list::SW_CLAMP_PIPELINES, 1);
+                l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 l.SetComputeRootShaderResourceView(1, src_gpu);
                 l.SetComputeRootShaderResourceView(2, count_gpu);
                 l.SetComputeRootUnorderedAccessView(3, dst_gpu);
@@ -1690,7 +1892,7 @@ void main() {
                 warp.list.SetComputeRootSignature(&c.root);
                 warp.list.SetPipelineState(&c.pso);
                 let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
@@ -1781,7 +1983,7 @@ void main() {
                         // Piece 0 of a copy starting `skew` into it; the
                         // hash stored (mode 0) in the variant's slot.
                         let constants = [0u32, skew, size, 1, 0, 0];
-                        warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                        warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                         warp.list.SetComputeRootShaderResourceView(1, now_gpu + (v * PIECE) as u64);
                         warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu + (v * 16) as u64);
                         let (x, y) = crate::host::card_compare_groups(1, true);
@@ -1853,7 +2055,7 @@ void main() {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
                 let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
@@ -1952,7 +2154,7 @@ void main() {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
                 let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);

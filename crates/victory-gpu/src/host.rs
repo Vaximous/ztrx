@@ -3275,10 +3275,76 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
+        if wide_stale() && spans.len() >= 4 {
+            return merge_under_writes_wide(spans);
+        }
         let mut runs_left = merge_runs();
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+}
+
+/// Whether [`stale_under_flights`] puts the title's bytes in beside the
+/// flights' writes on several threads, a host copy to a piece of work
+/// (`VICTORY_WIDE_STALE=1`; off by default).
+///
+/// The check ran copy by copy on the submitting thread: 28 ms a frame in
+/// 29 calls in the world (run zall17hb, "submissions' check of refreshes
+/// under flights"), for some 1,200 pages of 64 KiB read from title memory
+/// and compared with the copies' references. The copies have nothing to do
+/// with one another: each merge takes its own copy's locks, reads title
+/// memory through the guarded reads, asks the write-watch journal behind
+/// its own lock (answered from the submission's asking ahead), and notes
+/// what goes up to a copy in the card's memory in that copy's own list. As
+/// on one thread, a merge the copy cannot do asks for a settle; here every
+/// copy is still merged first (pages done stay done), and the runs' budget
+/// ([`merge_runs`]) is checked on their sum.
+fn wide_stale() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_STALE").is_some_and(|v| v == "1"))
+}
+
+/// [`wide_stale`]: the spans' merges, the spans of one copy together, on
+/// the kept threads. Whether the caller must settle.
+fn merge_under_writes_wide(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> bool {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let by_copy = spans_by_copy(spans);
+    let settle = Arc::new(AtomicBool::new(false));
+    let used = Arc::new(AtomicUsize::new(0));
+    let budget = merge_runs();
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = by_copy
+        .into_iter()
+        .map(|spans| {
+            let (settle, used) = (settle.clone(), used.clone());
+            Box::new(move || {
+                let mut runs_left = budget;
+                for (shadow, from, to) in spans {
+                    if shadow.merge_under_writes(from, to - from, &mut runs_left) {
+                        settle.store(true, Ordering::Relaxed);
+                    }
+                }
+                used.fetch_add(budget - runs_left, Ordering::Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    settle.load(Ordering::Relaxed) || used.load(Ordering::Relaxed) > budget
+}
+
+/// `spans` grouped by their copy, copies in the order first met, each
+/// copy's spans in their order.
+fn spans_by_copy<T>(spans: Vec<(std::sync::Arc<T>, usize, usize)>) -> Vec<Vec<(std::sync::Arc<T>, usize, usize)>> {
+    let mut by_copy: Vec<Vec<(std::sync::Arc<T>, usize, usize)>> = Vec::new();
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for span in spans {
+        let at = *index.entry(std::sync::Arc::as_ptr(&span.0) as usize).or_insert_with(|| {
+            by_copy.push(Vec::new());
+            by_copy.len() - 1
+        });
+        by_copy[at].push(span);
+    }
+    by_copy
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -8830,6 +8896,20 @@ mod flights_write {
     /// A read is sent to the card exactly where the flights' joined ranges
     /// (what a submission's reads wait by) meet it; while the line is busy,
     /// it is sent anyway.
+    /// [`wide_stale`] hands each copy's spans to one piece of work, in
+    /// their order, so that no two threads merge into one copy.
+    #[test]
+    fn wide_stale_keeps_a_copys_spans_together_and_in_order() {
+        use super::spans_by_copy;
+        use std::sync::Arc;
+        let (a, b, c) = (Arc::new(1u32), Arc::new(2u32), Arc::new(1u32));
+        let spans = vec![(a.clone(), 0, 4), (b.clone(), 8, 9), (a.clone(), 16, 20), (c.clone(), 0, 4), (b.clone(), 1, 2)];
+        let groups = spans_by_copy(spans);
+        let flat: Vec<Vec<(u32, usize, usize)>> = groups.iter().map(|g| g.iter().map(|(k, x, y)| (**k, *x, *y)).collect()).collect();
+        assert_eq!(flat, vec![vec![(1, 0, 4), (1, 16, 20)], vec![(2, 8, 9), (2, 1, 2)], vec![(1, 0, 4)]]);
+        assert!(Arc::ptr_eq(&groups[0][0].0, &a) && Arc::ptr_eq(&groups[2][0].0, &c), "equal values, distinct copies");
+    }
+
     #[test]
     fn reads_under_the_flights_ranges_and_only_those_are_under_flights() {
         let was = std::mem::replace(&mut super::line().written, vec![(0x1000, 0x2000), (0x8000, 0x8100)]);

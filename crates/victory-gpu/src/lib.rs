@@ -49,6 +49,8 @@ pub mod queue;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod rebar;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;

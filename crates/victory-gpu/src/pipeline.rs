@@ -133,6 +133,8 @@ pub(crate) struct Translated {
     /// Where a compute program's buffer stores can reach (`crate::extent`),
     /// if every one is followed.
     pub(crate) extents: Option<std::sync::Arc<crate::extent::StoreExtents>>,
+    /// Why a compute program has no `extents` ("" if it has).
+    pub(crate) extents_why: &'static str,
 }
 
 #[cfg(windows)]
@@ -148,6 +150,7 @@ impl Shader {
                     && crate::extent::denied(&self.hash)
                 {
                     t.extents = None;
+                    t.extents_why = "denied (VICTORY_EXTENT_DENY)";
                 }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -205,6 +208,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                 terms.total() == 0 || terms.bounded()
             })
         });
+    let mut extents_why = "";
     let extents = programs
         .iter()
         .find(|p| p.stage == HwStage::Cs)
@@ -212,6 +216,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             Ok(e) => Some(std::sync::Arc::new(e)),
             Err(why) => {
                 tracing::debug!(why, "a compute program without store extents");
+                extents_why = why;
                 None
             }
         });
@@ -225,7 +230,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, bounded, extents })
+    Ok(Translated { host, used, stores, bounded, extents, extents_why })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

@@ -637,6 +637,43 @@ pub(crate) fn dump(hash: &str, reads: &[(u64, u32)], groups: Option<[u32; 3]>) {
     }
 }
 
+/// Since the last frame-rate line, by compute shader (hash, why): views
+/// declared written whole for want of an extent, and their bytes.
+static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<(u64, &'static str), (u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+/// A compute shader's view of `len` bytes is declared written whole: the
+/// shader has no extents (`why`), or this one is unbounded.
+pub(crate) fn declared_whole(hash: u64, why: &'static str, len: u64) {
+    let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+    let e = whole.get_or_insert_with(Default::default).entry((hash, why)).or_default();
+    e.0 += 1;
+    e.1 += len;
+}
+
+/// The shaders whose views declared whole weigh most, for the frame line.
+pub(crate) fn whole_line(frames: f64) {
+    let Some(whole) = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut top: Vec<_> = whole.into_iter().collect();
+    top.sort_unstable_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    let all: u64 = top.iter().map(|(_, (_, b))| b).sum();
+    let shown: Vec<String> = top
+        .iter()
+        .take(10)
+        .map(|((hash, why), (n, bytes))| {
+            format!("{hash:016x} {:.0} MB in {:.1} ({why})", *bytes as f64 / frames / 1048576.0, *n as f64 / frames)
+        })
+        .collect();
+    tracing::info!(
+        "views of compute shaders declared written whole per frame: {:.0} MB from {} shaders; the most: {}",
+        all as f64 / frames / 1048576.0,
+        top.len(),
+        shown.join("; ")
+    );
+}
+
 /// The 64 KiB pieces of title memory that copy-backs wrote (what shaders
 /// or the card's copies wrote, found differing), while extents are made.
 static CARD_PIECES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);

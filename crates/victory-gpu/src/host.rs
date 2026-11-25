@@ -2186,9 +2186,10 @@ fn fetch_queue() -> bool {
 /// fence is signalled. A console's CPU reading the memory while the later
 /// work runs sees the same; where the later flight writes nothing in the
 /// piece (the usual case: views declared written whole), nothing differs.
-/// Its own landing merges what it wrote afterwards as before: the merge
-/// takes only bytes that differ from the CPU's side, which takes what it
-/// merged. Pieces a send of title bytes numbered after the landed flights
+/// Its own landing fetches every such piece again, flagged by its compare
+/// or not ([`EARLY_FETCHED`]), and merges what it wrote afterwards: the
+/// merge takes only bytes that differ from the CPU's side, which takes
+/// what it merged. Pieces a send of title bytes numbered after the landed flights
 /// went to stay on the one queue (the card's side may be older there).
 ///
 /// In the world, at the same 4,800 draws a frame: 120 ms a frame (run
@@ -2240,6 +2241,31 @@ static LANDING_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::at
 /// piece, end). Noted under that lock as the flight goes to the queue.
 static QUICK_DECLARED: Mutex<std::collections::BTreeMap<u64, Vec<(usize, u32, u32)>>> =
     Mutex::new(std::collections::BTreeMap::new());
+
+/// [`fetch_queue_loose`]: the pieces fetched on the copy queue while a
+/// newer flight that declares them written was in the air, by the place in
+/// [`QUEUE_ORDER`] of the newest such flight: (copy, from, to, piece). Its
+/// landing fetches them again whatever its compare says. The compare
+/// tells what differs from the bytes hashed when ranges were last sent
+/// up, not from what the early fetch put in: a piece the flight wrote
+/// partly by then and whose final bytes match the hash (written and
+/// restored, or written back to what the last send held) was not
+/// flagged, and title memory kept the bytes of the middle of the flight.
+/// `VICTORY_EARLY_REFETCH=0` leaves them to the compare, as before.
+#[allow(clippy::type_complexity)]
+static EARLY_FETCHED: Mutex<
+    std::collections::BTreeMap<u64, Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, (usize, u32))>>,
+> = Mutex::new(std::collections::BTreeMap::new());
+
+fn early_refetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_REFETCH").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: pieces fetched again at the landing of
+/// the flight they were fetched early under ([`EARLY_FETCHED`]), and of
+/// them those its compare had not flagged.
+static EARLY_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of [`fetch_queue`]: pieces fetched on
 /// the copy queue and their bytes; pieces kept on the one queue because a
@@ -3185,6 +3211,8 @@ fn late_line(frames: f64) {
             "fetches on the copy queue per frame (VICTORY_FETCH_QUEUE=1): {:.1} pieces {:.1} MB in {:.1} landings, {:.1} ms \
              waited for them; {:.1} pieces a newer flight declares (on the one queue unless VICTORY_FETCH_QUEUE=2), \
              {:.1} a newer send went to (on the one queue); \
+             fetched again at the landing of the flight they were fetched early under {:.1}, \
+             {:.1} of them not flagged by its compare (VICTORY_EARLY_REFETCH); \
              compared {} (alike {}, different {})",
             q[0],
             q[1] / (1 << 20) as f64,
@@ -3192,6 +3220,8 @@ fn late_line(frames: f64) {
             q[5] / 1000.0,
             q[2],
             q[3],
+            EARLY_STATS[0].swap(0, Ordering::Relaxed) as f64 / frames,
+            EARLY_STATS[1].swap(0, Ordering::Relaxed) as f64 / frames,
             QUICK_STATS[6].load(Ordering::Relaxed),
             QUICK_STATS[7].load(Ordering::Relaxed),
             QUICK_STATS[8].load(Ordering::Relaxed),
@@ -4138,11 +4168,18 @@ impl Host {
         let mut quick: Vec<FetchPiece> = Vec::new();
         {
             let declared = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
-            let newer: Vec<&(usize, u32, u32)> = declared.range(floor + 1..).flat_map(|(_, v)| v.iter()).collect();
+            let newer: Vec<(u64, &(usize, u32, u32))> =
+                declared.range(floor + 1..).flat_map(|(&n, v)| v.iter().map(move |d| (n, d))).collect();
             let (mut by_flight, mut by_send) = (0u64, 0u64);
+            let mut early: Vec<(u64, FetchPiece)> = Vec::new();
             pieces.retain(|p| {
                 let (shadow, lo, hi, _, (copy, piece)) = p;
-                if newer.iter().any(|&&(c, a, b)| c == *copy && a <= *piece && *piece < b) {
+                let newest = newer
+                    .iter()
+                    .filter(|&&(_, &(c, a, b))| c == *copy && a <= *piece && *piece < b)
+                    .map(|&(n, _)| n)
+                    .max();
+                if newest.is_some() {
                     by_flight += 1;
                     if !fetch_queue_loose() {
                         return true;
@@ -4152,9 +4189,18 @@ impl Host {
                     by_send += 1;
                     return true;
                 }
+                if let Some(n) = newest {
+                    early.push((n, p.clone()));
+                }
                 quick.push(p.clone());
                 checking
             });
+            if !early.is_empty() && early_refetch() {
+                let mut e = EARLY_FETCHED.lock().unwrap_or_else(|e| e.into_inner());
+                for (n, (shadow, lo, hi, _, piece)) in early {
+                    e.entry(n).or_default().push((shadow, lo, hi, piece));
+                }
+            }
             QUICK_STATS[2].fetch_add(by_flight, Ordering::Relaxed);
             QUICK_STATS[3].fetch_add(by_send, Ordering::Relaxed);
         }
@@ -4475,6 +4521,30 @@ impl Host {
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+        }
+        // Pieces fetched early under these flights: fetched again now,
+        // whatever the compare says (`EARLY_FETCHED`).
+        {
+            let floor = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+            let mut e = EARLY_FETCHED.lock().unwrap_or_else(|e| e.into_inner());
+            if floor > 0 && !e.is_empty() {
+                let rest = e.split_off(&(floor + 1));
+                let due = std::mem::replace(&mut *e, rest);
+                drop(e);
+                let mut have: std::collections::HashSet<(usize, usize, usize)> =
+                    pieces.iter().map(|p| (Arc::as_ptr(&p.0) as usize, p.1, p.2)).collect();
+                let (mut again, mut unflagged) = (0u64, 0u64);
+                for (shadow, lo, hi, piece) in due.into_values().flatten() {
+                    if have.insert((Arc::as_ptr(&shadow) as usize, lo, hi)) {
+                        unflagged += 1;
+                        pieces.push((shadow, lo, hi, total, piece));
+                        total += (hi - lo) as u64;
+                    }
+                    again += 1;
+                }
+                EARLY_STATS[0].fetch_add(again, Ordering::Relaxed);
+                EARLY_STATS[1].fetch_add(unflagged, Ordering::Relaxed);
             }
         }
         // `VICTORY_LAZY_BACK=1`: what this landing merges, protected after.

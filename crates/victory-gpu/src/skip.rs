@@ -21,6 +21,10 @@
 //! `02384a60` alone: in run zall6sk1 1,374 of its 1,376 runs were left out,
 //! 0 wrong, after a check run (zall6sk) with none that changed something.
 //!
+//! Each sampled run is timed on the card too (two timestamps around the
+//! dispatch): with `=check` the frame line gives the milliseconds a frame
+//! the runs to be left out would have saved, by shader.
+//!
 //! What the hashes cannot see makes a dispatch one that is not followed:
 //! textures, title memory read by address, buffers picked from the heap by
 //! a computed index, and more bound bytes than `VICTORY_DISPATCH_SKIP_MB`
@@ -531,11 +535,17 @@ static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
 struct Back {
     id: u64,
     hash: String,
-    data: Box<[u32; 16]>,
+    data: Box<[u32; BACK_DWORDS]>,
     done: Box<AtomicU32>,
     /// Frame-rate lines seen waiting (a list never run is let go).
     age: u32,
+    /// Whether the run's dispatch was timed (the last four dwords).
+    timed: bool,
 }
+
+/// By shader hash: sampled runs timed and their microseconds on the card
+/// (since the start); and the runs to be left out as of the last line.
+static TIMED: Mutex<Option<HashMap<String, (u64, f64, u64)>>> = Mutex::new(None);
 
 static BACKS: Mutex<Vec<Back>> = Mutex::new(Vec::new());
 /// Per key: its shader and its latest header.
@@ -567,7 +577,25 @@ pub(crate) fn wanted(hash: &str) -> bool {
 pub(crate) struct Plan {
     state: ID3D12Resource,
     spans: Vec<Span>,
-    back: Option<(Box<[u32; 16]>, Box<AtomicU32>, u64, String)>,
+    back: Option<(Box<[u32; BACK_DWORDS]>, Box<AtomicU32>, u64, String, Option<ID3D12QueryHeap>)>,
+}
+
+/// What a sampled run brings back: the state's header, then the two
+/// timestamps around the dispatch.
+const BACK_DWORDS: usize = HEADER as usize / 4 + 4;
+
+/// Two timestamps' query heap, for a sampled run.
+fn stamp_heap() -> Option<ID3D12QueryHeap> {
+    let host = crate::host::host()?;
+    let desc = D3D12_QUERY_HEAP_DESC {
+        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+        Count: 2,
+        NodeMask: 0,
+    };
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    // SAFETY: plain creation.
+    unsafe { host.device.CreateQueryHeap(&desc, &mut heap) }.ok()?;
+    heap
 }
 
 impl Plan {
@@ -645,10 +673,11 @@ pub(crate) fn before(list: &crate::host::HostList, c: Collect, key: u64, groups:
     track.runs += 1;
     let back = (track.runs <= 8 || track.runs.is_multiple_of(32)).then(|| {
         (
-            Box::new([0u32; 16]),
+            Box::new([0u32; BACK_DWORDS]),
             Box::new(AtomicU32::new(0)),
             track.id,
             hash.to_owned(),
+            stamp_heap(),
         )
     });
     let state = track.state.clone();
@@ -656,6 +685,11 @@ pub(crate) fn before(list: &crate::host::HostList, c: Collect, key: u64, groups:
     // SAFETY: an open list; the state and the views' buffers live with it.
     unsafe { record_before(&list.list, h, &state, &spans, mode() == Mode::Skip, groups) };
     list.keep(&state);
+    if let Some(heap) = back.as_ref().and_then(|b| b.4.as_ref()) {
+        // SAFETY: an open list and our query heap (kept by the list).
+        unsafe { list.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0) };
+        list.keep(heap);
+    }
     Some(Plan { state, spans, back })
 }
 
@@ -666,15 +700,23 @@ pub(crate) fn after(list: &crate::host::HostList, plan: Plan) {
         return;
     };
     let Plan { state, spans, back } = plan;
-    let back = back.and_then(|b| Some((host.read_back_buffer(HEADER)?, b)));
-    // SAFETY: as in `before`.
+    let bytes = 4 * BACK_DWORDS;
+    let back = back.and_then(|b| Some((host.read_back_buffer(bytes as u64)?, b)));
+    let stamps = back.as_ref().and_then(|b| b.1.4.as_ref());
+    // SAFETY: as in `before`; our query heap.
     unsafe {
+        if let Some(heap) = stamps {
+            list.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        }
         record_after(&list.list, h, &state, &spans, mode() == Mode::Skip, back.as_ref().map(|b| &b.0));
+        if let (Some(heap), Some((buffer, _))) = (stamps, back.as_ref()) {
+            list.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, buffer, HEADER);
+        }
     }
-    if let Some((buffer, (mut data, done, id, hash))) = back {
-        list.defer_read_back(buffer, data.as_mut_ptr().cast(), [HEADER as usize, 1, HEADER as usize]);
+    if let Some((buffer, (mut data, done, id, hash, heap))) = back {
+        list.defer_read_back(buffer, data.as_mut_ptr().cast(), [bytes, 1, bytes]);
         list.defer_write(done.as_ptr().cast(), crate::queue::Written::Value(1), 4);
-        BACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Back { id, hash, data, done, age: 0 });
+        BACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Back { id, hash, data, done, age: 0, timed: heap.is_some() });
     }
 }
 
@@ -690,18 +732,30 @@ fn sums<'a>(last: impl Iterator<Item = &'a [u32; 16]>) -> [u64; 5] {
     s
 }
 
-/// For the frame-rate line: what came back, and pipelines given up.
-pub(crate) fn line() {
+/// For the frame-rate line: what came back, and pipelines given up;
+/// `frames` since the last.
+pub(crate) fn line(frames: f64) {
     if mode() == Mode::Off {
         return;
     }
     let mut backs = BACKS.lock().unwrap_or_else(|e| e.into_inner());
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let last = last.get_or_insert_with(HashMap::new);
+    let mut timed = TIMED.lock().unwrap_or_else(|e| e.into_inner());
+    let timed = timed.get_or_insert_with(HashMap::new);
+    let frequency = crate::host::host().map_or(0, crate::host::Host::timestamp_frequency);
     backs.retain_mut(|b| {
         if b.done.load(Ordering::Acquire) == 0 {
             b.age += 1;
             return b.age < 600;
+        }
+        if b.timed && frequency > 0 {
+            let at = HEADER as usize / 4;
+            let stamp = |i: usize| u64::from(b.data[at + 2 * i]) | (u64::from(b.data[at + 2 * i + 1]) << 32);
+            let ticks = stamp(1).saturating_sub(stamp(0));
+            let t = timed.entry(b.hash.clone()).or_insert((0, 0.0, 0));
+            t.0 += 1;
+            t.1 += ticks as f64 * 1e6 / frequency as f64;
         }
         let was = last.get(&b.id).map_or(0, |l| l.1[7]);
         if b.data[7] > was {
@@ -712,7 +766,9 @@ pub(crate) fn line() {
                 "dispatch skip: a run to be left out changed something"
             );
         }
-        last.insert(b.id, (b.hash.clone(), *b.data));
+        let mut header = [0u32; 16];
+        header.copy_from_slice(&b.data[..16]);
+        last.insert(b.id, (b.hash.clone(), header));
         false
     });
     drop(backs);
@@ -747,6 +803,31 @@ pub(crate) fn line() {
         last.iter().filter(|l| given.contains(l.1.0.as_str())).map(|l| *l.0).collect()
     };
     r.keys.retain(|_, t| !ids.contains(&t.id));
+    // The runs to be left out since the last line, at each shader's
+    // measured time a run: what leaving them out saves (with `=check`,
+    // where they all ran).
+    let mut saved: Vec<(String, f64, f64)> = Vec::new();
+    for (hash, s) in &listed {
+        let t = timed.entry(hash.clone()).or_insert((0, 0.0, 0));
+        let new = s[3].saturating_sub(t.2);
+        t.2 = s[3];
+        if t.0 > 0 {
+            let us = t.1 / t.0 as f64;
+            saved.push((hash.clone(), new as f64 * us / 1000.0 / frames.max(1.0), us));
+        }
+    }
+    saved.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if mode() == Mode::Check {
+        let text: Vec<String> = saved
+            .iter()
+            .take(8)
+            .map(|(h, ms, us)| format!("{}: {ms:.2} ms ({us:.0} us a run)", &h[..h.len().min(16)]))
+            .collect();
+        tracing::info!(
+            "dispatch skip (Check): runs to be left out would save about {:.2} ms a frame on the card, by their timed runs; {text:?}",
+            saved.iter().map(|s| s.1).sum::<f64>()
+        );
+    }
     let all = sums(last.values().map(|l| &l.1));
     listed.sort_by_key(|l| std::cmp::Reverse(l.1[3]));
     let top: Vec<String> = listed

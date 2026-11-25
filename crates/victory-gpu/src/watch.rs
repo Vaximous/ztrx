@@ -206,6 +206,23 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 pub(crate) fn ask_once_end() {
     QUERY_STANDS.store(false, std::sync::atomic::Ordering::Relaxed);
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ask_once_written();
+}
+
+/// Title memory was written in a way the journal was not told (a step of
+/// ours ran): the submission's one asking no longer stands, but what
+/// Windows said of unmapped blocks does. A write commits nothing, and
+/// commits the runtime is not told of are seen from the next submission
+/// on in any case ([`query_once`]). Ending both made every refresh after
+/// such a step ask Windows about each hole again: `VirtualQuery` was 12%
+/// of the submitting thread (run zl3, `VICTORY_PROFILE`).
+/// `VICTORY_QUERY_PAST_RUNS=0` ends both, as before.
+pub(crate) fn ask_once_written() {
+    static PAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PAST.get_or_init(|| std::env::var_os("VICTORY_QUERY_PAST_RUNS").is_none_or(|v| v != "0")) {
+        QUERY_STANDS.store(false, std::sync::atomic::Ordering::Relaxed);
+        QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;

@@ -6537,7 +6537,7 @@ impl HostList {
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
+                        crate::watch::ask_once_written();
                     }
                     #[cfg(feature = "diagnostics")]
                     {

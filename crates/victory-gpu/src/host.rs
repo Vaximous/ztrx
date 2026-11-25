@@ -8624,6 +8624,14 @@ impl Meter {
                 );
             }
             {
+                let [looked, differed, lasting, recopied] =
+                    [0, 1, 2, 3].map(|i| crate::shadow::AUDIT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "host copies audited against title memory since the start: {looked} pages, {differed} differed where the \
+                     watch says unwritten, {lasting} pages stale two frames or more; {recopied} copied again (VICTORY_BUFFER_RECHECK)"
+                );
+            }
+            {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =

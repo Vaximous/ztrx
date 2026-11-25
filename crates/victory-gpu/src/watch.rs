@@ -398,6 +398,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// Whether the page at `at` (page aligned) is known unwritten since it was
+/// last asked about: a guarded block still read-only and clean (a write
+/// of the title's would have faulted and opened it), or write-watched
+/// memory the kernel reports unwritten since its last reset. False when
+/// it cannot tell. For `crate::shadow`'s audit: a copy that differs from
+/// such a page missed a write.
+pub(crate) fn unwritten_since_asked(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let block = at / BLOCK;
+    {
+        let g = guards();
+        if g.protected.contains(&block) {
+            return g.clean.contains(block) && !g.windowed.contains_key(&block);
+        }
+        if g.absent.contains(&block) {
+            return false;
+        }
+    }
+    let mut found = [0usize; PAGE / KERNEL_PAGE];
+    let (mut count, mut granularity) = (found.len(), 0);
+    // SAFETY: the answer buffer holds `count` entries; no reset.
+    let failed = unsafe {
+        GetWriteWatch(0, at as *const _, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+    } != 0;
+    !failed && count == 0
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 

@@ -2870,7 +2870,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
                 }
                 let (hash, why) = UNEXTENDED.get();
                 if hash != 0 && !matches!(extent, Some(Some(_))) {
-                    crate::extent::declared_whole(hash, if why.is_empty() { "unbounded" } else { why }, len);
+                    let why = match why {
+                        "" if GROUPS.get() == Some(crate::indirect::MOST_GROUPS) => {
+                            "unbounded: an indirect dispatch, its group count not known"
+                        }
+                        "" => "unbounded",
+                        why => why,
+                    };
+                    crate::extent::declared_whole(hash, why, len);
                 }
                 if let (Some(Some(extent)), Some(at)) = (extent, at)
                     && !shadow.in_place()

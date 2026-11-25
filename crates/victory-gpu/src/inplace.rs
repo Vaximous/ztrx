@@ -1243,6 +1243,33 @@ mod tests {
         assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
+    /// The probe on this PC's card (`cargo test -p victory-gpu --
+    /// --ignored card_probe --nocapture`): what its driver makes of the
+    /// openings, and what reading title memory in place costs the card
+    /// against today's shared buffers, 256 MB each.
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_probe() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries and device creation on the first
+        // high-performance adapter.
+        let device = unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!("adapter: {}, {} MB of its own memory", name.trim_end_matches(' '), desc.DedicatedVideoMemory >> 20);
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        let probe = probe(&device, &|| None, 256);
+        for line in &probe.lines {
+            eprintln!("in place probe: {line}");
+        }
+    }
+
     /// Stage 1's own call on the software adapter: a title buffer that
     /// begins and ends off the 64 KiB lines is placed over its pages, the
     /// GPU reads the buffer's bytes at the offset the views use, and its

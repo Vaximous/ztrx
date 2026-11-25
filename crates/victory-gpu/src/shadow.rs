@@ -1464,7 +1464,7 @@ pub(crate) fn back_line(frames: f64) {
             d[8],
         );
         crate::extent::check_line();
-        crate::skip::line();
+        crate::skip::line(frames);
         crate::extent::whole_line(frames);
         crate::lazy::line(frames);
         crate::lazy::early_line(frames);

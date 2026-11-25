@@ -1596,7 +1596,7 @@ mod most_groups {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -1634,7 +1634,7 @@ void main() {
     }
 
     /// Held by the [`WarpHarness`] alive.
-    static WARP_ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static WARP_ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl WarpHarness {
         fn new() -> Option<Self> {

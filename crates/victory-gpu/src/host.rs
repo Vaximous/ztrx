@@ -856,6 +856,9 @@ pub(crate) struct HostList {
     /// instead ([`read_fixup`]): destination (scratch chunk, offset), host
     /// copy and offset, bytes; the list's prelude records them.
     fixups: Mutex<Vec<Fixup>>,
+    /// With [`fixup_check`]: the fills to compare when the list is reset:
+    /// upload memory, title memory, bytes, whether sent to the card.
+    fill_checks: Mutex<Vec<(usize, usize, usize, bool)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -2564,7 +2567,45 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{WRITTEN_SEEN, WRITTEN_STATS, fixup_hot, flagged_pieces, landable, written_landed};
+    use std::sync::atomic::Ordering;
+
+    /// `VICTORY_READ_FIXUP=recent`: pieces a landing flagged lately are
+    /// hot; pieces never flagged are not, whatever flights in the air
+    /// declare; pieces flagged long ago only while a flight declares them.
+    #[test]
+    fn pieces_seen_written_lately_or_declared_in_the_air_are_hot() {
+        let copy = 0xc000;
+        written_landed(&[(copy, 5)].into_iter().collect());
+        assert!(fixup_hot(copy, 4, 6, &[]));
+        assert!(!fixup_hot(copy, 6, 9, &[(copy, 0, 100)]));
+        assert!(!fixup_hot(0xd000, 0, 9, &[(0xd000, 0, 100)]));
+        // Flagged long ago (frame 0, read far later is simulated by a piece
+        // whose frame is old): hot only while declared in the air.
+        WRITTEN_SEEN.lock().unwrap().0.entry(copy).or_default().insert(20, 0);
+        let frame = crate::queue::presented();
+        if frame > super::fixup_frames() {
+            assert!(!fixup_hot(copy, 20, 21, &[]));
+        }
+        assert!(fixup_hot(copy, 20, 21, &[(copy, 19, 22)]));
+    }
+
+    /// `VICTORY_WRITTEN_PROBE`: a landing that flags a piece of a spared
+    /// read counts it wrong and stops watching it; other pieces are noted
+    /// with their frame and leave the read watched.
+    #[test]
+    fn a_landing_that_writes_a_spared_read_counts_it_wrong() {
+        let wrong = WRITTEN_STATS[4].load(Ordering::Relaxed);
+        WRITTEN_SEEN.lock().unwrap().1.extend([(0xa000, 3, 5, 0), (0xb000, 0, 1, 0)]);
+        written_landed(&[(0xa000, 9)].into_iter().collect());
+        assert_eq!(WRITTEN_STATS[4].load(Ordering::Relaxed), wrong);
+        assert!(WRITTEN_SEEN.lock().unwrap().0[&0xa000].contains_key(&9));
+        written_landed(&[(0xa000, 4)].into_iter().collect());
+        assert_eq!(WRITTEN_STATS[4].load(Ordering::Relaxed), wrong + 1);
+        let seen = WRITTEN_SEEN.lock().unwrap();
+        assert!(!seen.1.iter().any(|w| w.0 == 0xa000));
+        assert!(seen.1.iter().any(|w| w.0 == 0xb000));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2807,12 +2848,87 @@ static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::ato
 /// more preparing on the submitting thread) to spare one wait of about 55 ms
 /// a frame: the card sat idle behind the submitting thread instead.
 pub(crate) fn read_fixup() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Off under `VICTORY_CARD_FILLS_CHECK`: its CPU fills are the compare.
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_READ_FIXUP").is_some_and(|v| v == "1") && !crate::cardcopy::fills_check_on()
+    read_fixup_mode() > 0
+}
+
+/// `VICTORY_READ_FIXUP`: 0 off (unset, as on `local/zall` since runs
+/// zall18d and zall18f0); 1 (`1`) every fill that would wait; 2 (`recent`,
+/// with the relay) only
+/// fills whose pieces flights were seen to write ([`fixup_hot`]): a fill
+/// in a copy in the card's memory, in pieces no landing flagged lately, is
+/// made by the CPU at submission as if no flight wrote there, and does not
+/// make the submission wait. Off under `VICTORY_CARD_FILLS_CHECK` (its CPU
+/// fills are the compare).
+///
+/// Why: the 174 MB title buffer in the card's memory is declared written
+/// whole by some 370 views a frame from over 300 shaders whose stores no
+/// extent bounds, so nearly every fill from it touches what flights may
+/// write, and `1` sent 5,000-6,000 of them a frame to the card (run
+/// zall19fx: 0.1 settles a frame, but some 40 ms more preparing). Most of
+/// them read constants the CPU wrote, which no shader writes. Whether a
+/// narrowing by what was seen written misses writes is what
+/// `VICTORY_WRITTEN_PROBE` counts ("such reads a later landing flagged")
+/// and `VICTORY_READ_FIXUP_CHECK` compares ([`fixup_check`]).
+fn read_fixup_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if crate::cardcopy::fills_check_on() {
+            return 0;
+        }
+        match std::env::var("VICTORY_READ_FIXUP").as_deref() {
+            Ok("1") => 1,
+            Ok("recent") if relay() => 2,
+            Ok("recent") => 1,
+            _ => 0,
+        }
     })
 }
+
+/// [`read_fixup_mode`] `recent`: a fill's pieces count as written by
+/// flights if a landing flagged one of them in the last
+/// `VICTORY_READ_FIXUP_FRAMES` frames (4), or flagged one ever and a
+/// flight in the air declares it written.
+fn fixup_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_READ_FIXUP_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// [`read_fixup_mode`] `recent`: whether pieces `[first, end)` of the copy
+/// in the card's memory at `copy` count as written by flights
+/// ([`fixup_frames`]). `in_air`: the pieces flights in the air declare,
+/// as `QUICK_DECLARED` holds them.
+fn fixup_hot(copy: usize, first: u32, end: u32, in_air: &[(usize, u32, u32)]) -> bool {
+    let frame = crate::queue::presented();
+    let window = fixup_frames();
+    let seen = WRITTEN_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pieces) = seen.0.get(&copy) else {
+        return false;
+    };
+    (first..end).any(|p| {
+        pieces.get(&p).is_some_and(|&f| {
+            f + window >= frame || in_air.iter().any(|&(c, a, b)| c == copy && a <= p && p < b)
+        })
+    })
+}
+
+/// `VICTORY_READ_FIXUP_CHECK=1`: the fills a submission's preparing found
+/// touching what flights may write (sent to the card, or made by the CPU
+/// as [`read_fixup_mode`] `recent` lets them) are compared when their
+/// list is next reset, after it ran: the bytes the upload memory holds
+/// against title memory then, which has the landed flights' writes.
+/// Differing bytes are bytes a list read that were not what the title
+/// held after the flights before it (or the title wrote them again since:
+/// a range that differs is logged, for the first 40, to tell which).
+fn fixup_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_READ_FIXUP_CHECK").is_ok_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line ([`read_fixup_mode`] `recent`): fills
+/// left to the CPU as their pieces were not seen written; with
+/// [`fixup_check`]: fills compared, those that differed sent to the card,
+/// those that differed left to the CPU, bytes that differed.
+static FIXUP_RECENT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Since the last frame-rate line ([`read_fixup`]): fills sent to the card
 /// at submission, submissions that did not wait for it, title copies sent
@@ -2935,7 +3051,7 @@ struct Fixup {
 /// than to the CPU before it. The title's memory-to-memory copies (runs
 /// that say where they copy) are title copies here too. A texture's bytes
 /// that touch any of it leave the submission waiting.
-fn fix_up_reads(runs: &[&HostList]) -> bool {
+fn fix_up_reads(runs: &[&HostList]) -> Option<Vec<(usize, usize)>> {
     use std::sync::Arc;
     let started = std::time::Instant::now();
     enum Seen {
@@ -2952,10 +3068,22 @@ fn fix_up_reads(runs: &[&HostList]) -> bool {
     }
     let bail = |why: usize| {
         FIXUP_BAIL[why].fetch_add(1, Ordering::Relaxed);
-        false
+        None
     };
     let most = fixup_most();
     let mut pending = line().written.clone();
+    // `recent`: fills left to the CPU (list, step), and the pieces flights
+    // in the air declare.
+    let recent = read_fixup_mode() == 2;
+    let mut spared: Vec<(usize, usize)> = Vec::new();
+    let mut spared_fills: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut converted_fills: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut copied: Vec<(usize, usize)> = Vec::new();
+    let in_air: Vec<(usize, u32, u32)> = if recent {
+        QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).values().flatten().copied().collect()
+    } else {
+        Vec::new()
+    };
     // (list, step, what)
     let mut plans: Vec<(usize, usize, Plan)> = Vec::new();
     for (l, list) in runs.iter().enumerate() {
@@ -2990,9 +3118,24 @@ fn fix_up_reads(runs: &[&HostList]) -> bool {
                     else {
                         return bail(0);
                     };
+                    // (Not one that reads what a title copy sent to the
+                    // card before it writes: that comes from the card.)
+                    if recent
+                        && !touches(&copied, src, src + len)
+                        && shadow.carded()
+                        && let Some(span) = shadow.card_span(src, src + len.max(1))
+                        && !fixup_hot(Arc::as_ptr(&shadow) as usize, span.first, span.first + span.pieces, &in_air)
+                    {
+                        spared.push((l, i));
+                        spared_fills.push((l, dst, src, len));
+                        continue;
+                    }
                     let Some((to, at)) = list.scratch_place(dst) else {
                         return bail(1);
                     };
+                    if fixup_check() {
+                        converted_fills.push((l, dst, src, len));
+                    }
                     plans.push((l, i, Plan::Fill(shadow, to, at, src, len)));
                     if plans.len() > most {
                         return bail(5);
@@ -3008,6 +3151,7 @@ fn fix_up_reads(runs: &[&HostList]) -> bool {
                     };
                     plans.push((l, i, Plan::Copy(from, to, dst, src, len)));
                     join_ranges(&mut pending, [(src, src + len), (dst, dst + len)]);
+                    join_ranges(&mut copied, [(dst, dst + len)]);
                 }
                 Seen::Other(a, b) => {
                     if touches(&pending, a, b) {
@@ -3081,8 +3225,17 @@ fn fix_up_reads(runs: &[&HostList]) -> bool {
         FIXUP_STATS[3].fetch_add(fixups.len() as u64, Ordering::Relaxed);
         list.fixups.lock().unwrap_or_else(|e| e.into_inner()).extend(fixups);
     }
+    FIXUP_RECENT[0].fetch_add(spared.len() as u64, Ordering::Relaxed);
+    if fixup_check() {
+        for (l, dst, src, len) in spared_fills {
+            runs[l].fill_checks.lock().unwrap_or_else(|e| e.into_inner()).push((dst, src, len, false));
+        }
+        for (l, dst, src, len) in converted_fills {
+            runs[l].fill_checks.lock().unwrap_or_else(|e| e.into_inner()).push((dst, src, len, true));
+        }
+    }
     FIXUP_NS[1].fetch_add(planned.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    true
+    Some(spared)
 }
 
 /// Since the last frame-rate line, of reads a submission waited for
@@ -3130,8 +3283,58 @@ fn note_read_flight(list: &HostList, step: usize, what: &str, lo: usize, hi: usi
     }
 }
 
+/// [`fixup_check`] for a list being reset: `checks` (upload memory, title
+/// memory, bytes, sent to the card) compared.
+fn check_fills(checks: &[(usize, usize, usize, bool)]) {
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut title = Vec::new();
+    for &(dst, src, len, card) in checks {
+        FIXUP_RECENT[1].fetch_add(1, Ordering::Relaxed);
+        title.clear();
+        title.resize(len, 0);
+        if !read_into(src as *const u8, &mut title) {
+            continue;
+        }
+        // SAFETY: the list's upload memory, alive until the reset that
+        // calls this; the list has run (it is reset only then).
+        let held = unsafe { std::slice::from_raw_parts(dst as *const u8, len) };
+        let differ = held.iter().zip(&title).filter(|(a, b)| a != b).count();
+        if differ == 0 {
+            continue;
+        }
+        FIXUP_RECENT[if card { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+        FIXUP_RECENT[4].fetch_add(differ as u64, Ordering::Relaxed);
+        if TOLD.fetch_add(1, Ordering::Relaxed) < 40 {
+            let first = held.iter().zip(&title).position(|(a, b)| a != b).unwrap_or(0);
+            let carded = crate::shadow::carded_at(src as u64, len as u64).is_some();
+            tracing::warn!(
+                src = format_args!("{src:#x}+{len:#x}"),
+                differ,
+                first = format_args!("{:#x}", src + first),
+                sent_to_card = card,
+                carded,
+                frame = crate::queue::presented(),
+                "VICTORY_READ_FIXUP_CHECK: a fill's bytes as the list read them differ from title memory after it ran"
+            );
+        }
+    }
+}
+
 /// For the frame-rate line: [`READ_FLIGHT`] and [`FIXUP_STATS`].
 pub(crate) fn read_flight_line(frames: f64) {
+    if written_probe() {
+        written_line(frames);
+    }
+    if read_fixup_mode() == 2 || fixup_check() {
+        let [left, compared, card, cpu, bytes] = [0, 1, 2, 3, 4].map(|i| FIXUP_RECENT[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "VICTORY_READ_FIXUP={} per frame: {:.1} fills left to the CPU as no landing flagged their pieces lately; \
+             VICTORY_READ_FIXUP_CHECK since the last line: {compared} fills compared, \
+             {card} sent to the card and {cpu} left to the CPU differed ({bytes} bytes)",
+            if read_fixup_mode() == 2 { "recent" } else { "1" },
+            left as f64 / frames,
+        );
+    }
     let [after, before, unknown] = [0, 1, 2].map(|i| READ_FLIGHT[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let [fixed, spared, copies, recorded] = [0, 1, 2, 3].map(|i| FIXUP_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let [planning, making, recording] = [0, 1, 2].map(|i| FIXUP_NS[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
@@ -3267,7 +3470,11 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    let why = blocked_by(&written, runs, true);
+    if why == Some(WHY_READ) && written_probe() {
+        written_read(&written, runs);
+    }
+    why
 }
 
 /// Reads that waited for flights ([`relay_exact`]), by where the newest
@@ -3354,18 +3561,24 @@ fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
         let Late::Run(flight) = item else {
             return None;
         };
-        flight.lists.iter().find_map(|l| {
+        // The first declaration of it in the flight, and how many views
+        // of how many shaders there declare it.
+        let mut first = None;
+        let (mut views, mut shaders) = (0u64, std::collections::BTreeSet::new());
+        for l in &flight.lists {
             let declared = l.host().declared.lock().unwrap_or_else(|e| e.into_inner());
-            declared
-                .iter()
-                .find(|&&(a, n, ..)| a < at + len && at < a + n)
-                .map(|&d| (d, flight.number, flight.sent_at))
-        })
+            for d in declared.iter().filter(|&&(a, n, ..)| a < at + len && at < a + n) {
+                first.get_or_insert(*d);
+                views += 1;
+                shaders.insert(d.5.0);
+            }
+        }
+        first.map(|d| (d, flight.number, flight.sent_at, views, shaders.len()))
     });
     drop(line);
     let now = std::time::Instant::now();
     let frame = crate::queue::presented();
-    let Some(((address, bytes, narrowed, recorded, recorded_frame, (hash, why)), number, sent)) = found else {
+    let Some(((address, bytes, narrowed, recorded, recorded_frame, (hash, why)), number, sent, views, shaders)) = found else {
         static UNFOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if UNFOUND.fetch_add(1, Ordering::Relaxed) < 20 {
             tracing::info!(
@@ -3388,7 +3601,7 @@ fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
         tracing::info!(
             "a read waits for flight {number}: {what} at {at:#x}+{len:#x}, declared by a table view {address:#x}+{bytes:#x} \
              ({}) of shader {hash:016x} ({why}), recorded in frame {recorded_frame} (now {frame}), {:.1} ms before the flight was sent, which was \
-             {:.1} ms ago",
+             {:.1} ms ago; {views} views of {shaders} shaders in that flight declare it",
             if narrowed { "narrowed by its store extent" } else { "whole" },
             to_send as f64 / 1000.0,
             to_read as f64 / 1000.0,
@@ -3396,10 +3609,164 @@ fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
     }
 }
 
+/// `VICTORY_WRITTEN_PROBE=1` (with the relay; counts only, changes
+/// nothing): how many of the reads that make a submission wait for flights
+/// a narrowing by what flights were seen to write would spare, and how
+/// many of those it would get wrong.
+///
+/// The 174 MB title buffer in the card's memory is declared written whole
+/// by some 370 table views a frame, from over 300 compute shaders whose
+/// stores no extent bounds (the frame line of views declared whole), so
+/// narrowing one shader's declaration spares no wait: the next view in the
+/// same flight declares the read too. What a flight did write is known at
+/// its landing: the pieces its compare flagged (`Host::relay_card_back`).
+/// Kept here per copy: the frame each 64 KiB piece was last flagged in.
+///
+/// At a read that waits ([`late_blocked`]): if every read of the submission
+/// that touches what flights may write lies in a copy in the card's memory,
+/// in pieces no landing flagged in the last `VICTORY_WRITTEN_PROBE_FRAMES`
+/// frames (2), a narrowing to the pieces seen written would have spared
+/// the wait; its milliseconds are counted, and its pieces watched. A
+/// later landing that flags one of them is a wait it would have wrongly
+/// spared (the read would have taken bytes from before a shader's write).
+fn written_probe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var("VICTORY_WRITTEN_PROBE").is_ok_and(|v| v == "1"))
+}
+
+/// [`written_probe`]'s window, in frames.
+fn written_probe_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_WRITTEN_PROBE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+}
+
+/// [`written_probe`]'s record: per copy (its address), per piece, the
+/// frame a landing last flagged it in; and the reads it would have spared
+/// still watched: (copy, first piece, end, frame of the read).
+#[allow(clippy::type_complexity)]
+static WRITTEN_SEEN: Mutex<(std::collections::BTreeMap<usize, std::collections::BTreeMap<u32, u64>>, Vec<(usize, u32, u32, u64)>)> =
+    Mutex::new((std::collections::BTreeMap::new(), Vec::new()));
+
+/// Since the last frame-rate line, of [`written_probe`]: submissions that
+/// waited for a read; of them, those whose reads all lie in copies in the
+/// card's memory; of them, those a narrowing would have spared; the
+/// microseconds those waited; spared reads a later landing found written
+/// (wrong); spared reads no landing wrote within the window after (right).
+static WRITTEN_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+thread_local! {
+    /// [`written_probe`]: the submission being prepared would have been
+    /// spared its wait, for the wait's time.
+    static WRITTEN_SPARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`written_probe`] at a landing: `flagged`, the pieces (copy, piece) the
+/// landed flights' compares flagged (or did not compare).
+fn written_landed(flagged: &std::collections::HashSet<(usize, u32)>) {
+    let frame = crate::queue::presented();
+    let window = written_probe_frames();
+    let mut seen = WRITTEN_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (pieces, watched) = &mut *seen;
+    for &(copy, piece) in flagged {
+        pieces.entry(copy).or_default().insert(piece, frame);
+    }
+    watched.retain(|&(copy, first, end, at)| {
+        if flagged.iter().any(|&(c, p)| c == copy && first <= p && p < end) {
+            WRITTEN_STATS[4].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if frame > at + window {
+            WRITTEN_STATS[5].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    });
+}
+
+/// [`written_probe`] at a submission about to wait for a read of what
+/// flights may write (`written`): whether a narrowing to the pieces seen
+/// written would have spared it (noted for the wait's time).
+fn written_read(written: &[(usize, usize)], runs: &[&HostList]) {
+    WRITTEN_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let mut reads: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match *step {
+                Step::Copy(dst, src, len) => {
+                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                        reads.extend([(src, len), (dst, len)]);
+                    }
+                }
+                Step::Fill(_, src, len) if touches(written, src, src + len) => reads.push((src, len)),
+                Step::Texture(ref staging) => {
+                    let (at, len) = staging.memory();
+                    if touches(written, at, at + len) {
+                        return;
+                    }
+                }
+                Step::Run(_, Some((dst, src, len))) if known_writes() => {
+                    if touches(written, src, src.saturating_add(len)) || touches(written, dst, dst.saturating_add(len)) {
+                        return;
+                    }
+                }
+                Step::Run(..) => return,
+                _ => {}
+            }
+        }
+    }
+    let frame = crate::queue::presented();
+    let window = written_probe_frames();
+    let mut watch: Vec<(usize, u32, u32)> = Vec::new();
+    for &(at, len) in &reads {
+        let Some(shadow) = crate::shadow::carded_at(at as u64, len.max(1) as u64) else {
+            return;
+        };
+        let Some(span) = shadow.card_span(at, at + len.max(1)) else {
+            return;
+        };
+        watch.push((std::sync::Arc::as_ptr(&shadow) as usize, span.first, span.first + span.pieces));
+    }
+    WRITTEN_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let recent = {
+        let seen = WRITTEN_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        watch.iter().any(|&(copy, first, end)| {
+            seen.0.get(&copy).is_some_and(|p| (first..end).any(|i| p.get(&i).is_some_and(|&f| f + window >= frame)))
+        })
+    };
+    if recent {
+        return;
+    }
+    WRITTEN_STATS[2].fetch_add(1, Ordering::Relaxed);
+    WRITTEN_SPARED.set(true);
+    let mut seen = WRITTEN_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    seen.1.extend(watch.into_iter().map(|(c, a, b)| (c, a, b, frame)));
+}
+
+/// For the frame-rate line: [`WRITTEN_STATS`].
+fn written_line(frames: f64) {
+    let [waited, carded, spared, us, wrong, right] = [0, 1, 2, 3, 4, 5].map(|i| WRITTEN_STATS[i].swap(0, Ordering::Relaxed));
+    tracing::info!(
+        "VICTORY_WRITTEN_PROBE per frame: {:.1} submissions waited for a read, {:.1} of them reading only copies in the \
+         card's memory, {:.1} reading only pieces no landing flagged in the last {} frames ({:.1} ms of waiting); \
+         since the last line, such reads a later landing flagged {wrong}, none within the window {right}",
+        waited as f64 / frames,
+        carded as f64 / frames,
+        spared as f64 / frames,
+        written_probe_frames(),
+        us as f64 / 1e3 / frames,
+    );
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_by_skipping(written, runs, count, &[])
+}
+
+/// [`blocked_by`], leaving out the steps `skip` names (list, step): fills
+/// [`fix_up_reads`] left to the CPU.
+fn blocked_by_skipping(written: &[(usize, usize)], runs: &[&HostList], count: bool, skip: &[(usize, usize)]) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3409,8 +3776,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             note_read_flight(runs[l], step, what, lo, hi);
         }
     }
-    for list in runs {
-        for step in &list.deferred().copies {
+    for (l, list) in runs.iter().enumerate() {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if !skip.is_empty() && skip.contains(&(l, i)) {
+                continue;
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
@@ -4483,6 +4853,7 @@ impl Host {
                 scratch: Mutex::default(),
                 card_scratch: Mutex::default(),
                 fixups: Mutex::default(),
+                fill_checks: Mutex::default(),
                 fill_groups: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -5530,6 +5901,9 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
+                if written_probe() || read_fixup_mode() == 2 {
+                    written_landed(&fetched);
+                }
                 // The ring's slot of each piece the flight pushed down.
                 let mut slots = std::collections::HashMap::new();
                 if let (Some((_, ring_slots)), Some(_)) = (ring, plan.push)
@@ -6374,22 +6748,22 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs)
-            && !(why == WHY_READ && read_fixup() && fix_up_reads(runs) && {
+            && !(why == WHY_READ && read_fixup() && fix_up_reads(runs).is_some_and(|spared| {
                 let written = line().written.clone();
-                let clear = blocked_by(&written, runs, false).is_none();
+                let clear = blocked_by_skipping(&written, runs, false, &spared).is_none();
                 FIXUP_STATS[1].fetch_add(u64::from(clear), Ordering::Relaxed);
                 if !clear {
                     note_still_blocked(&written, runs);
                 }
                 fixed_up.set(clear);
                 clear
-            })
+            }))
         {
+            let waiting = std::time::Instant::now();
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 let place = read_place(runs);
-                let waiting = std::time::Instant::now();
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
                 if let Some(newest) = place {
                     READ_PLACE[if newest { 5 } else { 6 }]
@@ -6397,6 +6771,9 @@ impl Host {
                 }
             } else {
                 self.settle(&mut submitted, why);
+            }
+            if WRITTEN_SPARED.replace(false) {
+                WRITTEN_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
         let behind = late && flying();
@@ -7003,6 +7380,10 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.fixups.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let checks = std::mem::take(&mut *self.fill_checks.lock().unwrap_or_else(|e| e.into_inner()));
+        if !checks.is_empty() {
+            check_fills(&checks);
+        }
         self.hoist().clear();
         #[cfg(feature = "diagnostics")]
         self.declared.lock().unwrap_or_else(|e| e.into_inner()).clear();

@@ -2799,6 +2799,15 @@ fn merge_runs() -> usize {
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
+    struct Timed(std::time::Instant);
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            let check = &crate::cardcopy::STALE_CHECK;
+            check[0].fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            check[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let _timed = Timed(std::time::Instant::now());
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
@@ -6371,14 +6380,16 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
-    ) {
+    ) -> bool {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
+        let new = deferred.refreshed.insert(key);
+        if new {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+        new
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's

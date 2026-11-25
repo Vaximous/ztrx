@@ -1893,10 +1893,11 @@ impl Shadow {
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
-    /// and keeps the copy alive until the list is reset.
-    pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    /// and keeps the copy alive until the list is reset. Whether that was
+    /// new to the list (not the same range again).
+    pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) -> bool {
         let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        list.defer_refresh(self, address as usize, len as usize)
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {

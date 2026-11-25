@@ -38,18 +38,41 @@ pub(crate) fn on() -> bool {
 /// and waiting for each (run zall8cc: still 1.0 settle a frame, 55-69 ms),
 /// and with card copies off the same flights' outputs made a buffer copy
 /// wait instead (run zall8a, 1.0 a frame, 60 ms).
+///
+/// Learned whole, 10-13k fills a frame were done by the card (run zall10:
+/// preparing 67 to 103 ms a frame, the copy-back 57 to 82, median frame
+/// 137 to 173-178 ms). `VICTORY_CARD_LEARN_BLOCK=<KB>` (takes the place of
+/// the whole buffer) learns the range read widened to blocks of that many
+/// KB, aligned in title memory and cut to the buffer: a ring buffer's next
+/// reads nearby are caught, the rest of a big buffer is not.
 fn learned_range(src: usize, len: usize) -> (usize, usize) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_LEARN_WHOLE").is_none_or(|v| v != "0"))
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static BLOCK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let block = *BLOCK.get_or_init(|| {
+        std::env::var("VICTORY_CARD_LEARN_BLOCK").ok().and_then(|v| v.parse::<usize>().ok()).map_or(0, |kb| kb << 10)
+    });
+    let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_LEARN_WHOLE").is_none_or(|v| v != "0"));
+    if (whole || block != 0)
         && let Some(copy) = crate::shadow::find(src as u64, len as u64)
     {
         let start = copy.title_start() as usize;
-        let whole = copy.left(start as u64) as usize;
-        if start <= src && src + len <= start + whole {
-            return (start, whole);
+        let buffer = (start, start + copy.left(start as u64) as usize);
+        if buffer.0 <= src && src + len <= buffer.1 {
+            return in_blocks(src, len, if block != 0 { block } else { usize::MAX }, buffer);
         }
     }
     (src, len)
+}
+
+/// `[src, src + len)` widened to `block`-aligned blocks (`usize::MAX`: the
+/// whole buffer), cut to `buffer` (start, end): start and length.
+fn in_blocks(src: usize, len: usize, block: usize, buffer: (usize, usize)) -> (usize, usize) {
+    if block == usize::MAX {
+        return (buffer.0, buffer.1 - buffer.0);
+    }
+    let from = (src / block * block).max(buffer.0);
+    let to = (src + len).next_multiple_of(block).min(buffer.1);
+    (from, to - from)
 }
 
 /// `VICTORY_CARD_COPIES_CHECK=1`: the first copies done by the card are
@@ -336,7 +359,21 @@ static LEARNED_FILLS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// of all time: sources learned, compared, alike, different; since the
 /// last line: copies recorded for the fills, barrier calls recorded for
 /// them.
-static FILL_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static FILL_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Since the last frame-rate line, where the fills' cost may land:
+/// [`try_fill`]'s own time (us, recording), its fills from host copies
+/// flights' shaders may be writing, and the new refreshes they added to
+/// their lists ([`HostList::defer_refresh`]).
+const FILL_US: usize = 8;
+const FILL_UNDER_FLIGHTS: usize = 9;
+const FILL_REFRESHES: usize = 10;
+
+/// Since the last frame-rate line: time (us) and calls of the submission's
+/// check for refreshes of memory flights may write (`host`'s
+/// `stale_under_flights`, per copy over the span of its refreshed ranges:
+/// fills spread over a buffer widen the span).
+pub(crate) static STALE_CHECK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether a draw's or dispatch's fills on the card ([`try_fill`]) are
 /// recorded together when its binding is done ([`batched`]): one wait for
@@ -546,6 +583,16 @@ static FILLS_COMPARED: Mutex<Vec<FillCompared>> = Mutex::new(Vec::new());
 /// stand-in of the list's, at this place in the list: the stand-in's
 /// address, for the view. None: the caller fills upload memory as before.
 pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
+    let start = std::time::Instant::now();
+    let filled = fill(list, src, len);
+    if filled.is_some() {
+        FILL_STATS[FILL_US].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    filled
+}
+
+/// [`try_fill`].
+fn fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     use windows::Win32::Graphics::Direct3D12::*;
     if !fills_on() || len == 0 || !overlaps(&LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src as usize, len as usize)
     {
@@ -571,7 +618,12 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     let (stand_in, at, first) = list.card_scratch(len)?;
     // The title's bytes sent up before the submission (where flights write
     // the memory, the refresh leaves their bytes alone).
-    from.refresh(list, src, len);
+    if from.refresh(list, src, len) {
+        FILL_STATS[FILL_REFRESHES].fetch_add(1, Ordering::Relaxed);
+    }
+    if from.writes_pending() {
+        FILL_STATS[FILL_UNDER_FLIGHTS].fetch_add(1, Ordering::Relaxed);
+    }
     let check = fills_check_on() && FILL_STATS[3].load(Ordering::Relaxed) < CHECKS_MOST;
     // SAFETY: a live buffer.
     let gpu = unsafe { stand_in.GetGPUVirtualAddress() } + at;
@@ -712,6 +764,16 @@ pub(crate) fn line(frames: f64) {
         let bytes = FILL_STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let copies = FILL_STATS[6].swap(0, Ordering::Relaxed) as f64 / frames;
         let barriers = FILL_STATS[7].swap(0, Ordering::Relaxed) as f64 / frames;
+        let [us, under, refreshes] =
+            [FILL_US, FILL_UNDER_FLIGHTS, FILL_REFRESHES].map(|i| FILL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let [stale_us, stale_calls] = [0, 1].map(|i| STALE_CHECK[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "card fills' cost per frame: {:.2} ms recording them; {under:.0} from host copies flights may write; \
+             {refreshes:.0} refreshes they added; submissions' check of refreshes under flights {:.2} ms in \
+             {stale_calls:.1} calls",
+            us / 1e3,
+            stale_us / 1e3,
+        );
         tracing::info!(
             "constants copied on the card instead of filled per frame (VICTORY_CARD_FILLS=1): {made:.1}, {:.1} KB, in \
              {copies:.1} copies and {barriers:.1} barrier calls (VICTORY_FILL_BATCH); sources learned {}; compared {} \
@@ -768,7 +830,19 @@ fn verdict<'a>(now: &[u8], src: &[u8], card_dst: &[u8], mut later: impl Iterator
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, learn, overlaps, plan_fills, verdict};
+    use super::{Verdict, in_blocks, learn, overlaps, plan_fills, verdict};
+
+    /// A learned range in blocks: aligned in title memory, cut to its
+    /// buffer; without a block size the whole buffer.
+    #[test]
+    fn learned_blocks_are_aligned_and_cut_to_the_buffer() {
+        let buffer = (0x1_0800, 0x5_0000);
+        assert_eq!(in_blocks(0x2_1000, 0x100, 0x1_0000, buffer), (0x2_0000, 0x1_0000));
+        assert_eq!(in_blocks(0x2_ff00, 0x200, 0x1_0000, buffer), (0x2_0000, 0x2_0000));
+        assert_eq!(in_blocks(0x1_0900, 0x10, 0x1_0000, buffer), (0x1_0800, 0xf800));
+        assert_eq!(in_blocks(0x4_ff00, 0x100, 0x1_0000, buffer), (0x4_0000, 0x1_0000));
+        assert_eq!(in_blocks(0x4_0000, 0x100, usize::MAX, buffer), (0x1_0800, 0x3_f800));
+    }
 
     /// A batch of fills: each stand-in buffer taken to a copy destination
     /// once (not at all where the batch has its first use: the common

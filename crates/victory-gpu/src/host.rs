@@ -3139,11 +3139,12 @@ pub(crate) fn read_flight_line(frames: f64) {
          (VICTORY_READ_FIXUP)",
         bail[0], bail[1], bail[2], bail[3], bail[4], bail[5]
     );
-    if crate::cardcopy::fills_check_on() {
-        let [fills, bytes] = [0, 1].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    {
+        let [fills, bytes, cuts] = [0, 1, 2].map(|i| CROSS_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "CPU fills per frame of what an earlier list of the same submission may write on the card: {fills:.1}, \
-             {bytes:.0} bytes (they read the bytes from before)"
+             {bytes:.0} bytes (they read the bytes from before); submissions cut before such a list: {cuts:.2} \
+             (VICTORY_CROSS_LIST_CUT)"
         );
     }
 }
@@ -3152,7 +3153,39 @@ pub(crate) fn read_flight_line(frames: f64) {
 /// fills (and their bytes) of a list that read what an earlier list of
 /// the same submission declared written on the card. The fill runs at
 /// submission, before either list, so it reads the bytes from before.
-static CROSS_LIST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Third: submissions cut before such a list ([`cross_list_cut`]).
+static CROSS_LIST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `VICTORY_CROSS_LIST_CUT=1` (off by default): a flight whose list reads
+/// on the CPU at submission (a fill of upload memory, a title buffer copy,
+/// a texture's memory) what an earlier list of the same submission may
+/// write on the card is cut before that list ([`cross_list_at`]). The
+/// earlier lists fly first; the rest is then prepared behind them, and its
+/// reads wait for their writes to land as any read under a flight's
+/// writes does (`late_blocked`). Without the cut such a read takes the
+/// bytes from before the earlier list ran. `VICTORY_FILL_AFTER_WRITE`
+/// closes this within one list only, and which lists of a submission
+/// write and read depends on how the title's threads record them: a
+/// skinned character's constants read black now and then (the hair of
+/// runs zall15d and zall20d2).
+fn cross_list_cut() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CROSS_LIST_CUT").is_some_and(|v| v == "1"))
+}
+
+/// The first of `runs` (past the first) that reads on the CPU what an
+/// earlier one declared written on the card ([`cross_list_cut`]).
+fn cross_list_at(runs: &[&HostList]) -> Option<usize> {
+    let mut written: Vec<(usize, usize)> = Vec::new();
+    for (i, list) in runs.iter().enumerate() {
+        if !written.is_empty() && blocked_by(&written, std::slice::from_ref(list), false).is_some() {
+            return Some(i);
+        }
+        let more = list.deferred().gpu_written.clone();
+        join_ranges(&mut written, more);
+    }
+    None
+}
 
 /// [`CROSS_LIST`] for one submission.
 fn count_cross_list(runs: &[&HostList]) {
@@ -5899,6 +5932,26 @@ impl Host {
             self.execute_late(rest.0, rest.1);
             return;
         }
+        if cross_list_cut()
+            && order.iter().all(|&i| i < lists.len())
+            && {
+                // Each list once (as `cut_flight` takes them).
+                let mut seen = order.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() == order.len()
+            }
+            && let Some(at) = {
+                let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                cross_list_at(&runs)
+            }
+        {
+            CROSS_LIST[2].fetch_add(1, Ordering::Relaxed);
+            let (first, rest) = cut_flight(lists, &order, at);
+            self.execute_late(first.0, first.1);
+            self.execute_late(rest.0, rest.1);
+            return;
+        }
         late_threads();
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -6324,9 +6377,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        if crate::cardcopy::fills_check_on() {
-            count_cross_list(runs);
-        }
+        count_cross_list(runs);
         work_stage(STAGE_LISTS);
         for list in runs {
             list.run_deferred(&mut batch);

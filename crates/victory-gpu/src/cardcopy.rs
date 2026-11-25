@@ -459,9 +459,12 @@ thread_local! {
 }
 
 /// The size of a [`FillGroup`]'s block of title memory
-/// (`VICTORY_FILL_GROUP_KB`, 64 by default and at most; `=0` off: each
-/// fill copies its own bytes, about 11,700 a frame and 4.3 us of CPU each
-/// in run zall11a, nearly all one constant buffer per binding).
+/// (`VICTORY_FILL_GROUP_KB`, at most 64; off by default, `=0`: each fill
+/// copies its own bytes, about 11,700 a frame and 4.3 us of CPU each in run
+/// zall11a, nearly all one constant buffer per binding). Off until fixed:
+/// with whole title buffers learned (run zall12w) the picture broke (blown
+/// out, the room gone), draws fell from about 3,400 to under 1,000 a frame,
+/// the recording of fills took 285-827 ms a frame and commit reached 51 GB.
 ///
 /// The same bytes as a fill of its own: a stand-in copied at a binding
 /// holds the host copy's bytes at that place in the list's order. A later
@@ -478,7 +481,7 @@ thread_local! {
 fn group_bytes() -> u64 {
     static KB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *KB.get_or_init(|| {
-        std::env::var("VICTORY_FILL_GROUP_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(64).min(64) << 10
+        std::env::var("VICTORY_FILL_GROUP_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(64) << 10
     })
 }
 

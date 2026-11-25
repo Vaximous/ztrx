@@ -804,6 +804,9 @@ fn uncommitted_end(block: usize) -> usize {
     if !ASKING_HERE.get() {
         return uncommitted_end_now(block);
     }
+    if holes_per_frame() {
+        return uncommitted_end_framed(block);
+    }
     if !query_once() || !QUERY_STANDS.load(std::sync::atomic::Ordering::Relaxed) {
         return uncommitted_end_now(block);
     }
@@ -827,6 +830,62 @@ fn uncommitted_end(block: usize) -> usize {
     let end = uncommitted_end_now(block);
     let mut q = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
     if q.0 == epoch {
+        q.1.get_or_insert_with(Default::default).insert(block, end);
+    }
+    end
+}
+
+/// Whether what Windows says of unmapped view blocks stands for the rest
+/// of the frame, not only the submission (`VICTORY_HOLES_PER_FRAME`, on
+/// by default; `=0` per submission, as before). Blocks of the title's
+/// views are committed by the runtime (`crate::title_memory_committed`)
+/// and mapped by it (`crate::title_memory_remapped`), and either makes
+/// the answers be asked anew; a commit nothing tells of is seen from the
+/// next frame on. Asked per submission, VirtualQuery over the views'
+/// holes stayed 10.5% of the submitting thread (run zl7): the world
+/// sends about 30 submissions a frame and each asked about every hole
+/// its refreshes cross.
+fn holes_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_PER_FRAME").is_none_or(|v| v != "0"))
+}
+
+/// Bumped when the runtime commits or maps title memory: [`holes_per_frame`]'s
+/// answers stand while it and the frame are the same.
+static COMMIT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime committed title memory `[at, at + len)` (pages of a view it
+/// mapped): what was said of holes there is asked again.
+pub fn title_memory_committed(at: usize, len: usize) {
+    let _ = (at, len);
+    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// [`holes_per_frame`]'s answers, as [`QUERIED`]'s, by (commit epoch, frame).
+#[allow(clippy::type_complexity)]
+static QUERIED_FRAME: Mutex<((u64, u64), Option<BTreeMap<usize, usize>>)> = Mutex::new(((0, 0), None));
+
+fn uncommitted_end_framed(block: usize) -> usize {
+    let key = (COMMIT_EPOCH.load(std::sync::atomic::Ordering::Acquire), crate::queue::presented());
+    {
+        let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        if q.0 != key {
+            *q = (key, None);
+        }
+        if let Some(m) = q.1.as_ref() {
+            if let Some(&end) = m.get(&block) {
+                return end;
+            }
+            if let Some((_, &end)) = m.range(..block).next_back()
+                && end > block
+            {
+                return end;
+            }
+        }
+    }
+    let end = uncommitted_end_now(block);
+    let mut q = QUERIED_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    if q.0 == key {
         q.1.get_or_insert_with(Default::default).insert(block, end);
     }
     end
@@ -979,6 +1038,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::lazy::forget(at, len);
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COMMIT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

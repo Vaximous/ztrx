@@ -567,20 +567,81 @@ pub(crate) fn check_line() {
     let c = CHECKS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     let r = RECHECKED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     tracing::info!(
-        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back;          {} constant dwords looked at again at submission, {} changed",
+        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back;          {} constant dwords looked at again at submission, {} changed; {} not used as bounds as the card wrote          their memory",
         c[0],
         c[1],
         c[2],
         c[3],
         r[0],
-        r[1]
+        r[1],
+        CARD_CONSTANTS.swap(0, Ordering::Relaxed)
     );
+}
+
+/// The 64 KiB pieces of title memory that copy-backs wrote (what shaders
+/// or the card's copies wrote, found differing), while extents are made.
+static CARD_PIECES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+
+/// Constant dwords not trusted as bounds since the card wrote their piece
+/// (see [`card_wrote`]).
+static CARD_CONSTANTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a constant buffer dword in memory the card has written is left
+/// unbounded (`VICTORY_EXTENT_CARD_CONSTANTS=1` trusts it). What the CPU
+/// reads there when a dispatch is bound need not be what the card reads
+/// when it runs: run fxchk2's one shader whose stores went outside their
+/// extents (ba4e20a2) multiplies the group's row by a dword the CPU read
+/// as 56 that has to be 32,768 on the card for its stores to reach where
+/// they did, and no title write changed it before submission.
+fn distrust_card_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXTENT_CARD_CONSTANTS").is_none_or(|v| v != "1"))
+}
+
+/// A copy-back wrote `[at, at + len)` of title memory.
+pub(crate) fn card_wrote(at: usize, len: usize) {
+    if len == 0 || !(narrow() || check_on()) || !distrust_card_constants() {
+        return;
+    }
+    let (first, last) = ((at >> 16) as u64, ((at + len - 1) >> 16) as u64);
+    let mut pieces = CARD_PIECES.lock().unwrap_or_else(|e| e.into_inner());
+    let pieces = pieces.get_or_insert_with(Default::default);
+    pieces.extend(first..=last);
+}
+
+/// Whether a constant buffer dword at `address` may bound a store: not if
+/// a copy-back ever wrote its piece.
+pub(crate) fn constant_trusted(address: u64) -> bool {
+    if !distrust_card_constants() {
+        return true;
+    }
+    let card = CARD_PIECES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|p| p.contains(&(address >> 16)));
+    if card {
+        CARD_CONSTANTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    !card
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use victory_shader::stores::Op;
+
+    /// A constant in a piece a copy-back wrote does not bound stores.
+    #[test]
+    fn constants_the_card_wrote_are_not_trusted() {
+        if !distrust_card_constants() {
+            return;
+        }
+        let at = 0x7_1234_0000usize;
+        CARD_PIECES.lock().unwrap().get_or_insert_with(Default::default).insert((at >> 16) as u64);
+        assert!(!constant_trusted(at as u64 + 0x14));
+        assert!(constant_trusted(at as u64 + 0x1_0000));
+    }
 
     /// Stores at the thread id times four through the entry at dword 8, and
     /// at an index times the view's element plus 4 through dword 16.

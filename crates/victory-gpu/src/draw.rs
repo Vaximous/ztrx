@@ -749,7 +749,7 @@ impl State {
         // A dword of a constant buffer in title memory.
         let read = |address: u64, size: u64, offset: u32| {
             let at = u64::from(offset);
-            if address == 0 || at + 4 > size {
+            if address == 0 || at + 4 > size || !crate::extent::constant_trusted(address + at) {
                 return None;
             }
             // SAFETY: title memory the title gave as a constant buffer.

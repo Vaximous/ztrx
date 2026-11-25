@@ -176,6 +176,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // A new submission: what Windows says of unmapped blocks stands for it.
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     QUERY_STANDS.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    ASKING_HERE.set(true);
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -205,6 +207,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
     QUERY_STANDS.store(false, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    ASKING_HERE.set(false);
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ask_once_written();
 }
@@ -687,6 +691,12 @@ static QUERY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// [`ask_once_end`]): only then are [`uncommitted_end`]'s answers kept.
 static QUERY_STANDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's submission asking stands ([`ask_once`]).
+    static ASKING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`uncommitted_end`]'s answers by block, and the epoch they were given in.
 static QUERIED: Mutex<(u64, Option<std::collections::HashMap<usize, usize>>)> = Mutex::new((0, None));
 
@@ -706,6 +716,12 @@ fn query_once() -> bool {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    // (Tests: only this thread's asking counts; the others' submissions
+    // run beside it.)
+    #[cfg(test)]
+    if !ASKING_HERE.get() {
+        return uncommitted_end_now(block);
+    }
     if !query_once() || !QUERY_STANDS.load(std::sync::atomic::Ordering::Relaxed) {
         return uncommitted_end_now(block);
     }

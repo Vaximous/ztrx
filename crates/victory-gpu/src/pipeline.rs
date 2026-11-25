@@ -142,7 +142,13 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let mut done = translate(&self.container);
+                if let Ok(t) = &mut done
+                    && t.extents.is_some()
+                    && crate::extent::denied(&self.hash)
+                {
+                    t.extents = None;
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

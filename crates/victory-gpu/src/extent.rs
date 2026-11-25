@@ -24,6 +24,21 @@ pub(crate) fn narrow() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_EXTENTS").is_ok_and(|v| v == "1"))
 }
 
+/// Shaders whose store extents are not used (their views are declared
+/// whole): `VICTORY_EXTENT_DENY`, hashes (or their beginnings) separated by
+/// commas; by default the ones a check run caught storing outside them.
+/// ba4e20a2 (run fxchk2): a clear whose row stride is a constant the CPU
+/// reads as 56 where the card's stores show 32,768.
+pub(crate) fn denied(hash: &str) -> bool {
+    static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DENY.get_or_init(|| {
+        let list = std::env::var("VICTORY_EXTENT_DENY").unwrap_or_else(|_| "ba4e20a2fd348338".into());
+        list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+    })
+    .iter()
+    .any(|d| hash.to_ascii_lowercase().starts_with(d.as_str()))
+}
+
 /// What the host reads to bound a leaf of an expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Leaf {

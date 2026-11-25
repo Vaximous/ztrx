@@ -514,6 +514,78 @@ impl Module {
         gone.len()
     }
 
+    /// Moves `store`, the last instruction of `block` so far, to just before `anchor` (a group
+    /// barrier earlier in `block`), with the instructions of `block` after `anchor` that make its
+    /// address and value, which must compute and nothing more (arithmetic, casts, compares,
+    /// selects, extracts, element addresses, and the `dx.op` math and wave operations: the
+    /// block has no branch between, so the same lanes run them there). Refused (false, nothing moved) unless `block` holds,
+    /// from `anchor` on, no store, atomic or compare-exchange and no load but those of `loads`:
+    /// then the store's slot is written before the barrier instead of after it, and nothing
+    /// between could have seen it or the slot's old value.
+    pub fn hoist_before(&mut self, block: usize, store: V, anchor: V, loads: &[V]) -> bool {
+        let (V::Inst(st), V::Inst(an)) = (store, anchor) else {
+            return false;
+        };
+        let body = &self.blocks[block].body;
+        let (Some(from), Some(&last)) = (body.iter().position(|&i| i == an), body.last()) else {
+            return false;
+        };
+        if last != st {
+            return false;
+        }
+        let after = &body[from..];
+        // what moves: the store and, through its operands, what it needs from after `anchor`
+        let pure_call = |f: u32| {
+            let name = &self.funcs[f as usize].name;
+            ["dx.op.wave", "dx.op.unary", "dx.op.binary", "dx.op.tertiary"]
+                .iter()
+                .any(|p| name.starts_with(p))
+        };
+        let mut moved = vec![st];
+        let mut k = 0;
+        while k < moved.len() {
+            let operands: Vec<V> = match &self.insts[moved[k] as usize].op {
+                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => vec![*a, *b],
+                Op::Cast(_, a) | Op::Extract(a, _) => vec![*a],
+                Op::Select(c, a, b) => vec![*c, *a, *b],
+                Op::Gep(_, p, ix) => std::iter::once(*p).chain(ix.iter().copied()).collect(),
+                Op::Call(f, args) if pure_call(*f) => args.clone(),
+                _ => return false,
+            };
+            for o in operands {
+                if let V::Inst(i) = o
+                    && after.contains(&i)
+                    && !moved.contains(&i)
+                {
+                    if !matches!(
+                        self.insts[i as usize].op,
+                        Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) | Op::Gep(..)
+                    ) && !matches!(self.insts[i as usize].op, Op::Call(f, _) if pure_call(f))
+                    {
+                        return false;
+                    }
+                    moved.push(i);
+                }
+            }
+            k += 1;
+        }
+        let allowed = |i: u32| loads.contains(&V::Inst(i));
+        let clean = after.iter().filter(|i| !moved.contains(i)).all(|&i| match self.insts[i as usize].op {
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(..) => false,
+            Op::Load(_) => allowed(i),
+            _ => true,
+        });
+        if !clean {
+            return false;
+        }
+        let body = &mut self.blocks[block].body;
+        let keep: Vec<u32> = body.iter().copied().filter(|i| moved.contains(i)).collect();
+        body.retain(|i| !moved.contains(i));
+        let at = body.iter().position(|&i| i == an).expect("anchor kept");
+        body.splice(at..at, keep);
+        true
+    }
+
     /// Whether `block` has its terminator.
     pub fn ended(&self, block: usize) -> bool {
         self.blocks[block].term.is_some()
@@ -1344,6 +1416,52 @@ mod tests {
         assert_eq!(ring_loop(2, 1), 0);
         // five through four pairs: the last one's pair is the first one's, written next
         assert_eq!(ring_loop(5, 4), 4);
+    }
+
+    /// One exchange (store, barrier, load) and the next one's store with its address made after
+    /// the barrier; with `between` a store into another slot after the barrier too.
+    fn hoist_case(between: bool) -> (Module, usize, [V; 4], bool) {
+        let mut m = Module::default();
+        let (i32t, void) = (m.int(32), m.void());
+        let fty = m.func_ty(void, vec![i32t, i32t]);
+        m.ptr(fty);
+        let barrier = m.function("dx.op.barrier", fty, Some(Attr::NoDuplicate), false);
+        let arr = m.array(16, i32t);
+        let lds = m.global("lds", arr, 3);
+        let (op, mode) = (m.i32(80), m.i32(9));
+        let b = m.new_block();
+        let (s0, s1, one) = (m.i32(0), m.i32(2), m.i32(1));
+        let p0 = m.element(b, lds, s0);
+        m.store(b, p0, one);
+        let sync = m.call(b, barrier, vec![op, mode]);
+        let read = m.load(b, p0);
+        if between {
+            let p = m.element(b, lds, one);
+            m.store(b, p, one);
+        }
+        let index = m.bin(b, Bin::Add, s1, one);
+        let p1 = m.element(b, lds, index);
+        let st = m.store(b, p1, one);
+        let moved = m.hoist_before(b, st, sync, &[read]);
+        (m, b, [sync, read, p1, st], moved)
+    }
+
+    #[test]
+    fn an_exchanges_store_goes_before_the_last_ones_barrier_with_its_address() {
+        let (m, b, [sync, read, p1, st], moved) = hoist_case(false);
+        assert!(moved);
+        let at = |v: V| match v {
+            V::Inst(i) => m.blocks[b].body.iter().position(|&x| x == i).unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(at(p1) < at(st) && at(st) < at(sync) && at(sync) < at(read));
+        // another store after the barrier: nothing moves
+        let (m, b, [.., st], moved) = hoist_case(true);
+        assert!(!moved);
+        assert_eq!(m.blocks[b].body.last(), Some(&match st {
+            V::Inst(i) => i,
+            _ => unreachable!(),
+        }));
     }
 
     #[test]

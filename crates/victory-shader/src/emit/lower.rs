@@ -269,6 +269,9 @@ struct Lower<'a> {
     /// ([`super::bitcode::Module::drop_barriers`]).
     ring_barriers: Vec<(V, u32)>,
     ring_stores: Vec<(V, u32)>,
+    /// The last exchange's meeting ([`exchange_batch`]): its block, its group barrier, the
+    /// ring pairs exchanged there and the reads after it.
+    batch: Option<(usize, V, Vec<u32>, Vec<V>)>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -970,6 +973,21 @@ const PAYLOAD: u32 = 2;
 /// the next, so the barrier after its reads can go where another exchange's barrier comes
 /// before the pair is written again.
 const RING: u32 = 4;
+
+/// Whether an exchange through the ring ([`Lower::exchange_pair`]) right after another in the
+/// same block, of a value made before the other's meeting, writes its slot before that meeting
+/// and has no meeting of its own (`VICTORY_EXCHANGE_BATCH=0` turns it off). The meeting is a
+/// group barrier: both host waves' writes before it are seen by their reads after it, so the
+/// reads get what they did. Only arithmetic and the other exchange's reads lie between, which
+/// never touch the slot ([`super::bitcode::Module::hoist_before`]), and the slot's earlier
+/// reads are kept from it as before: the barrier after them stays wherever no other one
+/// comes first ([`super::bitcode::Module::drop_barriers`] looks at where the write now is).
+/// The wave reductions and ballots of 14264103 (an append through an atomic) made 15 group
+/// barriers on host waves of 32, one per exchange.
+pub(super) fn exchange_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXCHANGE_BATCH").is_none_or(|v| v != "0"))
+}
 
 /// `VICTORY_EXCHANGE_BARRIERS=2`: every exchange keeps its barrier after the reads.
 pub(super) fn exchange_barriers_kept() -> bool {
@@ -1746,6 +1764,7 @@ impl<'a> Lower<'a> {
             ring_next: 0,
             ring_barriers: Vec::new(),
             ring_stores: Vec::new(),
+            batch: None,
             abort: None,
         }
     }
@@ -3794,7 +3813,13 @@ impl<'a> Lower<'a> {
         if self.ring_barriers.is_empty() || exchange_barriers_kept() {
             return;
         }
-        let n = self.s.m.drop_barriers(&self.ring_barriers, &self.ring_stores);
+        // Tried latest first with [`exchange_batch`]: the barriers after a batch's reads stand
+        // together, and the last one kept serves the pairs of all of them.
+        let mut cands = self.ring_barriers.clone();
+        if exchange_batch() {
+            cands.reverse();
+        }
+        let n = self.s.m.drop_barriers(&cands, &self.ring_stores);
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
             eprintln!("WAVE64-EXCHANGES {n} of {} barriers after the reads dropped", self.ring_barriers.len());
         }
@@ -3979,15 +4004,42 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(at, lds, index);
         let st = self.s.m.store(at, ptr, mine);
         self.ring_stores.push((st, key));
-        let at = self.meet(at);
+        // with the last exchange's meeting, if the write can go before it
+        let joined = match self.batch.take() {
+            Some((b, barrier, mut keys, mut reads))
+                if exchange_batch()
+                    && self.pair_sync.is_none()
+                    && b == at
+                    && !keys.contains(&key)
+                    && self.s.m.hoist_before(at, st, barrier, &reads) =>
+            {
+                keys.push(key);
+                Some((b, barrier, keys, std::mem::take(&mut reads)))
+            }
+            _ => None,
+        };
+        let (at, mut batch) = match joined {
+            Some(batch) => (at, Some(batch)),
+            None if self.pair_sync.is_none() => {
+                // [`Self::meet`] without pair counters: one group barrier
+                self.meetings.push(at);
+                let barrier = self.group_sync(at);
+                (at, Some((at, barrier, vec![key], Vec::new())))
+            }
+            None => (self.meet(at), None),
+        };
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
+        if let Some((_, _, _, reads)) = batch.as_mut() {
+            reads.extend([lo, hi]);
+        }
         // the slots are written again only after every thread read them
         self.meet_after_reads(at, key);
+        self.batch = batch;
         (lo, hi)
     }
 

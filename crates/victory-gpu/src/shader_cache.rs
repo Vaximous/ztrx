@@ -74,6 +74,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_UNIFORM_LOADS",
                     // How scalar loads of raw views are read.
                     "VICTORY_SMEM_VECTOR",
+                    "VICTORY_EXCHANGE_BATCH",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

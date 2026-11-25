@@ -169,7 +169,18 @@ fn uav_barrier() -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER
 /// submission wait and both ends have host copies. Whether it was; if not
 /// the caller defers it to the CPU as before.
 pub(crate) fn try_copy(list: &HostList, dst: usize, src: usize, len: usize) -> bool {
-    if !on() || len == 0 || !learned(src, len) {
+    let chosen = || {
+        if read_on_card() {
+            let under = crate::host::flights_write(src, len) || crate::host::flights_write(dst, len);
+            if under {
+                READ_ON_CARD_STATS[1].fetch_add(1, Ordering::Relaxed);
+            }
+            under
+        } else {
+            learned(src, len)
+        }
+    };
+    if !on() || len == 0 || !chosen() {
         return false;
     }
     let (Some(from), Some(to)) =
@@ -435,6 +446,39 @@ fn after_write_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_FILL_AFTER_WRITE").is_ok_and(|v| v == "1"))
 }
+
+/// Whether a draw's constants and a title buffer copy are read on the card
+/// exactly when what they read is in what flights in the air may write
+/// (`crate::host::flights_write`, the test a submission's reads wait by),
+/// instead of when their source made a submission wait before (learned):
+/// `VICTORY_READ_ON_CARD`, on by default; `=0` learned, as before.
+///
+/// Learned, the sources chased the title's moving reads: a ring read in a
+/// new place each frame made one submission wait each frame (runs zall13g,
+/// zall14r: 1.0 settle a frame, 61-69 ms), and learning whole buffers sent
+/// 11-13k fills a frame through the card. Asked at the read, a read under a
+/// flight's writes goes to the card, behind the flight on the one queue,
+/// and everything else stays a fill of upload memory.
+///
+/// As the wait: the settle lands the flights and copies back what their
+/// shaders wrote (the declared ranges), then the CPU reads title memory.
+/// The card reads the host copy after the flights' shaders, which holds
+/// what they wrote (beyond the declared ranges too, where the copy-back
+/// takes nothing), and the title's bytes the submission sends up; where
+/// the title wrote under a flight's writes, the submission settles first
+/// as for any refresh there (`stale_under_flights`). The same card fills and
+/// copies were compared with the CPU's (`VICTORY_CARD_FILLS_CHECK`,
+/// `VICTORY_CARD_COPIES_CHECK`: all alike). A flight sent after the read
+/// was recorded is not known then: that read stays on the CPU and waits as
+/// before.
+pub(crate) fn read_on_card() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_ON_CARD").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line ([`read_on_card`]): fills and title buffer
+/// copies sent to the card because flights may write what they read.
+static READ_ON_CARD_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A fill waiting in a [`batched`] binding to be recorded.
 struct Fill {
@@ -893,11 +937,18 @@ pub(crate) fn try_fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
 /// [`try_fill`].
 fn fill(list: &HostList, src: u64, len: u64) -> Option<u64> {
     use windows::Win32::Graphics::Direct3D12::*;
-    if !fills_on()
-        || len == 0
-        || !overlaps(&LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src as usize, len as usize)
-            && !(after_write_on() && list.gpu_written(src as usize, len as usize))
-    {
+    let chosen = || {
+        if read_on_card() {
+            let under = crate::host::flights_write(src as usize, len as usize);
+            if under {
+                READ_ON_CARD_STATS[0].fetch_add(1, Ordering::Relaxed);
+            }
+            under
+        } else {
+            overlaps(&LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src as usize, len as usize)
+        }
+    };
+    if !fills_on() || len == 0 || !chosen() && !(after_write_on() && list.gpu_written(src as usize, len as usize)) {
         return None;
     }
     let from = crate::shadow::find(src, len)?;
@@ -1074,6 +1125,13 @@ pub(crate) fn line(frames: f64) {
         let [us, under, refreshes, uses, groups] = [FILL_US, FILL_UNDER_FLIGHTS, FILL_REFRESHES, FILL_GROUP_USES, FILL_GROUPS]
             .map(|i| FILL_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let [stale_us, stale_calls] = [0, 1].map(|i| STALE_CHECK[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let [under_fills, under_copies] = [0, 1].map(|i| READ_ON_CARD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if read_on_card() {
+            tracing::info!(
+                "reads on the card under flights' writes per frame (VICTORY_READ_ON_CARD): {under_fills:.0} fills, \
+                 {under_copies:.1} title buffer copies"
+            );
+        }
         tracing::info!(
             "card fills' cost per frame: {:.2} ms recording them; {under:.0} from host copies flights may write; \
              {refreshes:.0} refreshes they added; submissions' check of refreshes under flights {:.2} ms in \

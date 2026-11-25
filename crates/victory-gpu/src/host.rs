@@ -2571,6 +2571,19 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
+/// Whether title memory `[address, address + len)` is in what flights in the
+/// air may write now: the test a submission's reads wait by
+/// ([`late_blocked`]). Busy (a settle being taken): yes, which costs only a
+/// read on the card where one on the CPU might have waited
+/// (`crate::cardcopy::read_on_card`).
+pub(crate) fn flights_write(address: usize, len: usize) -> bool {
+    match LINE.try_lock() {
+        Ok(line) => touches(&line.written, address, address + len),
+        Err(std::sync::TryLockError::Poisoned(e)) => touches(&e.into_inner().written, address, address + len),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+    }
+}
+
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
         return false;
@@ -8350,6 +8363,26 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod flights_write {
+    /// A read is sent to the card exactly where the flights' joined ranges
+    /// (what a submission's reads wait by) meet it; while the line is busy,
+    /// it is sent anyway.
+    #[test]
+    fn reads_under_the_flights_ranges_and_only_those_are_under_flights() {
+        let was = std::mem::replace(&mut super::line().written, vec![(0x1000, 0x2000), (0x8000, 0x8100)]);
+        assert!(super::flights_write(0x1ff0, 0x20));
+        assert!(super::flights_write(0x8080, 4));
+        assert!(!super::flights_write(0x2000, 0x100));
+        assert!(!super::flights_write(0x800, 0x800));
+        {
+            let _busy = super::line();
+            assert!(super::flights_write(0x4000, 4));
+        }
+        super::line().written = was;
     }
 }
 

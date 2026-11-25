@@ -277,6 +277,9 @@ struct Lower<'a> {
     meet_bad: bool,
     /// The blocks where host waves meet ([`Self::meet`]), for [`take_loop_meeting`].
     meetings: Vec<usize>,
+    /// The halves' words for the wave-wide branch closing an IR block, exchanged early
+    /// ([`Self::branch_answer`]): (block, lower half's, upper half's).
+    answered: Option<(usize, V, V)>,
     /// Stores left to the console's highest lane ([`Self::last_lane_store`]), by offset.
     store_gates: Vec<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -1563,6 +1566,7 @@ impl<'a> Lower<'a> {
             meet_bad: false,
             meetings: Vec::new(),
             store_gates: Vec::new(),
+            answered: None,
             flat: None,
             no_barrier,
             fence_only,
@@ -4014,11 +4018,27 @@ impl<'a> Lower<'a> {
             need(b);
             return Err(WHY);
         }
+        let (lo, hi) = match self.answered.take() {
+            // exchanged with a first-lane read of the block ([`Self::branch_answer`])
+            Some((at, lo, hi)) if at == b => (lo, hi),
+            _ => {
+                let c = self.cur;
+                let some = self.speaks_against(when, any)?;
+                self.exchange_halves(c, some)
+            }
+        };
+        let c = self.cur;
+        let both = self.s.m.bin(c, Bin::Or, lo, hi);
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+    }
+
+    /// What a host wave says of the wave-wide branch with lane condition `when`: whether some
+    /// lane speaks against (for `any`, some lane's `when` holds; else some lane's does not),
+    /// so that a half with no lane says nothing. As 0 or 1.
+    fn speaks_against(&mut self, when: Bool, any: bool) -> Result<V, Why> {
         let c = self.cur;
         let mine = self.boolean(when, c)?;
-        // what the halves exchange is "some lane speaks against" either way (for `any`:
-        // some lane's `when` holds; else: some lane's does not), so a half with no lane says
-        // nothing
         let set = if any {
             mine
         } else {
@@ -4028,12 +4048,38 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
-        let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
-        let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
-        let z = self.s.m.i32(0);
-        Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+        Ok(self.s.m.cast(c, Cast::ZExt, some, i32t))
+    }
+
+    /// For an exchange at instruction `inst` of the block being lowered: this host wave's word
+    /// for the block's closing wave-wide branch ([`Self::wave_wide`]), when the branch's lane
+    /// condition is already made (nothing after `inst` in the block writes what it reads), so
+    /// that the branch needs no meeting of its own. As in a walk that reads a first lane and
+    /// loops on a compare of it.
+    fn branch_answer(&mut self, inst: &Inst) -> Result<Option<V>, Why> {
+        let b = self.cur_ir;
+        if !self.x.st.wide.contains(&b) {
+            return Ok(None);
+        }
+        let LaneExit::Branch { when, .. } = self.x.st.exits[b] else {
+            return Ok(None);
+        };
+        let Some(any) = self.x.st.wave_any.get(b).copied().flatten() else {
+            return Ok(None);
+        };
+        let insts = &self.x.p.blocks[b].insts;
+        let Some(at) = insts.iter().position(|i| std::ptr::eq(i, inst)) else {
+            return Ok(None);
+        };
+        let later: HashSet<Value> = insts[at..].iter().flat_map(|i| i.writes.iter().map(|w| w.1)).collect();
+        let ready = self.x.st.bools.support(when).iter().all(|a| match *a {
+            Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) | Atom::Opaque(v) => !later.contains(&v),
+            Atom::Phi(_) | Atom::Constant(_) => true,
+        });
+        if !ready {
+            return Ok(None);
+        }
+        self.speaks_against(when, any).map(Some)
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
@@ -7656,8 +7702,31 @@ impl<'a> Lower<'a> {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
                         let ((lo_has, hi_has), (lo, hi)) = if self.can_carry(c) {
+                            // the block's wave-wide branch rides along when its condition is
+                            // known here (bit 1 by bit 0, "has a lane")
+                            let ride = self.branch_answer(inst)?;
+                            let has = match ride {
+                                Some(some) => {
+                                    let one = self.s.m.i32(1);
+                                    let up = self.s.m.bin(c, Bin::Shl, some, one);
+                                    self.s.m.bin(c, Bin::Or, has, up)
+                                }
+                                None => has,
+                            };
                             let (_, got) = self.meet_with(c, &[has, mine]);
-                            (got[0], got[1])
+                            let ((lo_has, hi_has), pair) = (got[0], got[1]);
+                            if ride.is_some() {
+                                let c = self.cur;
+                                let one = self.s.m.i32(1);
+                                let lo_some = self.s.m.bin(c, Bin::LShr, lo_has, one);
+                                let hi_some = self.s.m.bin(c, Bin::LShr, hi_has, one);
+                                self.answered = Some((self.cur_ir, lo_some, hi_some));
+                                let lo_has = self.s.m.bin(c, Bin::And, lo_has, one);
+                                let hi_has = self.s.m.bin(c, Bin::And, hi_has, one);
+                                ((lo_has, hi_has), pair)
+                            } else {
+                                ((lo_has, hi_has), pair)
+                            }
                         } else {
                             let h = self.exchange_halves(c, has);
                             let c = self.cur;

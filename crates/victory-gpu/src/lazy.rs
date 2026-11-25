@@ -271,8 +271,14 @@ pub(crate) fn forget(at: usize, len: usize) {
 
 /// Our code's image: a touch from inside it is ours.
 fn ours(rip: u64) -> bool {
+    let (base, end) = image();
+    rip >= base && rip < end
+}
+
+/// Our image's range.
+fn image() -> (u64, u64) {
     static IMAGE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    let (base, end) = *IMAGE.get_or_init(|| {
+    *IMAGE.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
         // SAFETY: the process's own module, mapped for its lifetime; the
         // headers are read where the PE format puts them.
@@ -285,8 +291,7 @@ fn ours(rip: u64) -> bool {
             let size = (nt as *const u8).add(0x50).cast::<u32>().read_unaligned();
             (base, base + u64::from(size))
         }
-    });
-    rip >= base && rip < end
+    })
 }
 
 /// For the vectored handlers: whether an access violation at `at`, by the
@@ -494,6 +499,9 @@ struct Touch {
     at: usize,
     rip: u64,
     frame: u64,
+    /// The faulting thread's return addresses (our image's as offsets in
+    /// it, for the symbols), from the handler on.
+    stack: [u64; 12],
 }
 
 #[derive(Default)]
@@ -627,6 +635,7 @@ pub(crate) fn early_landing(floor: u64, declared: &[(usize, u32, bool)]) {
                 piece,
                 read_frame = t.frame,
                 landing_frame = frame,
+                stack = %stack_text(&t.stack),
                 "memory a flight in the air changed was read before its landing: the read took stale bytes \
                  (VICTORY_EARLY_READ_CHECK)"
             );
@@ -648,7 +657,17 @@ fn early_fault(at: usize, rip: u64) -> bool {
                 // SAFETY: title pages we protected; only their protection changes.
                 unsafe { VirtualProtect(a as *const _, r.end - a, PAGE_READWRITE, &mut old) };
                 hit = true;
-                let touch = Touch { read, ours: by_us, at, rip, frame };
+                let mut stack = [0u64; 12];
+                // SAFETY: room for 12 frames; the walk allocates nothing.
+                unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+                        0,
+                        12,
+                        stack.as_mut_ptr().cast(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                let touch = Touch { read, ours: by_us, at, rip, frame, stack };
                 // A read is what matters: it replaces a write noted first.
                 let t = s.touched.entry(r.key).or_insert(touch);
                 if read && !t.read {
@@ -701,4 +720,15 @@ pub(crate) fn early_line(frames: f64) {
         s[EARLY_STALE_OURS],
         top.join(", "),
     );
+}
+
+/// `stack` as text: our image's addresses as `+offset`, others as they are.
+fn stack_text(stack: &[u64]) -> String {
+    let (base, end) = image();
+    stack
+        .iter()
+        .filter(|&&a| a != 0)
+        .map(|&a| if a >= base && a < end { format!("+{:#x}", a - base) } else { format!("{a:#x}") })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

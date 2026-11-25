@@ -200,6 +200,15 @@ pub fn legacy_plain() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_LEGACY_MUL").is_ok_and(|v| v == "plain"))
 }
 
+/// `VICTORY_LEGACY_MUL=exact`: the exact legacy-product pass
+/// (`bitcode::opt::LEGACY`) runs with the module passes. Off by default: it
+/// removes about 0.2% of the instructions and would change every cached
+/// translation. Part of the translation: the shader cache keys on it.
+pub fn legacy_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_LEGACY_MUL").is_ok_and(|v| v == "exact"))
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {

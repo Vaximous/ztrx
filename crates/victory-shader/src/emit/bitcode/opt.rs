@@ -33,7 +33,9 @@
 //!   legacy product `+0`). Where everything that reads it cannot tell the
 //!   zeros apart (a conversion to an integer, a float comparison, a sum
 //!   with a non-zero constant, the product of a multiply-add whose addend
-//!   is a non-zero constant), the plain product is taken.
+//!   is a non-zero constant), the plain product is taken. Off unless
+//!   `VICTORY_LEGACY_MUL=exact` (`emit::legacy_exact()`): it gains little
+//!   and would change every cached translation.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -55,7 +57,8 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
-/// Legacy products whose zero check cannot matter.
+/// Legacy products whose zero check cannot matter. Not in [`MODULE`]:
+/// only with `VICTORY_LEGACY_MUL=exact`.
 pub const LEGACY: u32 = 64;
 /// Not a pass over the module: the lowering of a first-lane read in a
 /// wave64 program run as two host waves skips the exchange that asks which
@@ -63,7 +66,7 @@ pub const LEGACY: u32 = 64;
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | LEGACY;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
 

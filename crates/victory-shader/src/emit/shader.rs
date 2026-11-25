@@ -444,7 +444,10 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let mut passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if super::legacy_exact() {
+            passes |= super::bitcode::opt::LEGACY;
+        }
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();

@@ -4463,6 +4463,19 @@ impl Host {
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
             let mut seen = std::collections::HashSet::new();
+            if crate::lazy::early_on() {
+                let declared: Vec<(usize, u32, bool)> = plans
+                    .iter()
+                    .flat_map(|plan| plan.ranges.iter())
+                    .flat_map(|r| {
+                        (0..r.span.pieces).map(move |p| {
+                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                            (Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
+                        })
+                    })
+                    .collect();
+                crate::lazy::early_landing(plans.iter().map(|p| p.sent_as).max().unwrap_or(0), &declared);
+            }
             for plan in plans {
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
@@ -5376,6 +5389,20 @@ impl Host {
                             .map(|r| (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first, r.span.first + r.span.pieces))
                             .collect();
                         QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).insert(*order, pieces);
+                    }
+                    if crate::lazy::early_on() {
+                        let pieces: Vec<crate::lazy::Piece> = card
+                            .ranges
+                            .iter()
+                            .flat_map(|r| {
+                                (0..r.span.pieces).map(move |p| {
+                                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                                    (r.shadow.clone(), lo, hi, r.span.first + p)
+                                })
+                            })
+                            .filter(|p| p.1 < p.2)
+                            .collect();
+                        crate::lazy::early_sent(*order, &pieces);
                     }
                 }
             }

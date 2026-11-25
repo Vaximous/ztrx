@@ -6696,7 +6696,17 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if crate::memcopy::texture_overlap() {
+                            let staging = staging.clone();
+                            batch.textures_beside.spawn(move || {
+                                let started = std::time::Instant::now();
+                                staging.refresh();
+                                crate::memcopy::add(crate::memcopy::OVERLAPPED, 1);
+                                crate::memcopy::add(crate::memcopy::OVERLAP_US, started.elapsed().as_micros() as u64);
+                            });
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -6742,6 +6752,11 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Texture refreshes running beside the submitting thread
+    /// ([`crate::memcopy::texture_overlap`]): waited for at every flush (a
+    /// step that writes title memory flushes first, and the lists go to
+    /// the card after the last).
+    textures_beside: crate::memcopy::Group,
 }
 
 impl Batch {
@@ -6799,6 +6814,11 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        if self.textures_beside.busy() {
+            let started = std::time::Instant::now();
+            self.textures_beside.join();
+            crate::memcopy::add(crate::memcopy::OVERLAP_WAIT_US, started.elapsed().as_micros() as u64);
+        }
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.

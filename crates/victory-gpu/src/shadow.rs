@@ -1338,6 +1338,7 @@ pub(crate) fn back_line(frames: f64) {
         crate::extent::whole_line(frames);
         crate::lazy::line(frames);
         crate::lazy::early_line(frames);
+        crate::memcopy::line(frames);
         crate::cardcopy::line(frames);
         let e: Vec<f64> = EXTENTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(

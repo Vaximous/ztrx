@@ -19,6 +19,8 @@
 mod capture;
 #[cfg(windows)]
 mod cardcopy;
+#[cfg(windows)]
+mod memcopy;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

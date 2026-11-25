@@ -4433,15 +4433,24 @@ impl Host {
         // `Shadow::card_merge`, which has no notes of sends to skip by.
         let copies: Option<Vec<Vec<(usize, usize)>>> = (crate::shadow::card_direct() > 0).then(|| {
             let writes = flown && crate::shadow::card_direct_writes();
-            let in_air = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+            // The pieces in the air per copy (the lock is not held over
+            // the writes: the landing thread drops flights from it).
+            let busy: Vec<Vec<(u32, u32)>> = {
+                let in_air = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+                dirty
+                    .iter()
+                    .map(|(shadow, _)| {
+                        let copy = Arc::as_ptr(shadow) as usize;
+                        in_air.values().flat_map(|v| v.iter()).filter(|e| e.0 == copy).map(|e| (e.1, e.2)).collect()
+                    })
+                    .collect()
+            };
             let mut wrote = false;
             let copies = dirty
                 .iter()
-                .map(|(shadow, ranges)| {
-                    let copy = Arc::as_ptr(shadow) as usize;
-                    let busy: Vec<(u32, u32)> =
-                        in_air.values().flat_map(|v| v.iter()).filter(|e| e.0 == copy).map(|e| (e.1, e.2)).collect();
-                    let Some((quiet, held)) = shadow.card_quiet(ranges, &busy) else {
+                .zip(&busy)
+                .map(|((shadow, ranges), busy)| {
+                    let Some((quiet, held)) = shadow.card_quiet(ranges, busy) else {
                         return ranges.clone();
                     };
                     let stats = &crate::shadow::CARD_STATS;

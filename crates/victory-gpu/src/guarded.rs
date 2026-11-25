@@ -58,6 +58,14 @@ pub(crate) fn on() -> bool {
 /// faulting instruction's address.
 fn install() {
     unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // A page the lazy copy-back protected is opened, and the copy goes
+        // on, whichever handler the system asks first.
+        // SAFETY: the system passes the exception being dispatched.
+        if let Some((at, rip)) = unsafe { crate::lazy::violation(info) }
+            && crate::lazy::fault(at, rip)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // SAFETY: the system passes the exception being dispatched.
         let (r, c) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
         // Only the symbols' addresses are taken.

@@ -4279,6 +4279,14 @@ impl Host {
                 }
             }
         }
+        // `VICTORY_LAZY_BACK=1`: what this landing merges, protected after.
+        let _lazy = crate::lazy::Landing::new(
+            pieces
+                .iter()
+                .map(|(shadow, lo, hi, _, (_, piece))| (shadow.clone(), *lo, *hi, *piece))
+                .chain(pushed.iter().map(|(shadow, lo, hi, _, _, (_, piece))| (shadow.clone(), *lo, *hi, *piece)))
+                .collect(),
+        );
         let mut title = Vec::new();
         let mut written = 0;
         // Pieces a fetch merged, with the place in the order it ran at:

@@ -731,6 +731,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::lazy::opening(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -790,6 +791,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::lazy::forget(at, len);
     QUERY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -820,6 +822,14 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // A page the lazy copy-back protected is its, whichever handler
+        // the system asks first.
+        // SAFETY: the system passes the exception being dispatched.
+        if let Some((at, rip)) = unsafe { crate::lazy::violation(info) }
+            && crate::lazy::fault(at, rip)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;

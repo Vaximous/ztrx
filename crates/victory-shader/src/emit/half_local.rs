@@ -1,5 +1,5 @@
 //! Loops a console wave64 program's two host waves of 32 can each run on their own lanes
-//! (`VICTORY_HALF_LOCAL=1`; off by default).
+//! (on unless `VICTORY_HALF_LOCAL=0`).
 //!
 //! A loop whose branches the wave takes together ([`Structured::wide`]) has its two host
 //! waves meet at every such branch (and at every first-lane read) to agree on the console
@@ -18,22 +18,22 @@
 //! values deciding them are the same in every lane still walking (a list walked in step by
 //! every lane, a count of steps), and a host wave with no lane left leaves (its exit
 //! condition holds of no lane, or the walk's mask has no lane of it). A loop deciding on
-//! values that differ by lane would go its own way per host wave; the switch is off by
-//! default until the cases it is on for are checked.
+//! values that differ by lane would go its own way per host wave. Checked on the
+//! title's defragmenter walks (run zm3: the picture as before, 11.9 ms a frame to 9.9).
 
 use std::collections::HashSet;
 
 use crate::ir::{Exit, Program, Reg, Value};
 use crate::structure::Structured;
 
-/// `VICTORY_HALF_LOCAL=1`: wide loops that qualify run per host wave ([`find`]).
+/// Wide loops that qualify run per host wave ([`find`]) unless `VICTORY_HALF_LOCAL=0`.
 pub(super) fn on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_HALF_LOCAL.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_LOCAL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_LOCAL").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]

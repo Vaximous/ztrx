@@ -228,6 +228,9 @@ impl Drop for Landing {
 /// Before the kernel writes title memory `[at, at + len)` for us or for
 /// the title: its protected pages are opened, as touched.
 pub(crate) fn opening(at: usize, len: usize) {
+    if early_on() && len > 0 {
+        early_open(at, at.saturating_add(len), EARLY_KERNEL);
+    }
     if !on() || len == 0 {
         return;
     }
@@ -244,6 +247,16 @@ pub(crate) fn opening(at: usize, len: usize) {
 /// Title memory `[at, at + len)` shows something new: its runs are
 /// forgotten (the new mapping has protections of its own).
 pub(crate) fn forget(at: usize, len: usize) {
+    if early_on() && len > 0 {
+        let end = at.saturating_add(len);
+        with_early(|s| {
+            let starts: Vec<usize> =
+                s.runs.range(..end).rev().take_while(|(_, r)| r.end > at).map(|(&a, _)| a).collect();
+            for a in starts {
+                s.runs.remove(&a);
+            }
+        });
+    }
     if !on() || len == 0 {
         return;
     }
@@ -258,8 +271,14 @@ pub(crate) fn forget(at: usize, len: usize) {
 
 /// Our code's image: a touch from inside it is ours.
 fn ours(rip: u64) -> bool {
+    let (base, end) = image();
+    rip >= base && rip < end
+}
+
+/// Our image's range.
+fn image() -> (u64, u64) {
     static IMAGE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    let (base, end) = *IMAGE.get_or_init(|| {
+    *IMAGE.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
         // SAFETY: the process's own module, mapped for its lifetime; the
         // headers are read where the PE format puts them.
@@ -272,14 +291,16 @@ fn ours(rip: u64) -> bool {
             let size = (nt as *const u8).add(0x50).cast::<u32>().read_unaligned();
             (base, base + u64::from(size))
         }
-    });
-    rip >= base && rip < end
+    })
 }
 
 /// For the vectored handlers: whether an access violation at `at`, by the
 /// instruction at `rip`, was a touch of a protected page; it is opened
 /// then, and the access can be made again.
 pub(crate) fn fault(at: usize, rip: u64) -> bool {
+    if early_on() && early_fault(at, rip) {
+        return true;
+    }
     if !ACTIVE.load(Ordering::Acquire) {
         return false;
     }
@@ -314,8 +335,17 @@ pub(crate) unsafe fn violation(
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     // SAFETY: as the caller vouches.
     let (r, c) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+    if r.NumberParameters >= 1 {
+        KIND.with(|k| k.set(r.ExceptionInformation[0]));
+    }
     (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS && r.NumberParameters >= 2)
         .then(|| (r.ExceptionInformation[1], c.Rip))
+}
+
+thread_local! {
+    /// The kind of the access [`violation`] last saw on this thread: 0 a
+    /// read, 1 a write, 8 an instruction fetch.
+    static KIND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Set once the handler is in ([`install`]).
@@ -412,4 +442,293 @@ mod tests {
         assert_eq!(inner(0x1010, 0x2010), None);
         assert_eq!(inner(0x1000, 0x1fff), None);
     }
+}
+
+// The early-read check (`VICTORY_EARLY_READ_CHECK=1`).
+//
+// Title memory a flight in the air declares its shaders write must not be
+// read by the CPU before the flight's landing merged what they wrote: the
+// title waits for the flight's fence, and our steps that read it settle
+// first. If something reads it earlier it takes the bytes from before the
+// flight, which would show as stale blocks. With the check, when a flight
+// goes to the card the whole 4 KiB pages of each piece it declares (of
+// copies in the card's memory whose memory is write-watched) are made
+// `PAGE_NOACCESS`; the landing of the newest flight that declares the
+// piece gives them their protection back before it merges. A touch in
+// between faults: the page is opened, and the touch noted (read or write,
+// our code or the title's, where, by which instruction). At the landing,
+// a noted read of a piece the flight's compare found changed is an early
+// read that took stale bytes, and is logged. Nothing read changes: the
+// check costs the faults and the protection calls.
+//
+// The kernel does not fault: our writes through it open the pages first
+// (counted). Our reads through it need the guarded reads (which fault).
+
+/// `VICTORY_EARLY_READ_CHECK=1` (needs the relay and the guarded reads;
+/// not with `VICTORY_LAZY_BACK`).
+pub(crate) fn early_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if !std::env::var("VICTORY_EARLY_READ_CHECK").is_ok_and(|v| v == "1") {
+            return false;
+        }
+        if crate::shadow::relay_stage() < 2 || !crate::guarded::on() || on() {
+            tracing::warn!(
+                "VICTORY_EARLY_READ_CHECK=1 needs the relay and the guarded reads, and not VICTORY_LAZY_BACK: left off"
+            );
+            return false;
+        }
+        install();
+        true
+    })
+}
+
+struct EarlyRun {
+    end: usize,
+    /// The copy (its address) and the piece's number.
+    key: (usize, u32),
+    /// The place in the queue's order of the newest flight declaring it.
+    flight: u64,
+}
+
+/// A touch of a protected piece before its landing.
+#[derive(Clone, Copy)]
+struct Touch {
+    read: bool,
+    ours: bool,
+    at: usize,
+    rip: u64,
+    frame: u64,
+    /// The faulting thread's return addresses (our image's as offsets in
+    /// it, for the symbols), from the handler on.
+    stack: [u64; 12],
+}
+
+#[derive(Default)]
+struct EarlyState {
+    runs: BTreeMap<usize, EarlyRun>,
+    /// Pieces touched while protected, until their landing.
+    touched: HashMap<(usize, u32), Touch>,
+    /// Instructions that read pieces their flight then changed, and how
+    /// often, since the start.
+    rips: HashMap<(u64, bool), u64>,
+}
+
+static EARLY: Mutex<Option<EarlyState>> = Mutex::new(None);
+
+fn with_early<R>(f: impl FnOnce(&mut EarlyState) -> R) -> R {
+    let mut s = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+    f(s.get_or_insert_with(EarlyState::default))
+}
+
+/// Since the last frame line:
+const EARLY_PROTECTED: usize = 0; // pieces protected at sends
+const EARLY_PROTECTED_B: usize = 1; // their bytes
+const EARLY_TITLE_READ: usize = 2; // touches before landing, by kind and by whom
+const EARLY_TITLE_WRITE: usize = 3;
+const EARLY_OURS_READ: usize = 4;
+const EARLY_OURS_WRITE: usize = 5;
+const EARLY_KERNEL: usize = 6; // opened for our writes through the kernel
+const EARLY_STALE_TITLE: usize = 7; // reads of pieces the flight changed: stale
+const EARLY_STALE_OURS: usize = 8;
+const EARLY_SKIPPED: usize = 9; // not protected: no whole page, unwatched, failed
+const EARLY_HELD: usize = 10; // declared again while protected
+static EARLY_STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+fn early_open(from: usize, to: usize, why: usize) {
+    with_early(|s| {
+        let starts: Vec<usize> =
+            s.runs.range(..to).rev().take_while(|(_, r)| r.end > from).map(|(&a, _)| a).collect();
+        for a in starts {
+            if let Some(r) = s.runs.remove(&a) {
+                let mut old = 0;
+                // SAFETY: title pages we protected; only their protection changes.
+                unsafe { VirtualProtect(a as *const _, r.end - a, PAGE_READWRITE, &mut old) };
+                EARLY_STATS[why].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// A flight went to the card at `flight` in the queue's order, declaring
+/// `pieces` written.
+pub(crate) fn early_sent(flight: u64, pieces: &[Piece]) {
+    with_early(|s| {
+        for piece in pieces {
+            let (from, to) = title_range(piece);
+            let key = (std::sync::Arc::as_ptr(&piece.0) as usize, piece.3);
+            let Some((a, b)) = inner(from, to) else {
+                EARLY_STATS[EARLY_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if piece.0.unwatched() {
+                EARLY_STATS[EARLY_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let mut held = false;
+            for (_, r) in s.runs.range_mut(..b).rev().take_while(|(_, r)| r.end > a) {
+                // Declared again by a newer flight (or another copy's piece
+                // over the same pages): held until the newer landing.
+                r.flight = r.flight.max(flight);
+                held = true;
+            }
+            if held {
+                EARLY_STATS[EARLY_HELD].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: title pages of a copy's piece; only their protection
+            // changes, and the handler or the landing gives it back.
+            if unsafe { VirtualProtect(a as *const _, b - a, PAGE_NOACCESS, &mut old) } == 0 {
+                EARLY_STATS[EARLY_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if old != PAGE_READWRITE {
+                // SAFETY: as above, back as it was.
+                unsafe { VirtualProtect(a as *const _, b - a, old, &mut old) };
+                EARLY_STATS[EARLY_SKIPPED].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            s.runs.insert(a, EarlyRun { end: b, key, flight });
+            EARLY_STATS[EARLY_PROTECTED].fetch_add(1, Ordering::Relaxed);
+            EARLY_STATS[EARLY_PROTECTED_B].fetch_add((b - a) as u64, Ordering::Relaxed);
+        }
+    });
+}
+
+/// The landing of the flights up to `floor` in the queue's order, before
+/// its merges: the pieces no newer flight declares are opened, and the
+/// touches of the pieces the landed flights declared (`declared`: copy
+/// address, piece, whether the compare found it changed) are judged.
+pub(crate) fn early_landing(floor: u64, declared: &[(usize, u32, bool)]) {
+    let frame = crate::queue::presented();
+    let mut stale: Vec<((usize, u32), Touch)> = Vec::new();
+    with_early(|s| {
+        let due: Vec<usize> = s.runs.iter().filter(|(_, r)| r.flight <= floor).map(|(&a, _)| a).collect();
+        for a in due {
+            if let Some(r) = s.runs.remove(&a) {
+                let mut old = 0;
+                // SAFETY: title pages we protected; only their protection changes.
+                unsafe { VirtualProtect(a as *const _, r.end - a, PAGE_READWRITE, &mut old) };
+            }
+        }
+        for &(copy, piece, changed) in declared {
+            let Some(t) = s.touched.remove(&(copy, piece)) else {
+                continue;
+            };
+            if changed && t.read {
+                *s.rips.entry((t.rip, t.ours)).or_default() += 1;
+                stale.push(((copy, piece), t));
+            }
+        }
+        // Touches of pieces no landing judged within some seconds.
+        s.touched.retain(|_, t| frame.saturating_sub(t.frame) < 600);
+    });
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    for ((_, piece), t) in stale {
+        EARLY_STATS[if t.ours { EARLY_STALE_OURS } else { EARLY_STALE_TITLE }].fetch_add(1, Ordering::Relaxed);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 200 {
+            tracing::warn!(
+                at = format_args!("{:#x}", t.at),
+                rip = format_args!("{:#x}", t.rip),
+                ours = t.ours,
+                piece,
+                read_frame = t.frame,
+                landing_frame = frame,
+                stack = %stack_text(&t.stack),
+                "memory a flight in the air changed was read before its landing: the read took stale bytes \
+                 (VICTORY_EARLY_READ_CHECK)"
+            );
+        }
+    }
+}
+
+fn early_fault(at: usize, rip: u64) -> bool {
+    let read = KIND.with(std::cell::Cell::get) == 0;
+    let by_us = ours(rip);
+    let frame = crate::queue::presented();
+    let mut hit = false;
+    with_early(|s| {
+        let starts: Vec<usize> =
+            s.runs.range(..at + 1).rev().take_while(|(_, r)| r.end > at).map(|(&a, _)| a).collect();
+        for a in starts {
+            if let Some(r) = s.runs.remove(&a) {
+                let mut old = 0;
+                // SAFETY: title pages we protected; only their protection changes.
+                unsafe { VirtualProtect(a as *const _, r.end - a, PAGE_READWRITE, &mut old) };
+                hit = true;
+                let mut stack = [0u64; 12];
+                // SAFETY: room for 12 frames; the walk allocates nothing.
+                unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace(
+                        0,
+                        12,
+                        stack.as_mut_ptr().cast(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                let touch = Touch { read, ours: by_us, at, rip, frame, stack };
+                // A read is what matters: it replaces a write noted first.
+                let t = s.touched.entry(r.key).or_insert(touch);
+                if read && !t.read {
+                    *t = touch;
+                }
+            }
+        }
+    });
+    if hit {
+        let i = match (by_us, read) {
+            (false, true) => EARLY_TITLE_READ,
+            (false, false) => EARLY_TITLE_WRITE,
+            (true, true) => EARLY_OURS_READ,
+            (true, false) => EARLY_OURS_WRITE,
+        };
+        EARLY_STATS[i].fetch_add(1, Ordering::Relaxed);
+    }
+    hit
+}
+
+/// For the frame-rate line.
+pub(crate) fn early_line(frames: f64) {
+    if !early_on() {
+        return;
+    }
+    let s: Vec<f64> = EARLY_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let (held, top) = with_early(|st| {
+        let mut top: Vec<((u64, bool), u64)> = st.rips.iter().map(|(&k, &n)| (k, n)).collect();
+        top.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+        top.truncate(6);
+        (st.runs.len(), top)
+    });
+    let top: Vec<String> =
+        top.iter().map(|((rip, us), n)| format!("{rip:#x}{} {n}", if *us { " (ours)" } else { "" })).collect();
+    tracing::info!(
+        "early-read check per frame (VICTORY_EARLY_READ_CHECK=1): {:.0} pieces {:.1} MB protected at sends ({:.0} not, \
+         {:.0} declared again while held); touched before their landing: by the title {:.1} reads {:.1} writes, by our \
+         code {:.1} reads {:.1} writes; opened for our kernel writes {:.1}; reads of pieces the flight changed (stale) \
+         by the title {:.2}, by our code {:.2}; {held} runs held; the instructions of stale reads since the start: [{}]",
+        s[EARLY_PROTECTED],
+        s[EARLY_PROTECTED_B] / (1 << 20) as f64,
+        s[EARLY_SKIPPED],
+        s[EARLY_HELD],
+        s[EARLY_TITLE_READ],
+        s[EARLY_TITLE_WRITE],
+        s[EARLY_OURS_READ],
+        s[EARLY_OURS_WRITE],
+        s[EARLY_KERNEL],
+        s[EARLY_STALE_TITLE],
+        s[EARLY_STALE_OURS],
+        top.join(", "),
+    );
+}
+
+/// `stack` as text: our image's addresses as `+offset`, others as they are.
+fn stack_text(stack: &[u64]) -> String {
+    let (base, end) = image();
+    stack
+        .iter()
+        .filter(|&&a| a != 0)
+        .map(|&a| if a >= base && a < end { format!("+{:#x}", a - base) } else { format!("{a:#x}") })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -323,14 +323,15 @@ static RECORDED: std::sync::Mutex<Vec<Recorded>> = std::sync::Mutex::new(Vec::ne
 /// outside them, checks never back.
 static CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Whether this dispatch of the shader `hash` is checked: its first three,
-/// then one in 64.
-fn sampled(hash: &str) -> bool {
+/// Whether this dispatch of the shader `hash` is checked (its number
+/// among them): its first four, then two in 64.
+fn sampled(hash: &str) -> Option<u32> {
     static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, u32>>> = std::sync::Mutex::new(None);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let n = seen.get_or_insert_with(Default::default).entry(hash.to_owned()).or_insert(0);
     *n += 1;
-    *n <= 3 || n.is_multiple_of(64)
+    // Two in a row: one of each kind of view (`check_before`).
+    (*n <= 4 || *n % 64 <= 1).then_some(*n)
 }
 
 /// A check about to be recorded around a dispatch.
@@ -346,10 +347,14 @@ pub(crate) struct Pending {
 /// and pipeline: the caller binds its own again). None if not checked.
 pub(crate) fn check_before(list: &crate::host::HostList, views: &[CheckView], hash: &str) -> Option<Pending> {
     use windows::Win32::Graphics::Direct3D12::*;
-    let view = views.iter().max_by_key(|v| v.len)?;
-    if !sampled(hash) {
-        return None;
-    }
+    let n = sampled(hash)?;
+    // Alternately the largest view the extents say is written and the
+    // largest of all (often one written nowhere).
+    let written = views.iter().filter(|v| v.extent.1 > v.extent.0).max_by_key(|v| v.len);
+    let view = match written {
+        Some(w) if n % 2 == 1 => w,
+        _ => views.iter().max_by_key(|v| v.len)?,
+    };
     let shadow = &view.shadow;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -458,10 +463,41 @@ pub(crate) fn check_after(list: &crate::host::HostList, pending: Pending) {
     RECORDED.lock().unwrap_or_else(|e| e.into_inner()).push(record);
 }
 
+/// Since the last frame-rate line: constant buffer dwords extents were
+/// bounded with, looked at again at submission, and of them those changed.
+static RECHECKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// At submission: whether the constant buffer dwords (title address, value
+/// when recorded) a call's extents were bounded with still hold those
+/// values.
+pub(crate) fn recheck(reads: &[(u64, u32)], hash: &str) {
+    use std::sync::atomic::Ordering;
+    RECHECKED[0].fetch_add(reads.len() as u64, Ordering::Relaxed);
+    for &(at, was) in reads {
+        let mut now = [0u8; 4];
+        if crate::host::read_into(at as *const u8, &mut now) && u32::from_le_bytes(now) == was {
+            continue;
+        }
+        RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+        static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if !told.iter().any(|h| h == hash) {
+            told.push(hash.to_owned());
+            tracing::warn!(
+                hash,
+                at = format_args!("{at:#x}"),
+                was,
+                now = u32::from_le_bytes(now),
+                "a constant the store extents were bounded with changed before submission"
+            );
+        }
+    }
+}
+
 /// For the frame-rate line: the checks that are back.
 pub(crate) fn check_line() {
     use std::sync::atomic::Ordering;
-    if !check_on() {
+    if !check_on() && !narrow() {
         return;
     }
     let mut recorded = RECORDED.lock().unwrap_or_else(|e| e.into_inner());
@@ -499,12 +535,15 @@ pub(crate) fn check_line() {
         false
     });
     let c = CHECKS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    let r = RECHECKED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
     tracing::info!(
-        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back",
+        "store extent checks: {} made, {} changed pieces inside the extents, {} outside, {} never back;          {} constant dwords looked at again at submission, {} changed",
         c[0],
         c[1],
         c[2],
-        c[3]
+        c[3],
+        r[0],
+        r[1]
     );
 }
 

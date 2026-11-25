@@ -741,9 +741,11 @@ impl State {
     /// it: a table's byte offset in its heap, a constant's value.
     /// The range of each leaf of a compute stage's store extents for the
     /// call being bound (None: unknown).
-    fn leaf_ranges(&self, e: &crate::extent::StoreExtents) -> Vec<Option<(u32, u32)>> {
+    /// Also the constant buffer dwords read (title address, value).
+    fn leaf_ranges(&self, e: &crate::extent::StoreExtents) -> (Vec<Option<(u32, u32)>>, Vec<(u64, u32)>) {
         use crate::extent::Leaf;
         let roots = self.roots_ref(true);
+        let reads = std::cell::RefCell::new(Vec::new());
         // A dword of a constant buffer in title memory.
         let read = |address: u64, size: u64, offset: u32| {
             let at = u64::from(offset);
@@ -751,9 +753,11 @@ impl State {
                 return None;
             }
             // SAFETY: title memory the title gave as a constant buffer.
-            Some(unsafe { ((address + at) as *const u32).read_unaligned() })
+            let value = unsafe { ((address + at) as *const u32).read_unaligned() };
+            reads.borrow_mut().push((address + at, value));
+            Some(value)
         };
-        e.leaves
+        let ranges = e.leaves
             .iter()
             .map(|&(_, leaf)| match leaf {
                 Leaf::Thread(axis) => {
@@ -781,7 +785,8 @@ impl State {
                     _ => None,
                 },
             })
-            .collect()
+            .collect();
+        (ranges, reads.into_inner())
     }
 
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -1045,7 +1050,13 @@ impl State {
             STORES.set(t.stores);
             BOUNDED.set(t.bounded);
             if compute && let Some(e) = &t.extents {
-                let ranges = self.leaf_ranges(e);
+                let (ranges, reads) = self.leaf_ranges(e);
+                // The constant buffer dwords the extents were bounded with,
+                // as the submission finds them.
+                if !reads.is_empty() && (crate::extent::narrow() || crate::extent::check_on()) {
+                    let hash = stage.shader.hash.clone();
+                    list.defer_host(move || crate::extent::recheck(&reads, &hash));
+                }
                 EXTENT.with_borrow_mut(|x| *x = Some((e.clone(), ranges)));
             }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);

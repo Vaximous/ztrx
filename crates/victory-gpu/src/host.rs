@@ -2598,11 +2598,17 @@ static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::ato
 /// scratch memory the list holds; else the submission waits as before.
 /// Scratch chunks are then made in memory the card may write too (the same
 /// memory as upload memory: write-combined, in the PC).
+///
+/// Off by default (`=1` on) since runs zall18d, zall18f0 (240 s, frames
+/// from 150 s): 142 ms a frame on, 126 off, the picture as clean off. On, it
+/// sent 5,000-6,000 fills a frame to the card at submission (about 40 ms
+/// more preparing on the submitting thread) to spare one wait of about 55 ms
+/// a frame: the card sat idle behind the submitting thread instead.
 pub(crate) fn read_fixup() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Off under `VICTORY_CARD_FILLS_CHECK`: its CPU fills are the compare.
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_READ_FIXUP").is_none_or(|v| v != "0") && !crate::cardcopy::fills_check_on()
+        std::env::var_os("VICTORY_READ_FIXUP").is_some_and(|v| v == "1") && !crate::cardcopy::fills_check_on()
     })
 }
 

@@ -880,6 +880,16 @@ pub(crate) struct HostList {
     /// it clamps arguments only when there may be some. True at the start
     /// (an earlier list of the same submission may have written).
     unwaited_writes: std::sync::atomic::AtomicBool,
+    /// Since the list's last wait for every earlier unordered access (a
+    /// barrier on all of it): 1, work was recorded (draws, dispatches,
+    /// indirect calls and our passes inside them); 2, work whose shaders
+    /// may store to memory (buffers or images). Both at the start: an
+    /// earlier list of the same submission may have done anything
+    /// ([`crate::list::barrier_elide`]).
+    since_wait: std::sync::atomic::AtomicU8,
+    /// Where the next clamp of indirect records goes in the list's scratch
+    /// buffer ([`crate::indirect::clamp_ring`]).
+    ring_at: std::sync::atomic::AtomicU64,
     /// Calls recorded whose shaders may write buffers ([`HostList::wrote`]),
     /// since the reset.
     writes: std::sync::atomic::AtomicU64,
@@ -4482,6 +4492,8 @@ impl Host {
                 indirect_args: Mutex::default(),
                 hoist: Mutex::default(),
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
+                since_wait: std::sync::atomic::AtomicU8::new(3),
+                ring_at: std::sync::atomic::AtomicU64::new(0),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -6985,6 +6997,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.unwaited_writes.store(true, Ordering::Relaxed);
+        self.since_wait.store(3, Ordering::Relaxed);
+        self.ring_at.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
@@ -7717,6 +7731,40 @@ impl HostList {
     /// [`waited`]: HostList::waited
     pub(crate) fn writes_unwaited(&self) -> bool {
         self.unwaited_writes.load(Ordering::Relaxed)
+    }
+
+    /// Work was recorded (`stores`: whose shaders may store to memory),
+    /// for [`HostList::since_wait`].
+    pub(crate) fn worked(&self, stores: bool) {
+        self.since_wait.fetch_or(1 | (u8::from(stores) << 1), Ordering::Relaxed);
+    }
+
+    /// A wait for every earlier unordered access (on all of it) was
+    /// recorded.
+    pub(crate) fn all_waited(&self) {
+        self.since_wait.store(0, Ordering::Relaxed);
+    }
+
+    /// What was recorded since the last [`HostList::all_waited`]: bit 1
+    /// work, bit 2 work that may store.
+    pub(crate) fn since_wait(&self) -> u8 {
+        self.since_wait.load(Ordering::Relaxed)
+    }
+
+    /// [`crate::indirect::clamp_ring`]: `bytes` (256-byte aligned) in the
+    /// list's scratch buffer for a clamp, after the last one's; the buffer,
+    /// the place, and whether the place may have been read by an indirect
+    /// call of the list before (the ring went round, or the buffer is new
+    /// to the list: the first use's barrier covers that).
+    pub(crate) fn indirect_ring(&self, bytes: u64) -> Option<(ID3D12Resource, u64, bool)> {
+        const RING: u64 = 1 << 20;
+        let bytes = bytes.next_multiple_of(256);
+        let dst = self.indirect_scratch(bytes.max(RING))?;
+        let cap = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |(_, cap)| *cap);
+        let at = self.ring_at.load(Ordering::Relaxed);
+        let (at, round) = if at + bytes <= cap { (at, false) } else { (0, true) };
+        self.ring_at.store(at + bytes, Ordering::Relaxed);
+        Some((dst, at, round))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -8650,6 +8698,7 @@ impl Meter {
         }
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::list::barrier_line(frames);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);

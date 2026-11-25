@@ -2691,12 +2691,14 @@ impl Shadow {
                         return true;
                     }
                     *runs_left -= runs.len();
-                    for (r, m) in runs {
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
+                    // One lock of the dirty ranges for the page's runs (46,021
+                    // runs a frame in run zall24r, flights always in the air).
+                    self.card_changed_runs(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(runs.iter().map(|&(_, m)| m as u64).sum(), Ordering::Relaxed);
                 } else {
                     let Some(snapshot) = before.as_mut() else {
                         MERGE_FAILED[3].fetch_add(1, Ordering::Relaxed);
@@ -2919,16 +2921,24 @@ impl Shadow {
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
+        self.card_changed_runs(std::iter::once((from, to)));
+    }
+
+    /// [`Self::card_changed`] for each of `runs` (offsets), in order.
+    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
-        if from >= to {
+        let mut runs = runs.filter(|&(from, to)| from < to).peekable();
+        if runs.peek().is_none() {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        for (from, to) in runs {
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
         }
     }
 

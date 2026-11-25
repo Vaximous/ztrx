@@ -16,10 +16,21 @@
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Whether small card copies go to [`record`] (`VICTORY_SCATTER_COPY=1`;
-/// off by default until a run shows it).
+/// `0` off; unset, on with `VICTORY_READ_FIXUP=recent` only).
+///
+/// With settles the ranges were few (run zall19sc: 576 a frame, where the
+/// pass changed nothing). `recent` keeps flights in the air all the time,
+/// so the title's bytes go in beside their writes as changed runs of a
+/// few dozen bytes each (`Shadow::merge_under_writes`): 46,021 ranges a
+/// frame in run zall24r against 666 in zall24d, each a `CopyBufferRegion`
+/// on the submitting thread and on the card.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCATTER_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var("VICTORY_SCATTER_COPY").as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => crate::host::read_fixup_recent(),
+    })
 }
 
 /// The most bytes of a range that goes to the pass

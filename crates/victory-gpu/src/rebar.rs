@@ -834,6 +834,115 @@ mod tests {
         );
     }
 
+    /// What bringing a copy in the card's memory up to date costs when the
+    /// title's bytes go up as many small ranges (`Host::card_before`), as
+    /// they do with flights always in the air (`VICTORY_READ_FIXUP=recent`,
+    /// run zall24r: 46,021 ranges of about 45 bytes a frame, against 666 in
+    /// zall24d): a `CopyBufferRegion` each, or one `crate::scatter` pass.
+    /// Checks the pass's bytes, and that it leaves the gaps alone.
+    #[test]
+    #[ignore = "opens the card: cargo test -p victory-gpu --lib rebar -- --ignored --nocapture --test-threads=1"]
+    fn small_ranges_by_copies_or_one_scatter_pass() {
+        let (device, name) = hardware().expect("a hardware adapter");
+        println!("adapter: {name}");
+        const SIZE: usize = 176 * MB;
+        const RANGES: usize = 46_000;
+        // Ranges of 4-92 bytes at any byte, spread over the buffer.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let stride = SIZE / RANGES;
+        let ranges: Vec<(usize, usize)> = (0..RANGES)
+            .map(|i| {
+                let a = i * stride + (next() as usize % (stride - 128));
+                (a, a + 4 + next() as usize % 89)
+            })
+            .collect();
+        let staging = committed(&device, kind(D3D12_HEAP_TYPE_UPLOAD), SIZE as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)
+            .expect("the CPU side");
+        let staging_at = map(&staging).expect("its mapping");
+        // SAFETY: the mapping holds SIZE bytes.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(staging_at.cast::<u32>(), SIZE / 4);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = (i as u32).wrapping_mul(2_654_435_761) | 0x0101_0101;
+            }
+        }
+        let card = committed(&device, kind(D3D12_HEAP_TYPE_DEFAULT), SIZE as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+            .expect("the card side");
+        let mut rig = Rig::new(&device).expect("a queue");
+        // The card side zeroed (a new committed buffer is, but say so).
+        let zeros = committed(&device, kind(D3D12_HEAP_TYPE_UPLOAD), SIZE as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)
+            .expect("zeros");
+        let clear = |rig: &mut Rig| rig.copy_ms(&card, &zeros, SIZE as u64).expect("cleared");
+        for round in 0..3 {
+            clear(&mut rig);
+            let recording = std::cell::Cell::new(0.0);
+            // SAFETY: live buffers holding every range.
+            let copies_ms = rig
+                .run(|list| unsafe {
+                    let started = Instant::now();
+                    for &(a, b) in &ranges {
+                        list.CopyBufferRegion(&card, a as u64, &staging, a as u64, (b - a) as u64);
+                    }
+                    recording.set(started.elapsed().as_secs_f64() * 1e3);
+                })
+                .expect("the copies ran");
+            println!(
+                "round {round}: {RANGES} CopyBufferRegion calls: recording {:.2} ms on the CPU, {copies_ms:.2} ms on the card",
+                recording.get()
+            );
+        }
+        let pass = crate::scatter::make(&device).expect("the scatter pass");
+        let (entries, rest) = crate::scatter::split(&ranges, SIZE as u64, crate::scatter::most());
+        assert!(rest.is_empty());
+        let table_bytes = (entries.len() * 16) as u64;
+        let table = committed(&device, kind(D3D12_HEAP_TYPE_UPLOAD), table_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)
+            .expect("the table");
+        let table_at = map(&table).expect("its mapping");
+        for round in 0..3 {
+            clear(&mut rig);
+            let started = Instant::now();
+            let (entries, _) = crate::scatter::split(&ranges, SIZE as u64, crate::scatter::most());
+            // SAFETY: the table's mapping holds every entry.
+            unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), table_at, entries.len() * 16) };
+            let building = started.elapsed().as_secs_f64() * 1e3;
+            let recording = std::cell::Cell::new(0.0);
+            // SAFETY: live buffers; the card side is promoted to unordered
+            // access from the common state.
+            let pass_ms = rig
+                .run(|list| unsafe {
+                    let started = Instant::now();
+                    crate::scatter::record(list, &pass, &staging, &card, table.GetGPUVirtualAddress(), entries.len() as u32);
+                    recording.set(started.elapsed().as_secs_f64() * 1e3);
+                })
+                .expect("the pass ran");
+            println!(
+                "round {round}: one scatter pass over {} entries: table {building:.2} ms, recording {:.3} ms on the CPU, {pass_ms:.2} ms on the card",
+                entries.len(),
+                recording.get()
+            );
+        }
+        // The pass's bytes: the ranges' from the CPU side, zeros between.
+        let back = committed(&device, kind(D3D12_HEAP_TYPE_READBACK), SIZE as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+            .expect("a read-back buffer");
+        rig.copy_ms(&back, &card, SIZE as u64).expect("read back");
+        let back_at = map(&back).expect("its mapping");
+        // SAFETY: both mappings hold SIZE bytes; the card is done.
+        let (got, want) = unsafe { (std::slice::from_raw_parts(back_at, SIZE), std::slice::from_raw_parts(staging_at, SIZE)) };
+        let mut end = 0;
+        for &(a, b) in &ranges {
+            assert!(got[end..a].iter().all(|&x| x == 0), "the pass wrote between ranges, before {a:#x}");
+            assert_eq!(&got[a..b], &want[a..b], "the range at {a:#x}");
+            end = b;
+        }
+        assert!(got[end..].iter().all(|&x| x == 0));
+    }
+
     /// For a lazy copy-back into private title memory without a moment in
     /// which another thread sees the page open and not yet merged: whether
     /// the kernel writes into our own page that is `PAGE_NOACCESS` or

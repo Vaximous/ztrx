@@ -306,14 +306,17 @@ fn heap_spans_rolling(heap: &crate::descriptor::Heap, host: &crate::descriptor::
     (slots.len(), views, spans)
 }
 
-/// `VICTORY_HEAP_ROLLING` (on by default, `=0` off): the heap pass of
+/// `VICTORY_HEAP_ROLLING=1` (off by default): the heap pass of
 /// buffer views ([`State::heap_buffers`]) looks at the changed slots and a
 /// 64th of the others each pass ([`heap_spans_rolling`]), where every 16th
 /// pass looked at all of them (83,000 slots) and every pass rebuilt every
 /// span (10-25 ms a frame in the world, run zall4).
+///
+/// Off again: in run zall5 the pass took 14-20 ms a frame (a 58 ms
+/// spike) with it, 7-9 ms without it (run zall5zv).
 fn heap_rolling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLLING").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_ROLLING").is_some_and(|v| v == "1"))
 }
 
 fn windows() -> bool {

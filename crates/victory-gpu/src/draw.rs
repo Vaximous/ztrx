@@ -2855,7 +2855,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
                 {
                     CHECK_VIEWS.with_borrow_mut(|v| {
                         if let Some(v) = v {
-                            v.push(crate::extent::CheckView { shadow: shadow.clone(), address, len, extent, entry: at });
+                            let detail = EXTENT.with_borrow(|x| {
+                                let ranges = x.as_ref().map(|(_, r)| r.clone());
+                                format!(
+                                    "element {:?}, view {view:?}, leaves {:?} {ranges:?}",
+                                    crate::descriptor::host::unordered_element(view),
+                                    x.as_ref().map(|(e, _)| e.leaves.iter().map(|l| l.1).collect::<Vec<_>>()),
+                                )
+                            });
+                            v.push(crate::extent::CheckView { shadow: shadow.clone(), address, len, extent, entry: at, detail });
                         }
                     });
                 }

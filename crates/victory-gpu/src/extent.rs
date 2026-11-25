@@ -41,9 +41,10 @@ pub(crate) enum Leaf {
     RootCb { slot: u8, offset: u32 },
 }
 
-/// One store through a table entry: offset and index expressions (nodes),
-/// bytes written.
-type Store = (u32, Option<u32>, u32);
+/// One store through a table entry: the offset expression (a node), the
+/// index expression with the bytes an index counts (None: the view's
+/// element, for typed stores), and the bytes written.
+type Store = (u32, Option<(u32, Option<u32>)>, u32);
 
 /// A compute program's stores, by the table entry they write through.
 #[derive(Debug)]
@@ -116,6 +117,25 @@ impl StoreExtents {
             let offset = s.offset?;
             let index = s.index.transpose()?;
             let key = entry_of(&res, n, s.site)?;
+            // An index counts what the translation multiplies it by: a
+            // typed store the host view's elements, an untyped one the
+            // used-resource entry's stride (`emit::lower`, raw bytes at
+            // index times stride), never the view's own stride.
+            let typed = p.blocks[s.site.0].insts[s.site.1].name().contains("format");
+            let index = match index {
+                Some(i) if typed => Some((i, None)),
+                Some(i) => {
+                    let stride = n
+                        .used
+                        .iter()
+                        .find(|u| u.root == RootType::Table && u.slot == key.0 && u.table_offset_dwords == key.1)
+                        .map(|u| u.stride)
+                        .filter(|&s| s >= 4 && s.is_multiple_of(4))
+                        .ok_or("an indexed untyped store without a stride")?;
+                    Some((i, Some(stride)))
+                }
+                None => None,
+            };
             let store = (offset, index, s.bytes);
             match entries.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, v)) => v.push(store),
@@ -206,9 +226,12 @@ impl StoreExtents {
             let (lo, hi) = bounds(&self.nodes, offset, &mut leaf)?;
             let (lo, hi) = (u64::from(lo), u64::from(hi) + u64::from(bytes));
             let (lo, hi) = match index {
-                Some(index) => {
+                Some((index, stride)) => {
                     let (a, b) = bounds(&self.nodes, index, &mut leaf)?;
-                    let element = element?;
+                    let element = match stride {
+                        Some(stride) => u64::from(stride),
+                        None => element?,
+                    };
                     (u64::from(a) * element + lo, u64::from(b) * element + hi)
                 }
                 None => (lo, hi),
@@ -237,6 +260,9 @@ pub(crate) struct CheckView {
     /// `[lo, hi)` from `address`.
     pub(crate) extent: (u64, u64),
     pub(crate) entry: (u8, u32),
+    /// What the extent was made of, for the report: the view, the element
+    /// size and the leaves' ranges.
+    pub(crate) detail: String,
 }
 
 const CHECK_SOURCE: &str = r#"
@@ -311,6 +337,7 @@ struct Recorded {
     /// Absolute ranges the extents allow.
     allowed: Vec<(u64, u64)>,
     entries: Vec<(u8, u32)>,
+    details: Vec<String>,
     flags: Box<[u32]>,
     /// Set to 1 once the list has run and the flags are read back.
     done: Box<std::sync::atomic::AtomicU32>,
@@ -406,6 +433,7 @@ pub(crate) fn check_before(list: &crate::host::HostList, views: &[CheckView], ha
             end,
             allowed,
             entries: views.iter().map(|v| v.entry).collect(),
+            details: views.iter().map(|v| format!("{:?} at {:#x}+{:#x}: {}", v.entry, v.address, v.len, v.detail)).collect(),
             flags: vec![u32::MAX; pieces as usize].into_boxed_slice(),
             done: Box::new(std::sync::atomic::AtomicU32::new(0)),
             age: 0,
@@ -528,6 +556,8 @@ pub(crate) fn check_line() {
                     entries = ?r.entries,
                     allowed = ?r.allowed.iter().map(|&(a, b)| (a - r.start, b - r.start)).collect::<Vec<_>>(),
                     piece = format_args!("{:#x}..{:#x}", lo - r.start, hi - r.start),
+                    start = format_args!("{:#x}", r.start),
+                    details = ?r.details,
                     "a store outside the store extents"
                 );
             }
@@ -563,7 +593,11 @@ mod tests {
                 Node::Const(4),
             ],
             leaves: vec![(Node::Input(Reg::V(0)), Leaf::Thread(0))],
-            entries: vec![((0, 8), vec![(2, None, 4)]), ((0, 16), vec![(3, Some(0), 8)])],
+            entries: vec![
+                ((0, 8), vec![(2, None, 4)]),
+                ((0, 16), vec![(3, Some((0, None)), 8)]),
+                ((0, 32), vec![(3, Some((0, Some(48))), 4)]),
+            ],
             threads: [64, 1, 1],
         }
     }
@@ -577,6 +611,9 @@ mod tests {
         assert_eq!(e.extent((0, 16), Some(32), &known), Some((4, 63 * 32 + 12)));
         assert_eq!(e.extent((0, 16), None, &known), None);
         assert_eq!(e.extent((0, 24), None, &known), Some((0, 0)));
+        // An untyped indexed store counts the used-resource stride, not
+        // the view's element.
+        assert_eq!(e.extent((0, 32), Some(4), &known), Some((4, 63 * 48 + 8)));
         assert_eq!(e.extent((0, 8), None, &[None]), None);
     }
 

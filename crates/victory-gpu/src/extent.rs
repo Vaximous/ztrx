@@ -95,6 +95,55 @@ fn entry_of(
     let Source::Loaded { load, first } = d.source else {
         return Err("a store through a descriptor not loaded from a table");
     };
+    loaded_entry(res, n, load, first)
+}
+
+/// The table entries a store's descriptor may come from: one, or each of
+/// those control flow or SCC picks it from (a phi or select of descriptors
+/// each loaded from a table), so its stores are counted against every one.
+fn entries_of(
+    res: &victory_shader::resource::Resources,
+    n: &NativeProgram,
+    site: victory_shader::resource::Site,
+) -> Result<Vec<(u8, u32)>, &'static str> {
+    fn walk(
+        res: &victory_shader::resource::Resources,
+        n: &NativeProgram,
+        source: &Source,
+        out: &mut Vec<(u8, u32)>,
+    ) -> Result<(), &'static str> {
+        match source {
+            &Source::Loaded { load, first } => {
+                let key = loaded_entry(res, n, load, first)?;
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+                Ok(())
+            }
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().try_for_each(|a| walk(res, n, a, out))
+            }
+            _ => Err("a store through a descriptor not loaded from a table"),
+        }
+    }
+    let d = res
+        .descriptors
+        .iter()
+        .find(|d| d.site == site && d.role == Role::Resource)
+        .ok_or("a store without a traced descriptor")?;
+    let mut out = Vec::new();
+    walk(res, n, &d.source, &mut out)?;
+    Ok(out)
+}
+
+/// The table entry (slot, dword) dwords `first..` of the scalar load at
+/// `load` read.
+fn loaded_entry(
+    res: &victory_shader::resource::Resources,
+    n: &NativeProgram,
+    load: victory_shader::resource::Site,
+    first: u8,
+) -> Result<(u8, u32), &'static str> {
     let i = res
         .scalar
         .binary_search_by_key(&load, |x| x.0)
@@ -138,30 +187,31 @@ impl StoreExtents {
         for s in &e.stores {
             let offset = s.offset?;
             let index = s.index.transpose()?;
-            let key = entry_of(&res, n, s.site)?;
-            // An index counts what the translation multiplies it by: a
-            // typed store the host view's elements, an untyped one the
-            // used-resource entry's stride (`emit::lower`, raw bytes at
-            // index times stride), never the view's own stride.
-            let typed = p.blocks[s.site.0].insts[s.site.1].name().contains("format");
-            let index = match index {
-                Some(i) if typed => Some((i, None)),
-                Some(i) => {
-                    let stride = n
-                        .used
-                        .iter()
-                        .find(|u| u.root == RootType::Table && u.slot == key.0 && u.table_offset_dwords == key.1)
-                        .map(|u| u.stride)
-                        .filter(|&s| s >= 4 && s.is_multiple_of(4))
-                        .ok_or("an indexed untyped store without a stride")?;
-                    Some((i, Some(stride)))
+            for key in entries_of(&res, n, s.site)? {
+                // An index counts what the translation multiplies it by: a
+                // typed store the host view's elements, an untyped one the
+                // used-resource entry's stride (`emit::lower`, raw bytes at
+                // index times stride), never the view's own stride.
+                let typed = p.blocks[s.site.0].insts[s.site.1].name().contains("format");
+                let index = match index {
+                    Some(i) if typed => Some((i, None)),
+                    Some(i) => {
+                        let stride = n
+                            .used
+                            .iter()
+                            .find(|u| u.root == RootType::Table && u.slot == key.0 && u.table_offset_dwords == key.1)
+                            .map(|u| u.stride)
+                            .filter(|&s| s >= 4 && s.is_multiple_of(4))
+                            .ok_or("an indexed untyped store without a stride")?;
+                        Some((i, Some(stride)))
+                    }
+                    None => None,
+                };
+                let store = (offset, index, s.bytes);
+                match entries.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, v)) => v.push(store),
+                    None => entries.push((key, vec![store])),
                 }
-                None => None,
-            };
-            let store = (offset, index, s.bytes);
-            match entries.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, v)) => v.push(store),
-                None => entries.push((key, vec![store])),
             }
         }
         let (groups, _) = cs.system_sgprs();
@@ -830,5 +880,30 @@ mod tests {
     fn the_check_compiles() {
         let made = crate::host::compile(CHECK_SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1"));
         assert!(made.is_ok_and(|b| !b.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    /// `VICTORY_EXTENT_BINS=<files, ;-separated> cargo test -p victory-gpu
+    /// extent_probe -- --ignored --nocapture`: whether each shader
+    /// container's compute program has store extents, and why not.
+    #[test]
+    #[ignore = "reads shaders from VICTORY_EXTENT_BINS"]
+    fn extent_probe() {
+        let Some(paths) = std::env::var_os("VICTORY_EXTENT_BINS") else {
+            return;
+        };
+        for path in std::env::split_paths(&paths) {
+            let bytes = std::fs::read(&path).expect("a file");
+            let c = victory_shader::Container::parse(&bytes).expect("a container");
+            let part = c.part(victory_shader::FourCC::DXIL).expect("code");
+            for n in victory_shader::native_programs(part.data).expect("programs") {
+                match super::StoreExtents::of(&n) {
+                    Ok(e) => println!("{}: extents, {} entries, leaves {:?}", path.display(), e.entries.len(), e.leaves.iter().map(|l| l.1).collect::<Vec<_>>()),
+                    Err(why) => println!("{}: none ({why})", path.display()),
+                }
+            }
+        }
     }
 }

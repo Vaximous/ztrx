@@ -17,11 +17,18 @@ use victory_shader::resource::{Role, Source};
 use victory_shader::stores::{Node, bounds, extents};
 
 /// Whether table views are declared written only where the shader's
-/// stores can reach (`VICTORY_EXTENTS=1`; off by default: the extents are
-/// only counted).
+/// stores can reach (`VICTORY_EXTENTS=0`: the extents are only counted).
+/// On by default since check runs fxchk1-3 (VICTORY_EXTENT_CHECK=1, over
+/// 25,000 dispatches hashed before and after) found stores outside the
+/// extents from one shader only, which is denied ([`denied`]); constant
+/// dwords looked at again at submission had not changed.
 pub(crate) fn narrow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_EXTENTS").is_ok_and(|v| v == "1"))
+    // (A check run only counts, unless asked to narrow as well.)
+    *ON.get_or_init(|| match std::env::var("VICTORY_EXTENTS") {
+        Ok(v) => v == "1",
+        Err(_) => !check_on(),
+    })
 }
 
 /// Shaders whose store extents are not used (their views are declared

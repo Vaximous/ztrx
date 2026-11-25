@@ -41,7 +41,8 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: each record of a group is
+    // charged to the budget on its own (`VICTORY_CLAMP_GROUP_CHARGE=0`).
     uint has_count;
     uint count_offset;
 };
@@ -54,17 +55,33 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+// One record: what it asks for, bounded, and what it costs.
+struct Rec {
+    bool live;
+    uint src_at;
+    uint dst_at;
+    uint cost;
+    uint2 draw_counts;
+    uint3 groups;
+};
+Rec measure(uint i) {
+    Rec r;
+    r.live = false;
+    r.src_at = 0;
+    r.dst_at = 0;
+    r.cost = 0;
+    r.draw_counts = uint2(0, 0);
+    r.groups = uint3(0, 0, 0);
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    if (i >= eff_count) return r;
+    r.live = true;
+    uint src_at = args_offset + i * stride;
+    r.src_at = src_at;
+    r.dst_at = i * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -110,39 +127,115 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
+    r.cost = cost;
+    r.draw_counts = draw_counts;
+    r.groups = groups;
+    return r;
+}
+// Adds `cost` to the list's work so far, saturating at the budget: the
+// work before it.
+uint charge(uint cost) {
+    uint before;
+    budget.InterlockedOr(0, 0, before);
+    [allow_uav_condition]
+    while (before < BUDGET) {
+        uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+        uint prev;
+        budget.InterlockedCompareExchange(0, before, next, prev);
+        if (prev == before) break;
+        before = prev;
     }
+    return before;
+}
+// Whether a record costing `cost` with `before` of work ahead of it is past
+// the budget.
+bool past(uint before, uint cost) {
+    return cost > 0 && (before >= BUDGET || BUDGET - before < cost);
+}
+void store(Rec r, bool over) {
     if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args.Store2(r.dst_at, over ? uint2(0, 0) : r.draw_counts);
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
     } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
+        dst_args.Store3(r.dst_at, over ? uint3(0, 0, 0) : r.groups);
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
     }
 }
+// The group's work, saturating at the budget, and that of the list before
+// the group.
+groupshared uint group_cost;
+groupshared uint group_before;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {
+    // The records of a group are charged to the budget once, by one
+    // thread: each charging its own, the 64 of a window waited on one
+    // another's exchanges with the card's memory, 68 microseconds a window
+    // (run fxg4). Each record's place in the group's sum stands for the
+    // work before it, so a record is past the budget as it was charged one
+    // by one.
+    if (at == 0) {
+        group_cost = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    Rec r = measure(id.x);
+    bool alone = (has_count & 4u) != 0;
+    uint ahead = 0;
+    if (r.cost > 0 && !alone) {
+        uint seen = group_cost;
+        [allow_uav_condition]
+        while (true) {
+            uint next = (seen >= BUDGET || BUDGET - seen <= r.cost) ? BUDGET : (seen + r.cost);
+            uint prev;
+            InterlockedCompareExchange(group_cost, seen, next, prev);
+            if (prev == seen) break;
+            seen = prev;
+        }
+        ahead = seen;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (at == 0) {
+        group_before = group_cost > 0 ? charge(group_cost) : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!r.live) return;
+    if (alone) {
+        store(r, past(r.cost > 0 ? charge(r.cost) : 0, r.cost));
+        return;
+    }
+    uint before = group_before >= BUDGET || BUDGET - group_before <= ahead ? BUDGET : group_before + ahead;
+    store(r, past(before, r.cost));
+}
 "#;
+
+/// Whether the records clamped by one group of the compute pass are
+/// charged to the list's budget once, by one thread, each at its place in
+/// the group's sum (on by default; `VICTORY_CLAMP_GROUP_CHARGE=0` charges
+/// each on its own). Each charge is a loop of exchanges with the card's
+/// memory until no other thread changed the word between: the 64 records of
+/// a window took turns, and a window's clamp cost 68 microseconds against
+/// under 5 for a record alone, 24 ms of the card's time a frame in the
+/// world (run fxg4, 355 windows a frame).
+fn group_charge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_GROUP_CHARGE").is_none_or(|v| v != "0"))
+}
+
+/// The most groups per axis of any dispatch or mesh record the clamp
+/// passes on ([`SOURCE`]: `min(asked, 65535u)`; mesh records also at most
+/// 1 in y and z). Others may rely on it as an upper bound of the group ids
+/// of clamped indirect dispatches; kept in step with the shader by a test.
+#[allow(dead_code, reason = "a bound for store extents of indirect dispatches")]
+pub(crate) const MAX_GROUPS_PER_AXIS: u32 = 65535;
+
+/// The most groups of one clamped indirect dispatch in all (x * y * z;
+/// [`SOURCE`]'s `GROUPS`); a record asking for more runs empty.
+#[allow(dead_code, reason = "a bound for store extents of indirect dispatches")]
+pub(crate) const MAX_DISPATCH_GROUPS: u32 = 1 << 20;
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -452,7 +545,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(!group_charge()) << 2);
+    let constants = [kind, stride, records, args_offset, flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -817,20 +911,108 @@ void main() {
         }
     }
 
-    /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
-    /// what was hashed last and leaves the hashes: a piece a shader changed
-    /// and a later one changed back then looks untouched, which is right
-    /// only if the piece was fetched after both. Told 2 (submissions sent
-    /// ahead with the relay, whose pieces are fetched flight by flight) it
-    /// stores the hash it made: each compare flags what changed since the
-    /// compare before it, also a change back.
+    #[test]
+    fn clamp_bounds_match_the_shader() {
+        assert_eq!(MAX_GROUPS_PER_AXIS, 65535);
+        assert!(SOURCE.contains("uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));"));
+        assert!(SOURCE.contains("g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));"));
+        assert_eq!(MAX_DISPATCH_GROUPS, 1 << 20);
+        assert!(SOURCE.contains("static const uint GROUPS = 1u << 20;"));
+    }
+
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same of the compare with a group per piece
+    /// (`crate::host::CARD_COMPARE_WIDE`).
+    #[test]
+    fn warp_wide_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    /// The compare with a group per piece flags the same pieces as the
+    /// one with a thread per piece, for changes of one byte anywhere in a
+    /// piece (its first and last bytes too) and for two 16-byte runs of a
+    /// piece swapped, near each other and 4 KiB apart (one thread of the
+    /// group reads both of those). Four pieces, the copy starting 48 bytes
+    /// into the first (`skew`), so the first and last are cut short.
+    #[test]
+    fn warp_wide_and_narrow_card_compares_flag_the_same_pieces() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        const SKEW: u32 = 48;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251 + i / 4093) as u8).collect();
+        let shaders = [
+            (compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("narrow"), false),
+            (compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("wide"), true),
+        ];
+        let run = |warp: &mut WarpHarness, c: &Clamp, wide: bool, mode: u32| -> [u32; 4] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&c.root);
+                warp.list.SetPipelineState(&c.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2, 3].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        let reset = || {
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        };
+        // (what changes, the pieces it lies in). Piece p of the copy
+        // starts at p * 64 KiB - SKEW.
+        let piece_at = |p: usize| p * PIECE - SKEW as usize;
+        type Change = Box<dyn Fn(*mut u8)>;
+        let flip = |at: usize| -> Change { Box::new(move |base: *mut u8| unsafe { *base.add(at) ^= 0x10 }) };
+        let swap = |a: usize, b: usize| -> Change {
+            Box::new(move |base: *mut u8| unsafe { std::ptr::swap_nonoverlapping(base.add(a), base.add(b), 16) })
+        };
+        let cases: Vec<(Change, [u32; 4])> = vec![
+            (flip(0), [1, 0, 0, 0]),
+            (flip(piece_at(1) - 1), [1, 0, 0, 0]),
+            (flip(piece_at(1)), [0, 1, 0, 0]),
+            (flip(piece_at(2) + 12_345), [0, 0, 1, 0]),
+            (flip(size - SKEW as usize - 1), [0, 0, 0, 1]),
+            (swap(piece_at(1) + 1024, piece_at(1) + 1040), [0, 1, 0, 0]),
+            (swap(piece_at(2) + 4096, piece_at(2) + 8192), [0, 0, 1, 0]),
+        ];
+        for (n, (change, expected)) in cases.iter().enumerate() {
+            for (c, wide) in &shaders {
+                reset();
+                assert_eq!(run(&mut warp, c, *wide, 0), [7; 4]);
+                assert_eq!(run(&mut warp, c, *wide, 1), [0; 4], "case {n}, wide {wide}: nothing changed yet");
+                change(now_ptr);
+                assert_eq!(run(&mut warp, c, *wide, 1), *expected, "case {n}, wide {wide}");
+            }
+        }
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, wide: bool) {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -856,7 +1038,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -893,10 +1076,21 @@ void main() {
     /// slot plus 2; pieces past the last slot keep their 1, others their 0.
     #[test]
     fn warp_card_push_puts_flagged_pieces_in_slots() {
+        card_push_puts_flagged_pieces_in_slots(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same after the wide compare (`crate::host::CARD_COMPARE_WIDE`):
+    /// the push reads its `differs` as it reads the narrow one's.
+    #[test]
+    fn warp_card_push_after_the_wide_compare() {
+        card_push_puts_flagged_pieces_in_slots(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    fn card_push_puts_flagged_pieces_in_slots(compare_source: &str, wide: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, compare_source).expect("the card compare must compile on WARP");
         let push = compile_cs(&warp.device, crate::host::CARD_PUSH).expect("the card push must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
@@ -943,7 +1137,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
                 if mode != 0 {
                     warp.list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
                     warp.list.SetComputeRootSignature(&push.root);

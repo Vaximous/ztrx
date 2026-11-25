@@ -1336,6 +1336,7 @@ pub(crate) fn back_line(frames: f64) {
         );
         crate::extent::check_line();
         crate::extent::whole_line(frames);
+        crate::cardcopy::line(frames);
         let e: Vec<f64> = EXTENTS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "store extents per frame: {:.0} table views of shaders with extents ({:.0} MB), {:.0} MB of them left by the \

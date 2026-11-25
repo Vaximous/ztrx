@@ -740,6 +740,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local chunks for constants the card copies out of title
+    /// buffers' card copies (`crate::cardcopy::try_fill`): the chunks, the
+    /// one in use and the bytes used of it; kept across resets.
+    card_scratch: Mutex<(Vec<ID3D12Resource>, usize, u64)>,
     /// Whether shaders recorded in the list may have written buffers since
     /// its last wait for every earlier shader write (a barrier on all
     /// unordered access): `crate::indirect` waits for those writes before
@@ -2474,6 +2478,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
                         if count {
+                            crate::cardcopy::fill_blocked(src, len);
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             note_read_block("a fill of upload memory", written, src, len);
@@ -3295,6 +3300,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                card_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -4126,6 +4132,7 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::cardcopy::landed();
         {
             let mut line = line();
             let Line {
@@ -5150,6 +5157,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
+            let mut card = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (card.1, card.2) = (0, 0);
+        }
+        {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
@@ -5776,6 +5787,32 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// `len` bytes (at most 64 KiB) of device-local memory, 256-byte
+    /// aligned, for the list until it is reset: the buffer, the offset in
+    /// it, and whether this is the buffer's first use in the recording (it
+    /// starts each execution in the common state; after a first use the
+    /// list left it a constant buffer).
+    pub(crate) fn card_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, bool)> {
+        const CHUNK: u64 = 64 << 10;
+        let len = len.max(1).next_multiple_of(256);
+        if len > CHUNK {
+            return None;
+        }
+        let mut s = self.card_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if s.1 < s.0.len() && s.2 + len > CHUNK {
+            (s.1, s.2) = (s.1 + 1, 0);
+        }
+        if s.1 == s.0.len() {
+            let buffer = host()?.uav_buffer(CHUNK)?;
+            name(&buffer, || "list constants copied on the card".into());
+            s.0.push(buffer);
+            s.2 = 0;
+        }
+        let at = s.2;
+        s.2 += len;
+        Some((s.0[s.1].clone(), at, at == 0))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for

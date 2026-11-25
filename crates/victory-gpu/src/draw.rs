@@ -465,6 +465,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if let Some(gpu) = crate::cardcopy::try_fill(list, address, len) {
+        return Some(gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -2212,7 +2215,9 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        if let Some(gpu) = constant_in_card_copy(list, address, size) {
+                        if let Some(gpu) = constant_in_card_copy(list, address, size)
+                            .or_else(|| crate::cardcopy::try_fill(list, address, u64::from(size)))
+                        {
                             host.constant_at(index, gpu, size);
                             continue;
                         }

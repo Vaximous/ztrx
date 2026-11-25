@@ -446,6 +446,24 @@ fn need(block: usize) {
     });
 }
 
+/// Whether [`lane_uniform`] looks only at the VGPRs an operand names (its dwords), not every
+/// VGPR the instruction reads from that register up: a destination's old value (read for the
+/// lanes a guard leaves) made a scalar's reciprocal through VGPRs, the compiler's idiom before
+/// `v_readfirstlane`, count as differing between lanes, so each such read was exchanged between
+/// the host waves through LDS (two group barriers). `VICTORY_UNIFORM_PRECISE=0` restores the
+/// old rule.
+fn uniform_precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_PRECISE").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`lane_uniform`] takes a plain buffer load from an address every lane makes alike
+/// as alike in every lane (`VICTORY_UNIFORM_LOADS=0`: never).
+fn uniform_loads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_LOADS").is_none_or(|v| v != "0"))
+}
+
 /// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
@@ -465,26 +483,49 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
+            let (ops, dst): (Vec<Operand>, Option<Operand>) = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
                         && v.sdwa.is_none()
                         && !name.starts_with("v_mbcnt")
                         && !name.starts_with("v_cmpx")
+                        && !name.contains("movrel")
                         && !name.contains("lane") =>
                 {
-                    v.src.clone()
+                    (v.src.clone(), v.dst)
+                }
+                // A plain buffer load whose address every lane makes alike: the console wave's
+                // lanes all read the one place in the one instruction.
+                // shortcut: the two host waves read it at two times; a store by another wave
+                // in between would part them (the console's waves of a group race the same way).
+                Fields::Buffer { addr, offen, idxen, lds: false, tfe: false, cache, .. }
+                    if uniform_loads()
+                        && name.starts_with("buffer_load")
+                        && !name.contains("d16")
+                        && !cache.glc =>
+                {
+                    (if *offen || *idxen { vec![*addr] } else { Vec::new() }, None)
                 }
                 _ => continue,
             };
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+            // An accumulator (`v_fmac`), or a 16-bit or packed result that may keep the other
+            // half, reads its destination as well.
+            let keeps = name.contains("mac") || name.contains("16") || name.contains("pk");
+            let precise = uniform_precise();
+            let alike = ops.iter().chain(dst.iter().filter(|_| keeps)).all(|op| match *op {
+                Operand::Vector { reg, dwords } => {
+                    // every dword of the operand the instruction reads (`precise`: only those; else
+                    // every VGPR read from that register on, the destination's old value too)
+                    let end = if precise { u16::from(reg) + u16::from(dwords.max(1)) } else { u16::MAX };
+                    let read: Vec<Value> = inst
+                        .reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && u16::from(x) < end))
+                        .map(|r| r.1)
+                        .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it

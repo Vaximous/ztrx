@@ -36,7 +36,8 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: each record of a group is
+    // charged to the budget on its own (`VICTORY_CLAMP_GROUP_CHARGE=0`).
     uint has_count;
     uint count_offset;
 };
@@ -49,17 +50,33 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+// One record: what it asks for, bounded, and what it costs.
+struct Rec {
+    bool live;
+    uint src_at;
+    uint dst_at;
+    uint cost;
+    uint2 draw_counts;
+    uint3 groups;
+};
+Rec measure(uint i) {
+    Rec r;
+    r.live = false;
+    r.src_at = 0;
+    r.dst_at = 0;
+    r.cost = 0;
+    r.draw_counts = uint2(0, 0);
+    r.groups = uint3(0, 0, 0);
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    if (i >= eff_count) return r;
+    r.live = true;
+    uint src_at = args_offset + i * stride;
+    r.src_at = src_at;
+    r.dst_at = i * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -99,39 +116,103 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
+    r.cost = cost;
+    r.draw_counts = draw_counts;
+    r.groups = groups;
+    return r;
+}
+// Adds `cost` to the list's work so far, saturating at the budget: the
+// work before it.
+uint charge(uint cost) {
+    uint before;
+    budget.InterlockedOr(0, 0, before);
+    [allow_uav_condition]
+    while (before < BUDGET) {
+        uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+        uint prev;
+        budget.InterlockedCompareExchange(0, before, next, prev);
+        if (prev == before) break;
+        before = prev;
     }
+    return before;
+}
+// Whether a record costing `cost` with `before` of work ahead of it is past
+// the budget.
+bool past(uint before, uint cost) {
+    return cost > 0 && (before >= BUDGET || BUDGET - before < cost);
+}
+void store(Rec r, bool over) {
     if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
-        }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args.Store2(r.dst_at, over ? uint2(0, 0) : r.draw_counts);
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
     } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
-        }
-        dst_args.Store3(dst_at, groups);
+        dst_args.Store3(r.dst_at, over ? uint3(0, 0, 0) : r.groups);
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args.Store(r.dst_at + off, src_args.Load(r.src_at + off));
         }
     }
 }
+// The group's work, saturating at the budget, and that of the list before
+// the group.
+groupshared uint group_cost;
+groupshared uint group_before;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint at : SV_GroupIndex) {
+    // The records of a group are charged to the budget once, by one
+    // thread: each charging its own, the 64 of a window waited on one
+    // another's exchanges with the card's memory, 68 microseconds a window
+    // (run fxg4). Each record's place in the group's sum stands for the
+    // work before it, so a record is past the budget as it was charged one
+    // by one.
+    if (at == 0) {
+        group_cost = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    Rec r = measure(id.x);
+    bool alone = (has_count & 4u) != 0;
+    uint ahead = 0;
+    if (r.cost > 0 && !alone) {
+        uint seen = group_cost;
+        [allow_uav_condition]
+        while (true) {
+            uint next = (seen >= BUDGET || BUDGET - seen <= r.cost) ? BUDGET : (seen + r.cost);
+            uint prev;
+            InterlockedCompareExchange(group_cost, seen, next, prev);
+            if (prev == seen) break;
+            seen = prev;
+        }
+        ahead = seen;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (at == 0) {
+        group_before = group_cost > 0 ? charge(group_cost) : 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!r.live) return;
+    if (alone) {
+        store(r, past(r.cost > 0 ? charge(r.cost) : 0, r.cost));
+        return;
+    }
+    uint before = group_before >= BUDGET || BUDGET - group_before <= ahead ? BUDGET : group_before + ahead;
+    store(r, past(before, r.cost));
+}
 "#;
+
+/// Whether the records clamped by one group of the compute pass are
+/// charged to the list's budget once, by one thread, each at its place in
+/// the group's sum (on by default; `VICTORY_CLAMP_GROUP_CHARGE=0` charges
+/// each on its own). Each charge is a loop of exchanges with the card's
+/// memory until no other thread changed the word between: the 64 records of
+/// a window took turns, and a window's clamp cost 68 microseconds against
+/// under 5 for a record alone, 24 ms of the card's time a frame in the
+/// world (run fxg4, 355 windows a frame).
+fn group_charge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_GROUP_CHARGE").is_none_or(|v| v != "0"))
+}
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -343,7 +424,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(!group_charge()) << 2);
+    let constants = [kind, stride, records, args_offset, flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`

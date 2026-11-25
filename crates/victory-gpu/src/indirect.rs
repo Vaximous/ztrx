@@ -438,6 +438,8 @@ pub(crate) fn bound(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| clamp_note("clamp", spec, wait));
     record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, clamped_as_draw(spec.0, spec.2)).then(|| {
         list.waited();
         dst
@@ -546,10 +548,21 @@ pub(crate) fn bound_ahead(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| clamp_note("clamp-window", spec, wait));
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, clamped_as_draw(spec.0, spec.2)).then(|| {
         list.waited();
         dst
     })
+}
+
+/// For timing notes: a clamp's own line, so the card's time of its waits
+/// and pass is told apart from the indirect call after it.
+#[cfg(feature = "diagnostics")]
+fn clamp_note(what: &str, (kind, _, records): (u32, u32, u32), wait: bool) -> String {
+    let drawn = if clamped_as_draw(kind, records) { " drawn" } else { "" };
+    let wait = if wait { "waiting" } else { "alone" };
+    format!("{what}{drawn} {wait} kind {kind} records {records}")
 }
 
 #[cfg(test)]

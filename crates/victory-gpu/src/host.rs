@@ -786,7 +786,7 @@ fn lazy_prelude() -> bool {
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 16384;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]

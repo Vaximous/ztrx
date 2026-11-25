@@ -2650,6 +2650,13 @@ impl State {
             6
         };
         WINDOWED[how].fetch_add(1, Ordering::Relaxed);
+        // Timing notes: the copies of the arguments to the card first, then
+        // the clamp (`crate::indirect`'s own note), then the call's state,
+        // then the call: each its own line of the card's time.
+        #[cfg(feature = "diagnostics")]
+        if hit.is_none() {
+            list.note_op(|| format!("ifetch kind {kind}"));
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None if unclamped => {
@@ -2748,6 +2755,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("ibind kind {kind}"));
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),

@@ -2315,9 +2315,11 @@ fn landing_check() -> usize {
 /// in the air).
 static LANDING_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-/// [`fetch_queue`]: the card copies' pieces declared written by each flight
-/// sent and not yet landed, by its place in [`QUEUE_ORDER`]: (copy, first
-/// piece, end). Noted under that lock as the flight goes to the queue.
+/// [`fetch_queue`], [`landing_check`] and `crate::shadow::card_direct`: the
+/// card copies' pieces declared written by each flight sent and not yet
+/// landed, by its place in [`QUEUE_ORDER`]: (copy, first piece, end). Noted
+/// under that lock as the flight goes to the queue, dropped after its
+/// landing's merge.
 static QUICK_DECLARED: Mutex<std::collections::BTreeMap<u64, Vec<(usize, u32, u32)>>> =
     Mutex::new(std::collections::BTreeMap::new());
 
@@ -4422,6 +4424,50 @@ impl Host {
                 }
             }
         }
+        // `VICTORY_CARD_DIRECT` (`crate::shadow::card_direct`): ranges in
+        // pieces no flight in the air declares written are counted, and
+        // with `1` written through the BAR now; the rest (`copies`) go by
+        // copy on the queue. All of them are hashed again below, after the
+        // writes and ahead of the submission's lists. Only for a flight
+        // sent ahead: a submission that is waited for merges with
+        // `Shadow::card_merge`, which has no notes of sends to skip by.
+        let copies: Option<Vec<Vec<(usize, usize)>>> = (crate::shadow::card_direct() > 0).then(|| {
+            let writes = flown && crate::shadow::card_direct_writes();
+            let in_air = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut wrote = false;
+            let copies = dirty
+                .iter()
+                .map(|(shadow, ranges)| {
+                    let copy = Arc::as_ptr(shadow) as usize;
+                    let busy: Vec<(u32, u32)> =
+                        in_air.values().flat_map(|v| v.iter()).filter(|e| e.0 == copy).map(|e| (e.1, e.2)).collect();
+                    let Some((quiet, held)) = shadow.card_quiet(ranges, &busy) else {
+                        return ranges.clone();
+                    };
+                    let stats = &crate::shadow::CARD_STATS;
+                    stats[7].fetch_add(quiet.iter().map(|r| (r.1 - r.0) as u64).sum(), Ordering::Relaxed);
+                    stats[8].fetch_add(quiet.len() as u64, Ordering::Relaxed);
+                    stats[9].fetch_add(held.iter().map(|r| (r.1 - r.0) as u64).sum(), Ordering::Relaxed);
+                    stats[10].fetch_add(held.len() as u64, Ordering::Relaxed);
+                    if writes && !quiet.is_empty() && shadow.card_write_side(&quiet) {
+                        wrote = true;
+                        held
+                    } else {
+                        ranges.clone()
+                    }
+                })
+                .collect();
+            if wrote {
+                // The stores are write-combined: all of them out before
+                // the queue runs the hashing that reads them.
+                // SAFETY: a plain store fence.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_sfence()
+                };
+            }
+            copies
+        });
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -4435,15 +4481,16 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for (shadow, ranges) in &dirty {
+                    for (i, (shadow, ranges)) in dirty.iter().enumerate() {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
-                        for &(a, b) in ranges {
+                        let copied = copies.as_ref().map_or(ranges, |c| &c[i]);
+                        for &(a, b) in copied {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
-                        crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        crate::shadow::CARD_STATS[1].fetch_add(copied.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
                             continue;
                         };
@@ -4453,7 +4500,9 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        // (Written through the BAR only: the buffer is in the
+                        // common state, and the hashing's read promotes it.)
+                        if !copied.is_empty() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4971,6 +5020,18 @@ impl Host {
             };
             LANDING_STATS[if *flagged { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
             LANDING_STATS[3].fetch_add(count as u64, Ordering::Relaxed);
+            // `VICTORY_CARD_DIRECT=1` holds only if this never happens:
+            // the writes through the BAR stop at the first such piece.
+            if crate::shadow::card_direct() == 2 {
+                crate::shadow::CARD_STATS[11].fetch_add(1, Ordering::Relaxed);
+                if crate::shadow::card_direct_trip() {
+                    tracing::error!(
+                        piece = format_args!("{:#x}+{:#x}", shadow.title_start() + *lo as u64, hi - lo),
+                        "VICTORY_CARD_DIRECT: a card side differs from its CPU side after a landing; ranges go by copy \
+                         on the queue from now on"
+                    );
+                }
+            }
             tracing::warn!(
                 title = format_args!("{:#x}", shadow.title_start() + first as u64),
                 piece = format_args!("{:#x}+{:#x}", shadow.title_start() + *lo as u64, hi - lo),
@@ -5194,7 +5255,7 @@ impl Host {
                 }
             }
         }
-        if fetch_queue() || landing_check() > 0 {
+        if fetch_queue() || landing_check() > 0 || crate::shadow::card_direct() > 0 {
             QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&n, _| n > floor);
         }
         if pieces.is_empty() {
@@ -5966,7 +6027,7 @@ impl Host {
                 *order += 1;
                 if let Some(card) = card.as_mut() {
                     card.sent_as = *order;
-                    if fetch_queue() || landing_check() > 0 {
+                    if fetch_queue() || landing_check() > 0 || crate::shadow::card_direct() > 0 {
                         let pieces = card
                             .ranges
                             .iter()
@@ -8161,9 +8222,9 @@ impl Meter {
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
                      ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
-                    card[7],
-                    card[8] >> 20,
-                    card[9] >> 20,
+                    card[12],
+                    card[13] >> 20,
+                    card[14] >> 20,
                     per_frame(0) / 1e6,
                     per_frame(1),
                     per_frame(2),
@@ -8172,6 +8233,20 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                if crate::shadow::card_direct() > 0 {
+                    tracing::info!(
+                        "VICTORY_CARD_DIRECT ({}) per frame: {:.1} MB in {:.0} ranges in pieces no flight in the air \
+                         declares ({}), {:.1} MB in {:.0} ranges in pieces one does (by copy); since the last line \
+                         {} pieces the landing check found differing",
+                        if crate::shadow::card_direct() == 1 { "probe" } else { "1" },
+                        per_frame(7) / 1e6,
+                        per_frame(8),
+                        if crate::shadow::card_direct_writes() { "written through the BAR" } else { "by copy" },
+                        per_frame(9) / 1e6,
+                        per_frame(10),
+                        card[11]
+                    );
+                }
                 let push: Vec<f64> = PUSH_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
                 tracing::info!(
                     "pushed down by the card per frame: {:.0} pieces ({:.1} MB) merged, {:.0} passed over as \
@@ -8672,6 +8747,70 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer as [`Host::uav_buffer`] makes, in card memory the CPU maps
+    /// through the resizable BAR (a GPU upload heap), with its mapping
+    /// (write-combined: to be written, not read). `None` if the card has
+    /// no such heaps or the buffer cannot be made.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        let supported = *SUPPORTED.get_or_init(|| {
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a plain query that fills our structure.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+                )
+            };
+            let supported = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(supported, "GPU upload heaps (VICTORY_CARD_DIRECT)");
+            supported
+        });
+        if !supported {
+            return None;
+        }
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a buffer of ours; the CPU
+        // reads none of it (an empty read range).
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no GPU upload buffer: the copy's card side is made as before");
                 None
             }
         }

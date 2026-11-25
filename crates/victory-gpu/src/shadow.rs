@@ -101,6 +101,11 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// With `VICTORY_CARD_DIRECT=1` ([`card_direct`]): the card's side is a
+    /// GPU upload buffer (card memory the CPU maps through the resizable
+    /// BAR), and this is its mapping, write-combined. Written, never read
+    /// (the CPU reads it at some 54 MB/s).
+    side: Option<usize>,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -197,19 +202,117 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
-pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Then, with [`card_direct`]: bytes and ranges sent up in pieces no flight
+/// in the air declares (written through the BAR with
+/// `VICTORY_CARD_DIRECT=1`), bytes and ranges in pieces one does (copied
+/// on the queue, as before), and pieces [`crate::host`]'s landing check
+/// found differing while the writes through the BAR were on.
+pub(crate) static CARD_STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub(crate) fn card_stats() -> [u64; 15] {
+    let mut out = [0u64; 15];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
-    out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+    out[12] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[13] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+    out[14] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
+}
+
+/// `VICTORY_CARD_DIRECT`, with [`relay`] only: 0 (unset, the default)
+/// sends what changed on a copy's CPU side to its card side with copies on
+/// the queue ahead of each submission's lists (`Host::card_before`), as
+/// before. `probe` (1) does the same and counts how much of it lies in
+/// pieces no flight in the air declares written ([`CARD_STATS`] 7-10).
+/// `1` (2) makes the card sides of title buffers GPU upload buffers and
+/// writes those ranges through the BAR from the CPU instead, for flights
+/// sent ahead (a submission that is waited for merges with
+/// [`Shadow::card_merge`], which skips no sends); the rest still goes by
+/// copy.
+///
+/// Why only those pieces: a piece a flight sent and not yet landed
+/// declares written is changed on the card only by work in the queue's
+/// order. A write through the BAR lands at once: under a flight still
+/// running it could land before that flight's shaders write the piece,
+/// which would then keep the shader's byte on the card and the title's on
+/// the CPU side for good, and the hash of the piece taken before it
+/// (`Card::before`) would no longer be what the next flight starts with.
+/// Outside such pieces nothing compares or fetches by the queue's order:
+/// the merge of a fetch skips the bytes of sends numbered after it (the
+/// note [`card_dirty`] makes before the write lands), and the pieces
+/// written are hashed again in the next submission's list ahead of its
+/// lists, after the write. The flights in the air are those
+/// `crate::host::QUICK_DECLARED` holds: noted under the queue's order as
+/// each goes to the queue, dropped after its landing's merge.
+pub(crate) fn card_direct() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !relay() {
+            return 0;
+        }
+        match std::env::var("VICTORY_CARD_DIRECT").as_deref() {
+            Ok("probe") => 1,
+            Ok("1") => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// Set when the landing check (`VICTORY_LANDING_CHECK`) finds a piece that
+/// differs while writes through the BAR are on: they stop, and every
+/// range goes by copy again.
+static CARD_DIRECT_TRIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether ranges are written through the BAR now ([`card_direct`] `1`,
+/// not stopped by [`card_direct_trip`]).
+pub(crate) fn card_direct_writes() -> bool {
+    card_direct() == 2 && !CARD_DIRECT_TRIPPED.load(Ordering::Relaxed)
+}
+
+/// The landing check found a card side that differs from its CPU side
+/// while writes through the BAR were on: they stop. Whether this was the
+/// first time.
+pub(crate) fn card_direct_trip() -> bool {
+    card_direct() == 2 && !CARD_DIRECT_TRIPPED.swap(true, Ordering::Relaxed)
+}
+
+/// Of ranges `ranges` (offsets, in order, apart) of a copy of title memory
+/// from `start` on, `len` bytes: the parts in pieces none of `busy` (runs
+/// of pieces, `[first, end)`) holds, and the parts in pieces one does,
+/// each cut at piece lines and joined again where they touch.
+fn quiet_split(start: usize, len: usize, ranges: &[(usize, usize)], busy: &[(u32, u32)]) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let (mut quiet, mut held): (Vec<(usize, usize)>, Vec<(usize, usize)>) = (Vec::new(), Vec::new());
+    let push = |out: &mut Vec<(usize, usize)>, from: usize, to: usize| match out.last_mut() {
+        Some(last) if last.1 == from => last.1 = to,
+        _ => out.push((from, to)),
+    };
+    for &(a, b) in ranges {
+        let b = b.min(len);
+        if a >= b {
+            continue;
+        }
+        if busy.is_empty() {
+            push(&mut quiet, a, b);
+            continue;
+        }
+        for piece in pieces_of(start, a, b) {
+            let (lo, hi) = piece_at(start, len, piece);
+            let (from, to) = (lo.max(a), hi.min(b));
+            if from >= to {
+                continue;
+            }
+            let p = piece as u32;
+            if busy.iter().any(|&(f, e)| f <= p && p < e) {
+                push(&mut held, from, to);
+            } else {
+                push(&mut quiet, from, to);
+            }
+        }
+    }
+    (quiet, held)
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -223,7 +326,7 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Option<(ID3D12Resource, Option<usize>)> {
     if !cards() {
         return None;
     }
@@ -251,7 +354,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // With `VICTORY_CARD_DIRECT=1`: in card memory the CPU maps, if the
+    // card has it ([`card_direct`]); else as before.
+    let direct = if card_direct() == 2 { host.gpu_upload_buffer(size) } else { None };
+    let buffer = match direct {
+        Some((buffer, side)) => Some((buffer, Some(side as usize))),
+        None => host.uav_buffer(size).map(|b| (b, None)),
+    };
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -1672,6 +1781,35 @@ fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
 }
 
 #[cfg(test)]
+mod quiet_tests {
+    use super::{PIECE, quiet_split};
+
+    /// The ranges are split at the lines of busy pieces and nowhere else;
+    /// together the parts hold every byte once.
+    #[test]
+    fn quiet_split_cuts_at_busy_pieces_only() {
+        // A copy starting 0x100 into a piece: piece i holds offsets from
+        // i * PIECE - 0x100 on.
+        let (start, len) = (5 * PIECE + 0x100, 8 * PIECE);
+        let line = |i: usize| i * PIECE - 0x100;
+        let ranges = vec![(0x10, 0x20), (line(1) - 8, line(3) + 8), (line(6) + 4, line(6) + 12), (len - 4, len + 100)];
+        // Pieces 2 and 6 busy.
+        let (quiet, held) = quiet_split(start, len, &ranges, &[(2, 3), (6, 7)]);
+        assert_eq!(quiet, vec![(0x10, 0x20), (line(1) - 8, line(2)), (line(3), line(3) + 8), (len - 4, len)]);
+        assert_eq!(held, vec![(line(2), line(3)), (line(6) + 4, line(6) + 12)]);
+        // Nothing busy: all quiet, as given (cut to the copy).
+        let (quiet, held) = quiet_split(start, len, &ranges, &[]);
+        assert_eq!(quiet, vec![(0x10, 0x20), (line(1) - 8, line(3) + 8), (line(6) + 4, line(6) + 12), (len - 4, len)]);
+        assert!(held.is_empty());
+        // All busy.
+        let (quiet, held) = quiet_split(start, len, &ranges, &[(0, 9)]);
+        assert!(quiet.is_empty());
+        let bytes: usize = held.iter().map(|r| r.1 - r.0).sum();
+        assert_eq!(bytes, 0x10 + (line(3) + 8 - (line(1) - 8)) + 8 + 4);
+    }
+}
+
+#[cfg(test)]
 mod piece_tests {
     use super::{PIECE, piece_at, pieces_of};
 
@@ -2772,6 +2910,38 @@ impl Shadow {
         }
     }
 
+    /// [`card_direct`]: of `ranges` (offsets, in order, apart) about to go
+    /// to the card side, those in pieces no flight in the air declares
+    /// written, and the rest; `busy` holds the runs of pieces such flights
+    /// declare (`[first, end)`). `None` for a window (no compare, never
+    /// written through the BAR).
+    pub(crate) fn card_quiet(&self, ranges: &[(usize, usize)], busy: &[(u32, u32)]) -> Option<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+        (self.card.is_some() && !self.window).then(|| quiet_split(self.start as usize, self.len as usize, ranges, busy))
+    }
+
+    /// [`card_direct`] `1`: the CPU side's bytes of `ranges` (offsets) are
+    /// written to the card side through the BAR. Whether it could (the
+    /// card side is a GPU upload buffer); the caller fences the
+    /// write-combined stores before the queue runs anything that reads
+    /// them.
+    pub(crate) fn card_write_side(&self, ranges: &[(usize, usize)]) -> bool {
+        let Some(side) = self.card.as_ref().and_then(|c| c.side) else {
+            return false;
+        };
+        for &(a, b) in ranges {
+            let b = b.min(self.len as usize);
+            if a < b {
+                // SAFETY: both mappings hold the copy's bytes (the card
+                // side is the copy's size rounded up); the CPU side may be
+                // written meanwhile by a refresh, which notes the range
+                // dirty again after its bytes are in, as for a copy on the
+                // queue that reads it later.
+                unsafe { std::ptr::copy_nonoverlapping(self.data.add(a), (side as *mut u8).add(a), b - a) };
+            }
+        }
+        true
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -3110,7 +3280,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+            Some((on_card, side)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -3123,6 +3293,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    side,
                 };
                 (on_card, Some(card))
             }
@@ -3339,6 +3510,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                side: None,
             };
             (on_card, Some(card))
         }

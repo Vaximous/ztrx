@@ -2211,6 +2211,30 @@ fn fetch_queue_check() -> bool {
 
 const QUICK_CHECKS: u64 = 20_000;
 
+/// `VICTORY_LANDING_CHECK=<pieces>` (`1`: 512): after each landing, up to
+/// that many pieces of the copies in the card's memory that the landed
+/// flights declared, changed or not, are fetched again on the copy queue
+/// and compared with the CPU side the merge left ([`Host::landing_check`]).
+/// Only pieces no flight still in the air declares and no later send went
+/// to: there the two must agree, outside title bytes not yet sent. A piece
+/// that differs is one the copy-back missed or left stale (the compare
+/// found it unchanged, or the merge skipped bytes): its title memory is
+/// older than the card's. Logged with the title address, the bytes, the
+/// frame and whether the compare had flagged the piece.
+fn landing_check() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_LANDING_CHECK").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+        if !relay() { 0 } else if n == 1 { 512 } else { n }
+    })
+}
+
+/// Since the last frame-rate line, of [`landing_check`]: pieces compared,
+/// pieces that differed (flagged by the compare, not flagged), bytes that
+/// differed, landings checked, landings skipped (a synchronous submission
+/// in the air).
+static LANDING_STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// [`fetch_queue`]: the card copies' pieces declared written by each flight
 /// sent and not yet landed, by its place in [`QUEUE_ORDER`]: (copy, first
 /// piece, end). Noted under that lock as the flight goes to the queue.
@@ -3140,6 +3164,19 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    if landing_check() > 0 {
+        let l: Vec<u64> = LANDING_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+        tracing::info!(
+            "landing check (VICTORY_LANDING_CHECK) since the last line: {} pieces compared in {} landings ({} skipped), \
+             {} differed after their flight's compare flagged them, {} the compare had not flagged; {} bytes differed",
+            l[0],
+            l[4],
+            l[5],
+            l[1],
+            l[2],
+            l[3],
         );
     }
     if fetch_queue() {
@@ -4175,6 +4212,155 @@ impl Host {
         Some((quick, data))
     }
 
+    /// [`landing_check`], after the landing of the flights of `plans` has
+    /// merged what they wrote.
+    fn landing_check(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        use std::sync::Arc;
+        static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let floor = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+        if floor == 0 || plans.iter().any(|p| p.sent_as == 0) {
+            return;
+        }
+        // Every piece the landed flights declared, and whether the compare
+        // flagged it.
+        let differs = {
+            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            work.as_ref().map(|w| (w.differs.1, (w.differs.2 / 4) as usize))
+        };
+        let Some((differs, dwords)) = differs else {
+            return;
+        };
+        // SAFETY: the mapping of the results; these plans' dwords are given
+        // to no other plan before their flights are done with (`card_done`,
+        // after this).
+        let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
+        let mut all: Vec<(Arc<crate::shadow::Shadow>, usize, usize, (usize, u32), bool)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for plan in plans {
+            for r in &plan.ranges {
+                let copy = Arc::as_ptr(&r.shadow) as usize;
+                for p in 0..r.span.pieces {
+                    let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                    if lo >= hi || !seen.insert((copy, lo, hi)) {
+                        continue;
+                    }
+                    let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                    all.push((r.shadow.clone(), lo, hi, (copy, r.span.first + p), flagged));
+                }
+            }
+        }
+        if all.is_empty() {
+            return;
+        }
+        if fetch.is_none() {
+            *fetch = self.make_relay_fetch();
+        }
+        let Some(f) = fetch.as_mut() else {
+            return;
+        };
+        if f.quick.is_none() {
+            f.quick = self.make_quick_fetch();
+        }
+        let Some(q) = f.quick.as_mut() else {
+            return;
+        };
+        let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        if SYNC_IN_AIR.load(Ordering::Acquire) > 0 {
+            LANDING_STATS[5].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut picked = Vec::new();
+        {
+            let declared = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+            let newer: Vec<&(usize, u32, u32)> = declared.range(floor + 1..).flat_map(|(_, v)| v.iter()).collect();
+            let n = all.len();
+            let start = TURN.fetch_add(landing_check() as u64, Ordering::Relaxed) as usize % n;
+            for i in 0..n {
+                if picked.len() >= landing_check() {
+                    break;
+                }
+                let item = &all[(start + i) % n];
+                let (copy, piece) = item.3;
+                if newer.iter().any(|&&(c, a, b)| c == copy && a <= piece && piece < b) || item.0.sent_after(item.1, item.2, floor) {
+                    continue;
+                }
+                picked.push(item.clone());
+            }
+        }
+        if picked.is_empty() {
+            return;
+        }
+        let total: u64 = picked.iter().map(|p| (p.2 - p.1) as u64).sum();
+        if q.buffer.as_ref().is_none_or(|b| b.2 < total) {
+            let size = total.next_multiple_of(16 << 20);
+            q.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        }
+        let Some((buffer, data, _)) = q.buffer.clone() else {
+            return;
+        };
+        q.sent += 1;
+        // SAFETY: as in `quick_fetch`: the list's last run was waited for by
+        // this thread; live buffers; our fences and event. Nothing later
+        // runs on the one queue before the copy is done.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                q.allocator.Reset()?;
+                q.list.Reset(&q.allocator, None)?;
+                let mut at = 0u64;
+                for (shadow, lo, hi, _, _) in &picked {
+                    q.list.CopyBufferRegion(&buffer, at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    at += (*hi - *lo) as u64;
+                }
+                q.list.Close()?;
+                q.queue.ExecuteCommandLists(&[Some(q.list.cast::<ID3D12CommandList>()?)]);
+                q.queue.Signal(&q.fence, q.sent)?;
+                self.queue.Wait(&q.fence, q.sent)?;
+                Ok(())
+            })()
+        };
+        drop(order);
+        if let Err(e) = ran {
+            fail(format_args!("pieces could not be fetched again on the copy queue ({e}, VICTORY_LANDING_CHECK)"));
+        }
+        // SAFETY: our fence and event.
+        unsafe {
+            if q.fence.GetCompletedValue() < q.sent {
+                if let Err(e) = q.fence.SetEventOnCompletion(q.sent, q.event) {
+                    fail(format_args!("the landing check's fetch could not be waited for ({e})"));
+                }
+                WaitForSingleObject(q.event, INFINITE);
+            }
+        }
+        let frame = crate::queue::presented();
+        let mut at = 0usize;
+        for (shadow, lo, hi, _, flagged) in &picked {
+            // SAFETY: the mapping of the fetched bytes; the copy has run.
+            let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, hi - lo) };
+            at += hi - lo;
+            LANDING_STATS[0].fetch_add(1, Ordering::Relaxed);
+            let Some((first, count)) = shadow.card_side_differs(*lo, gpu, floor) else {
+                continue;
+            };
+            // A refresh may be between writing the CPU side and noting it
+            // dirty: looked at again a moment later.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let Some((first, count)) = shadow.card_side_differs(*lo, gpu, floor).map(|_| (first, count)) else {
+                continue;
+            };
+            LANDING_STATS[if *flagged { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            LANDING_STATS[3].fetch_add(count as u64, Ordering::Relaxed);
+            tracing::warn!(
+                title = format_args!("{:#x}", shadow.title_start() + first as u64),
+                piece = format_args!("{:#x}+{:#x}", shadow.title_start() + *lo as u64, hi - lo),
+                bytes = count,
+                frame,
+                flagged,
+                "after a landing the copy in the card's memory holds bytes its CPU side and title memory lack (VICTORY_LANDING_CHECK)"
+            );
+        }
+        LANDING_STATS[4].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         // SAFETY: plain objects of our own.
@@ -4349,7 +4535,7 @@ impl Host {
                 }
             }
         }
-        if fetch_queue() {
+        if fetch_queue() || landing_check() > 0 {
             QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&n, _| n > floor);
         }
         if pieces.is_empty() {
@@ -4487,6 +4673,9 @@ impl Host {
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
+                if landing_check() > 0 {
+                    self.landing_check(&plans, fetch);
+                }
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -5109,7 +5298,7 @@ impl Host {
                 *order += 1;
                 if let Some(card) = card.as_mut() {
                     card.sent_as = *order;
-                    if fetch_queue() {
+                    if fetch_queue() || landing_check() > 0 {
                         let pieces = card
                             .ranges
                             .iter()

@@ -2645,6 +2645,43 @@ impl Shadow {
         })
     }
 
+    /// `VICTORY_LANDING_CHECK`: `gpu` is what the card's side held at
+    /// offset `at` on, fetched after a landing whose sends go up to
+    /// `floor`, in a piece no flight still in the air declares and no later
+    /// send went to. After the landing's merge the CPU side must hold the
+    /// same, except where it holds title bytes not yet sent (dirty) or sent
+    /// after `floor`. The first offset that differs and how many bytes do;
+    /// None if all agree.
+    pub(crate) fn card_side_differs(&self, at: usize, gpu: &[u8], floor: u64) -> Option<(usize, usize)> {
+        let card = self.card.as_ref()?;
+        if at + gpu.len() > self.len as usize {
+            return None;
+        }
+        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: inside the mapping (checked above); read only.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(at), gpu.len()) };
+        let skip: Vec<(usize, usize)> = {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            dirty
+                .iter()
+                .copied()
+                .chain(sent.iter().filter(|s| s.2 > floor).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < at + gpu.len() && b > at)
+                .collect()
+        };
+        let (mut first, mut count) = (None, 0usize);
+        for (a, b) in outside(at, at + gpu.len(), skip) {
+            for i in a..b {
+                if gpu[i - at] != held[i - at] {
+                    first.get_or_insert(i);
+                    count += 1;
+                }
+            }
+        }
+        first.map(|f| (f, count))
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {

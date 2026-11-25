@@ -88,6 +88,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod half_local;
 mod lower;
 mod own_bits;
 mod rect;
@@ -268,6 +269,21 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// See [`with_wide_first`].
+    static WIDE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 program first, as
+/// `VICTORY_WAVE_WIDE=1` puts it for every program: for one program at a time
+/// (`VICTORY_WAVE_WIDE_FIRST`, a diagnostics switch of the host).
+pub fn with_wide_first<T>(f: impl FnOnce() -> T) -> T {
+    let was = WIDE_FIRST.replace(true);
+    let r = f();
+    WIDE_FIRST.set(was);
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -379,7 +395,14 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_env = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_env.as_ref().is_some_and(|v| v == "1") || WIDE_FIRST.get();
+        // Unless `VICTORY_WAVE_WIDE=0`, a program no other form takes gets this one last: the
+        // 64-lane form it would have instead is refused by a host of 32-lane waves, which
+        // then never runs it (dispatch arguments, culling and relocation passes left unrun).
+        let wide_last = !wide_on && wide_env.is_none_or(|v| v != "0");
+        // (the wave-wide form found with meetings inside loops, kept for last)
+        let mut wide_late = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -401,7 +424,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || wide_last {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -409,10 +432,20 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
+                        lower::take_loop_meeting();
                         let again = widen(c, native, base, why);
+                        let looped = lower::take_loop_meeting();
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            // By default ahead of the approximate forms only without meetings
+                            // in loops; with them, last of all.
+                            if wide_on || !looped {
+                                return again.map(|(shader, _)| shader);
+                            }
+                            if why {
+                                eprintln!("WAVE64-WIDE meetings in a loop: kept for last");
+                            }
+                            wide_late = Some(again);
                         }
                     }
                 }
@@ -458,6 +491,26 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if let Some(late) = wide_late {
+            return late.map(|(shader, _)| shader);
+        }
+        if wide_last {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches, last", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
@@ -517,6 +570,10 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Several console waves: the two host waves of each meet each other alone
+        // (`lower::pair_sync_on`), not the group.
+        crate::native::StageIo::Cs(cs)
+            if lower::pair_sync_on() && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

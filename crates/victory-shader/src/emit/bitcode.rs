@@ -387,6 +387,156 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Moves what `block` holds so far (its phis and body) to a new block, which takes every
+    /// edge into `block`; `block`, still without a terminator, is left empty to follow it.
+    /// Returns the new block, which the caller ends.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert!(self.blocks[block].term.is_none(), "a split of an ended block");
+        let pre = self.new_block();
+        let phis = std::mem::take(&mut self.blocks[block].phis);
+        let body = std::mem::take(&mut self.blocks[block].body);
+        self.blocks[pre].phis = phis;
+        self.blocks[pre].body = body;
+        for b in &mut self.blocks {
+            match &mut b.term {
+                Some(Term::Br(t)) if *t == block => *t = pre,
+                Some(Term::CondBr(_, t, f)) => {
+                    if *t == block {
+                        *t = pre;
+                    }
+                    if *f == block {
+                        *f = pre;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // (no phi names `block` as a predecessor: it has no terminator yet)
+        pre
+    }
+
+    /// Whether `block` is on a cycle of the blocks' terminators (inside a loop).
+    pub fn in_cycle(&self, block: usize) -> bool {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut stack: Vec<usize> = successors(self.blocks[block].term).to_vec();
+        while let Some(b) = stack.pop() {
+            if b == block {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[b], true) {
+                stack.extend_from_slice(&successors(self.blocks[b].term));
+            }
+        }
+        false
+    }
+
+    /// Whether instruction `i` is a group barrier with an LDS fence (`dx.op.barrier` whose
+    /// mode waits for the group and fences group-shared memory).
+    fn group_barrier(&self, i: u32) -> bool {
+        let Op::Call(f, args) = &self.insts[i as usize].op else {
+            return false;
+        };
+        self.funcs[*f as usize].name == "dx.op.barrier"
+            && args.get(1).and_then(|&m| self.int_value(m)).is_some_and(|m| m & 9 == 9)
+    }
+
+    /// Takes out the barriers of `cands` (calls, each with a key) that no thread needs to wait
+    /// at: from each, every path to a store of `stores` with its key (an LDS slot the barrier
+    /// keeps from being written again before the group read it) passes a group barrier kept.
+    /// Returns how many went.
+    pub fn drop_barriers(&mut self, cands: &[(V, u32)], stores: &[(V, u32)]) -> usize {
+        let at: HashMap<u32, (usize, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, blk)| blk.body.iter().enumerate().map(move |(n, &i)| (i, (b, n))))
+            .collect();
+        let id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => panic!("not an instruction"),
+        };
+        let mut kept: Vec<bool> = cands.iter().map(|&(c, _)| !at.contains_key(&id(c))).collect();
+        let dropped = |kept: &[bool], i: u32| cands.iter().zip(kept).any(|(&(c, _), &k)| !k && id(c) == i);
+        loop {
+            let mut changed = false;
+            for n in 0..cands.len() {
+                if kept[n] {
+                    continue;
+                }
+                let (c, key) = cands[n];
+                let (b0, i0) = at[&id(c)];
+                let hits = |i: u32| stores.iter().any(|&(st, k)| k == key && id(st) == i);
+                // scans a block's body from `from`: Some(true) at a store first, Some(false)
+                // at a barrier first, None through to its end
+                let scan = |b: usize, from: usize| -> Option<bool> {
+                    for &i in &self.blocks[b].body[from..] {
+                        if hits(i) {
+                            return Some(true);
+                        }
+                        if i != id(c) && self.group_barrier(i) && !dropped(&kept, i) {
+                            return Some(false);
+                        }
+                    }
+                    None
+                };
+                let mut reaches = scan(b0, i0 + 1);
+                if reaches.is_none() {
+                    let mut seen = vec![false; self.blocks.len()];
+                    let mut stack: Vec<usize> = successors(self.blocks[b0].term).to_vec();
+                    while let Some(b) = stack.pop() {
+                        if std::mem::replace(&mut seen[b], true) {
+                            continue;
+                        }
+                        match scan(b, 0) {
+                            Some(true) => {
+                                reaches = Some(true);
+                                break;
+                            }
+                            Some(false) => {}
+                            None => stack.extend_from_slice(&successors(self.blocks[b].term)),
+                        }
+                    }
+                }
+                if reaches == Some(true) {
+                    kept[n] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let gone: std::collections::HashSet<u32> =
+            cands.iter().zip(&kept).filter(|(_, k)| !**k).map(|(&(c, _), _)| id(c)).collect();
+        for blk in &mut self.blocks {
+            blk.body.retain(|i| !gone.contains(i));
+        }
+        gone.len()
+    }
+
+    /// Whether `block` has its terminator.
+    pub fn ended(&self, block: usize) -> bool {
+        self.blocks[block].term.is_some()
+    }
+
+    /// Gives `block`'s terminator to a new block, which every phi now names where it named
+    /// `block` as a predecessor; `block` is left without a terminator, its body kept, for code
+    /// to go at its end before the new block. Returns the new block.
+    pub fn split_after(&mut self, block: usize) -> usize {
+        let post = self.new_block();
+        self.blocks[post].term = self.blocks[block].term.take();
+        for i in &mut self.insts {
+            if let Op::Phi(incoming) = &mut i.op {
+                for (_, from) in incoming.iter_mut() {
+                    if *from == block {
+                        *from = post;
+                    }
+                }
+            }
+        }
+        post
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -472,9 +622,10 @@ impl Module {
         };
         self.push(block, ty, Op::Load(ptr))
     }
-    pub fn store(&mut self, block: usize, ptr: V, value: V) {
+    /// The store, as an instruction ([`Module::drop_barriers`] names it).
+    pub fn store(&mut self, block: usize, ptr: V, value: V) -> V {
         let void = self.void();
-        self.push(block, void, Op::Store(ptr, value));
+        self.push(block, void, Op::Store(ptr, value))
     }
     pub fn atomic(&mut self, block: usize, op: Rmw, ptr: V, value: V) -> V {
         let ty = self.type_of(value);
@@ -1154,6 +1305,47 @@ mod tests {
         live
     }
 
+    /// A loop of `sites` exchanges, each through pair `site % keys`: a store, a group barrier,
+    /// a load and the barrier after the reads. Returns how many of those last barriers go.
+    fn ring_loop(sites: u32, keys: u32) -> usize {
+        let mut m = Module::default();
+        let (i32t, void) = (m.int(32), m.void());
+        let fty = m.func_ty(void, vec![i32t, i32t]);
+        m.ptr(fty);
+        let barrier = m.function("dx.op.barrier", fty, Some(Attr::NoDuplicate), false);
+        let arr = m.array(16, i32t);
+        let lds = m.global("lds", arr, 3);
+        let (op, mode) = (m.i32(80), m.i32(9));
+        let (body, exit) = (m.new_block(), m.new_block());
+        let (mut cands, mut stores) = (Vec::new(), Vec::new());
+        for site in 0..sites {
+            let key = site % keys;
+            let at = m.i32(2 * key);
+            let ptr = m.element(body, lds, at);
+            let one = m.i32(1);
+            stores.push((m.store(body, ptr, one), key));
+            m.call(body, barrier, vec![op, mode]);
+            m.load(body, ptr);
+            cands.push((m.call(body, barrier, vec![op, mode]), key));
+        }
+        let again = m.bool(true);
+        m.terminate(body, Term::CondBr(again, body, exit));
+        m.terminate(exit, Term::Ret);
+        m.drop_barriers(&cands, &stores)
+    }
+
+    #[test]
+    fn a_barrier_after_an_exchanges_reads_goes_where_another_comes_first() {
+        // one exchange in a loop: its pair is written again with no other barrier between
+        assert_eq!(ring_loop(1, 4), 0);
+        // two through different pairs: each one's first barrier covers the other
+        assert_eq!(ring_loop(2, 4), 2);
+        // through one pair: the next store comes before any barrier but the dropped one
+        assert_eq!(ring_loop(2, 1), 0);
+        // five through four pairs: the last one's pair is the first one's, written next
+        assert_eq!(ring_loop(5, 4), 4);
+    }
+
     #[test]
     fn worklist_liveness_matches_passes() {
         for (regs, stages, read) in [(1, 0, 1), (1, 1, 1), (4, 3, 1), (8, 17, 3), (16, 40, 16)] {
@@ -1189,6 +1381,45 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// A block split before keeps its place after the code it held, which moves to a block
+    /// that takes the edges into it; one split after keeps its code, and the new block after
+    /// it takes its terminator and its place in the phis of its successors.
+    #[test]
+    fn blocks_on_a_cycle_are_in_a_loop() {
+        let mut m = Module::default();
+        let (a, b, c, d) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let t = m.bool(true);
+        m.terminate(a, Term::Br(b));
+        m.terminate(b, Term::Br(c));
+        m.terminate(c, Term::CondBr(t, b, d));
+        m.terminate(d, Term::Ret);
+        assert_eq!([a, b, c, d].map(|x| m.in_cycle(x)), [false, true, true, false]);
+    }
+
+    #[test]
+    fn blocks_split_before_and_after() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (a, b, c) = (m.new_block(), m.new_block(), m.new_block());
+        let one = m.i32(1);
+        m.terminate(a, Term::Br(b));
+        let x = m.bin(b, Bin::Add, one, one);
+        let phi = m.phi(b, i32t);
+        let pre = m.split_before(b);
+        assert_eq!(&*successors(m.blocks[a].term), &[pre]);
+        assert_eq!((m.blocks[pre].body.len(), m.blocks[pre].phis.len()), (1, 1));
+        assert!(m.blocks[b].body.is_empty() && m.blocks[b].phis.is_empty() && !m.ended(b));
+        m.terminate(b, Term::Br(c));
+        let y = m.phi(c, i32t);
+        m.set_phi(y, vec![(x, b)]);
+        let _ = phi;
+        let post = m.split_after(b);
+        assert!(!m.ended(b) && m.ended(post));
+        assert_eq!(&*successors(m.blocks[post].term), &[c]);
+        let V::Inst(i) = y else { unreachable!() };
+        assert!(matches!(&m.insts[i as usize].op, Op::Phi(inc) if inc == &vec![(x, post)]));
     }
 
     #[test]

@@ -450,3 +450,373 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Two console waves in one group of 128 threads, each thread t holding the bit
+/// `1 << ((t & 63) >> 1)`: the threads below s0 OR theirs over their wave inside
+/// `if (t < s0) { ... }` and store the result to dword `t >> 6`. With s0 at 64 or below the
+/// second console wave never enters the branch, so the two host waves of the first, which
+/// meet inside it, must meet each other alone: a group barrier there waits for the second
+/// console wave's threads, which never come (`Lower::meet`'s counters instead).
+#[test]
+fn console_waves_on_either_side_of_a_wave_wide_branch_meet_their_own_halves() {
+    let mut words = vec![
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x360C_00BF, // v_and_b32 v6, 63, v0
+        0x2C0C_0C81, // v_lshrrev_b32 v6, 1, v6
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        0x2C10_0086, // v_lshrrev_b32 v8, 6, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 23, // s_cbranch_execz to the restore of EXEC
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18 | 0x1000,
+        0x80 << 24 | 2 << 16 | 8, // buffer_store_dword v0, v8, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    // (threads below s0) -> (console wave 0's OR, console wave 1's)
+    for (below, expected) in [
+        (40u32, [0x000F_FFFFu32, 0]),
+        (1, [1, 0]),
+        (64, [u32::MAX, 0]),
+        (100, [u32::MAX, 0x0003_FFFF]),
+        (128, [u32::MAX, u32::MAX]),
+        (0, [0, 0]),
+    ] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!([out[0][0], out[0][1]], expected, "{below} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: each console wave's OR, the other wave elsewhere");
+}
+
+/// 64 threads in one console wave; the threads below s0 store their number to dword 0 (an
+/// address of scalars only) inside `if (t < s0) { ... }`, taken wave-wide. On the console
+/// the highest of them stores last, so dword 0 ends as s0 - 1. Two host waves of 32 store
+/// unordered: past 32 threads the lower one's 31 could stay, unless only the console's
+/// highest lane stores (`Lower::last_lane_store`), as the hair shadow-mask pass needs for
+/// the tile word every lane writes to one place.
+#[test]
+fn lanes_storing_to_one_address_leave_the_highest_lanes_data() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz over the store
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the skip");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [1u32, 20, 32, 33, 40, 63, 64] {
+        for _ in 0..8 {
+            let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+            assert_eq!(got, below - 1, "{below} threads storing");
+        }
+    }
+    eprintln!("ran on the hardware device: the highest storing lane's number stays");
+}
+
+/// Two console waves of 64 in a group of 128. Under `t < s0` (EXEC narrowed with no branch,
+/// so the first-lane read is guarded) each thread reads its wave's first thread number and
+/// adds 1000 unless `vccz` (no thread there below s1) skips the add, a branch taken
+/// wave-wide. The branch's word rides along with the first-lane read's exchange
+/// (`Lower::branch_answer`): one meeting of the two host waves for both.
+#[test]
+fn a_wave_wide_branch_after_a_first_lane_read_shares_its_meeting() {
+    let words = [
+        0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0
+        0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+        0x7E0E_0500, // v_readfirstlane_b32 s7, v0
+        0x7E02_0207, // v_mov_b32 v1, s7
+        0xBF86_0002, // s_cbranch_vccz over the add
+        0x4A02_02FF,
+        0x0000_03E8, // v_add_nc_u32 v1, 1000, v1
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x38 << 26 | 0x1C << 18 | 0x1000,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_vccz"))
+        .expect("the branch");
+    let shader = lowered(&native, &p, &HashSet::from([branch])).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    for (s0, s1) in [(128u32, 128u32), (100, 10), (100, 70), (40, 0), (128, 64), (20, 20)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = [s0, s1][d as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for t in 0..128u32 {
+            let first = t & !63;
+            let expected = if t >= s0 {
+                0
+            } else if first < s1 {
+                first + 1000
+            } else {
+                first
+            };
+            assert_eq!(out[0][t as usize], expected, "thread {t}, s0 = {s0}, s1 = {s1}");
+        }
+    }
+    eprintln!("ran on the hardware device: the first lane and the branch from one meeting");
+}
+
+/// One console wave of 64 threads. A loop of s1 iterations reads lane 40 of v1 (the upper
+/// host wave's) and lane 3 (the lower's) and adds both to v1; each thread stores its v1.
+/// The reads exchange through two pairs of the ring, so neither keeps its barrier after the
+/// reads (`Module::drop_barriers`): the other's first barrier keeps its pair from being
+/// written again before both host waves read it.
+#[test]
+fn lane_reads_in_a_loop_need_one_meeting_each() {
+    let ra = super::valu_tests::vop3(0x360, 12, 256 + 1, 128 + 40, 0); // v_readlane_b32 s12, v1, 40
+    let rb = super::valu_tests::vop3(0x360, 13, 256 + 1, 128 + 3, 0); // v_readlane_b32 s13, v1, 3
+    let words = [
+        0x7E02_0300, // v_mov_b32 v1, v0
+        ra[0],
+        ra[1],
+        rb[0],
+        rb[1],
+        0x4A02_020C, // v_add_nc_u32 v1, s12, v1
+        0x4A02_020D, // v_add_nc_u32 v1, s13, v1
+        0x8081_8101, // s_sub_u32 s1, s1, 1
+        0xBF07_8001, // s_cmp_lg_u32 s1, 0
+        0xBF85_FFF7, // s_cbranch_scc1 to the first lane read
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x38 << 26 | 0x1C << 18 | 0x1000,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 2, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    for n in [1u32, 2, 7, 64, 500] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 1) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = n;
+            }
+        }
+        let mut v: Vec<u32> = (0..64).collect();
+        for _ in 0..n {
+            let (a, b) = (v[40], v[3]);
+            for x in &mut v {
+                *x = x.wrapping_add(a).wrapping_add(b);
+            }
+        }
+        for _ in 0..4 {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            assert_eq!(out[0][..64], v[..], "{n} iterations");
+        }
+    }
+    eprintln!("ran on the hardware device: lane reads in a loop with one meeting each");
+}
+
+/// Two console waves of 64 in a group of 128, each walking a chain of values: x starts at
+/// s0, and each step every lane still walking takes the first lane's x, then lane k
+/// (thread & 63) leaves after k + 1 steps (`v_cmpx` and `s_andn2` of the walk's mask, its
+/// exit when no lane is left); the rest go on to x = 2x + 7 unless x passed s1 (`vccz`).
+/// Each thread stores the x it took last. Both branches are taken wave-wide; with
+/// [`super::half_local`] each host wave walks on its own lanes, the lower one leaving after
+/// 32 steps, and neither meets the other.
+#[test]
+fn a_walk_whose_lanes_leave_one_by_one_runs_per_host_wave() {
+    let words = [
+        0x3602_00BF, // v_and_b32 v1, 63, v0
+        0x7E04_0200, // v_mov_b32 v2, s0
+        0x7E06_02C1, // v_mov_b32 v3, -1
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0xBE96_047E, // s_mov_b64 s[22:23], exec
+        0x7E26_0502, // v_readfirstlane_b32 s19, v2 (the walk's first step)
+        0x7E06_0213, // v_mov_b32 v3, s19
+        0x8115_8115, // s_add_i32 s21, s21, 1
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DAC_0215, // v_cmpx_ge_u32 exec, s21, v1
+        0x8A8E_7E0E, // s_andn2_b64 s[14:15], s[14:15], exec
+        0xBF84_0005, // s_cbranch_scc0 to the end
+        0x87FE_0E10, // s_and_b64 exec, s[16:17], s[14:15]
+        0x4A04_0502, // v_add_nc_u32 v2, v2, v2
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0x7D82_0401, // v_cmp_lt_u32 vcc, s1, v2
+        0xBF86_FFF4, // s_cbranch_vccz to the first step
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x38 << 26 | 0x1C << 18 | 0x1000,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 4, // buffer_store_dword v3, v4, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let wide: HashSet<usize> = (0..p.blocks.len())
+        .filter(|&b| {
+            p.blocks[b].insts.last().is_some_and(|i| matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_vccz"))
+        })
+        .collect();
+    assert_eq!(wide.len(), 2, "the walk's two branches");
+    let mut shaders = Vec::new();
+    for on in [false, true] {
+        let was = super::half_local::TEST_HALF_LOCAL.replace(Some(on));
+        let shader = lowered(&native, &p, &wide);
+        super::half_local::TEST_HALF_LOCAL.set(was);
+        let shader = shader.expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        shaders.push(shader);
+    }
+    assert_ne!(shaders[0].dxil, shaders[1].dxil, "the walk runs per host wave");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    for shader in &shaders {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the hardware device does not take this program; not run");
+            return;
+        };
+        for (s0, s1) in [(1u32, u32::MAX), (5, 1000), (3, 200_000), (0, 0), (100, 50_000_000)] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = [s0, s1][d as usize];
+                }
+            }
+            // the console wave's walk
+            let mut took = [u32::MAX; 64];
+            let mut walking: Vec<u32> = (0..64).collect();
+            let (mut x, mut steps) = (s0, 0u32);
+            loop {
+                for &k in &walking {
+                    took[k as usize] = x;
+                }
+                steps += 1;
+                walking.retain(|&k| steps < k);
+                if walking.is_empty() {
+                    break;
+                }
+                x = x.wrapping_mul(2).wrapping_add(7);
+                if s1 < x {
+                    break;
+                }
+            }
+            for _ in 0..4 {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud.clone()))],
+                            views: &[View::RawUav(128)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+                for t in 0..128usize {
+                    assert_eq!(out[0][t], took[t & 63], "thread {t}, s0 = {s0}, s1 = {s1}");
+                }
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: a walk per console wave and per host wave");
+}

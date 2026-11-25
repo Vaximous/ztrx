@@ -275,6 +275,8 @@ struct Lower<'a> {
     /// With `pair_sync`: a meeting was asked for in a block other than the current one, which
     /// cannot take the meeting's loop.
     meet_bad: bool,
+    /// The blocks where host waves meet ([`Self::meet`]), for [`take_loop_meeting`].
+    meetings: Vec<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -965,6 +967,14 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`take_loop_meeting`].
+    static LOOP_MEETING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last lowering on this thread that got through made host waves meet inside a
+/// loop (a group barrier or a pair's wait on a cycle of blocks), which it forgets.
+pub(super) fn take_loop_meeting() -> bool {
+    LOOP_MEETING.take()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1544,6 +1554,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             pair_sync,
             meet_bad: false,
+            meetings: Vec::new(),
             flat: None,
             no_barrier,
             fence_only,
@@ -2142,6 +2153,8 @@ impl<'a> Lower<'a> {
         if self.meet_bad {
             return Err(unsupported(0, "a meeting of host waves away from the block being lowered"));
         }
+        let looped = self.meetings.iter().any(|&b| self.s.m.in_cycle(b));
+        LOOP_MEETING.set(looped);
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3605,6 +3618,7 @@ impl<'a> Lower<'a> {
     /// each other, so one waiting does not keep its partner from coming. Returns the block to
     /// go on in.
     fn meet(&mut self, at: usize) -> usize {
+        self.meetings.push(at);
         let Some(pc) = self.pair_sync else {
             self.group_sync(at);
             return at;
@@ -3676,6 +3690,7 @@ impl<'a> Lower<'a> {
         let there = self.s.m.cmp(spin, pred::SGE, ahead, zero);
         self.s.m.terminate(spin, Term::CondBr(there, c, spin));
         self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.meetings.push(c);
         self.s.flags |= flags::WAVE_OPS;
         c
     }

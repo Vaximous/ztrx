@@ -415,6 +415,21 @@ impl Module {
         pre
     }
 
+    /// Whether `block` is on a cycle of the blocks' terminators (inside a loop).
+    pub fn in_cycle(&self, block: usize) -> bool {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut stack: Vec<usize> = successors(self.blocks[block].term).to_vec();
+        while let Some(b) = stack.pop() {
+            if b == block {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[b], true) {
+                stack.extend_from_slice(&successors(self.blocks[b].term));
+            }
+        }
+        false
+    }
+
     /// Whether `block` has its terminator.
     pub fn ended(&self, block: usize) -> bool {
         self.blocks[block].term.is_some()
@@ -1245,6 +1260,18 @@ mod tests {
     /// A block split before keeps its place after the code it held, which moves to a block
     /// that takes the edges into it; one split after keeps its code, and the new block after
     /// it takes its terminator and its place in the phis of its successors.
+    #[test]
+    fn blocks_on_a_cycle_are_in_a_loop() {
+        let mut m = Module::default();
+        let (a, b, c, d) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let t = m.bool(true);
+        m.terminate(a, Term::Br(b));
+        m.terminate(b, Term::Br(c));
+        m.terminate(c, Term::CondBr(t, b, d));
+        m.terminate(d, Term::Ret);
+        assert_eq!([a, b, c, d].map(|x| m.in_cycle(x)), [false, true, true, false]);
+    }
+
     #[test]
     fn blocks_split_before_and_after() {
         let mut m = Module::default();

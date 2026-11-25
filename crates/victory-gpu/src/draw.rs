@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// As [`STORES`]: whether every buffer store of that stage's shader is
+    /// bounded by the lane's place (`Translated::bounded`).
+    static BOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -985,8 +988,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            BOUNDED.set(t.bounded);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            BOUNDED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -2737,6 +2742,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View);
+                if BOUNDED.get() {
+                    crate::shadow::declared_by_bounded(len);
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

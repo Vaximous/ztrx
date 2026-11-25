@@ -126,6 +126,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether every buffer store's address depends on nothing worse than
+    /// the lane's place in the dispatch (`victory_shader::stores`): false
+    /// when its code is not known or it has no stores.
+    pub(crate) bounded: bool,
 }
 
 #[cfg(windows)]
@@ -184,6 +188,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let bounded = stores
+        && !programs.is_empty()
+        && programs.iter().all(|p| {
+            victory_shader::ir::build(&p.code, p.wave64, p.vgprs).is_ok_and(|ir| {
+                let terms = victory_shader::stores::store_terms(&ir);
+                terms.total() == 0 || terms.bounded()
+            })
+        });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +206,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, bounded })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

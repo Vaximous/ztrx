@@ -16,6 +16,7 @@ pub mod ir;
 pub mod native;
 pub mod resource;
 pub mod spill;
+pub mod stores;
 pub mod structure;
 
 pub use dxbc::{Container, FourCC, Part};

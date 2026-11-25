@@ -1249,6 +1249,17 @@ pub(crate) enum Declarer {
 /// written, their bytes, and those over 16 MiB.
 static DECLARED_BY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
+/// Since the last frame-rate line: of the ranges table views declared, those
+/// whose shader's stores are all bounded by the lane's place
+/// (`victory_shader::stores`), and their bytes.
+static DECLARED_BOUNDED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A range a table view declared written ([`DECLARED_BOUNDED`]).
+pub(crate) fn declared_by_bounded(len: u64) {
+    DECLARED_BOUNDED[0].fetch_add(1, Ordering::Relaxed);
+    DECLARED_BOUNDED[1].fetch_add(len, Ordering::Relaxed);
+}
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
@@ -1259,13 +1270,16 @@ pub(crate) fn back_line(frames: f64) {
         let mb = |v: f64| v / (1 << 20) as f64;
         tracing::info!(
             "ranges declared written by shaders per frame: by root views {:.0} ({:.0} MB, {:.0} over 16 MiB), by table views \
-             {:.0} ({:.0} MB, {:.0} over 16 MiB), by title addresses {:.0} ({:.0} MB, {:.0} over 16 MiB)",
+             {:.0} ({:.0} MB, {:.0} over 16 MiB; of them by shaders whose stores are all bounded by the lane's place {:.0}, \
+             {:.0} MB), by title addresses {:.0} ({:.0} MB, {:.0} over 16 MiB)",
             d[0],
             mb(d[1]),
             d[2],
             d[3],
             mb(d[4]),
             d[5],
+            DECLARED_BOUNDED[0].swap(0, Ordering::Relaxed) as f64 / frames,
+            mb(DECLARED_BOUNDED[1].swap(0, Ordering::Relaxed) as f64 / frames),
             d[6],
             mb(d[7]),
             d[8],

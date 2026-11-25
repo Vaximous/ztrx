@@ -20,10 +20,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::host::HostList;
 
-/// Whether copies whose source made a submission wait are done by the card.
+/// Whether copies whose source made a submission wait are done by the card
+/// (`VICTORY_CARD_COPIES`; on by default, `=0` off). Checked in run
+/// zall8cc: of 2,000 compared, 1,885 alike and 115 alike a later copy to
+/// the same place that landed with them, none different (run zl3cck's 90
+/// "different" were those).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_CARD_COPIES").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// The range learned when a read of `[src, src + len)` made a submission
+/// wait: the whole title buffer holding it (`VICTORY_CARD_LEARN_WHOLE`, on;
+/// `=0` the range read, as before). The title reads what flights wrote from
+/// another place of the same buffers every frame (ring buffers): learned
+/// by the range read, fills went on learning about 7 new sources a frame
+/// and waiting for each (run zall8cc: still 1.0 settle a frame, 55-69 ms),
+/// and with card copies off the same flights' outputs made a buffer copy
+/// wait instead (run zall8a, 1.0 a frame, 60 ms).
+fn learned_range(src: usize, len: usize) -> (usize, usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_LEARN_WHOLE").is_none_or(|v| v != "0"))
+        && let Some(copy) = crate::shadow::find(src as u64, len as u64)
+    {
+        let start = copy.title_start() as usize;
+        let whole = copy.left(start as u64) as usize;
+        if start <= src && src + len <= start + whole {
+            return (start, whole);
+        }
+    }
+    (src, len)
 }
 
 /// `VICTORY_CARD_COPIES_CHECK=1`: the first copies done by the card are
@@ -55,12 +81,14 @@ pub(crate) fn blocked(src: usize, len: usize) {
     if !on() || len == 0 {
         return;
     }
-    let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
     if learned.iter().any(|&(a, b)| a <= src && src + len <= b) {
         return;
     }
     STATS[2].fetch_add(1, Ordering::Relaxed);
-    learn(&mut learned, src, len);
+    drop(learned);
+    let (src, len) = learned_range(src, len);
+    learn(&mut LEARNED.lock().unwrap_or_else(|e| e.into_inner()), src, len);
 }
 
 /// `ranges` (in order, joined) with `[src, src + len)`.
@@ -313,12 +341,14 @@ pub(crate) fn fill_blocked(src: usize, len: usize) {
     if !fills_on() || len == 0 {
         return;
     }
-    let mut learned = LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner());
+    let learned = LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner());
     if learned.iter().any(|&(a, b)| a <= src && src + len <= b) {
         return;
     }
     FILL_STATS[2].fetch_add(1, Ordering::Relaxed);
-    learn(&mut learned, src, len);
+    drop(learned);
+    let (src, len) = learned_range(src, len);
+    learn(&mut LEARNED_FILLS.lock().unwrap_or_else(|e| e.into_inner()), src, len);
 }
 
 /// A fill compared ([`fills_check_on`]): what the CPU filled and what the

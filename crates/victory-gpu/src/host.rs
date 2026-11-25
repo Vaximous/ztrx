@@ -2065,6 +2065,81 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// With [`relay`], whether the pieces a landing fetches that no newer
+/// flight may change come down on a copy queue of their own
+/// (`VICTORY_FETCH_QUEUE=1`; off by default).
+///
+/// The landing's fetch goes to the one queue behind everything sent since
+/// the flights it lands: 25-30 flights in the air, about 18 ms a landing
+/// and 150-165 ms a frame of the landing thread's waits (run fxres1), and
+/// the reads of title memory that wait for those flights wait for that.
+/// The flights being landed have run; a copy queue can fetch their pieces
+/// at once, beside the later flights. Exact only for a piece no later work
+/// on the card may write while it is read: one that no flight sent after
+/// the landed ones declares written (the declarations of every flight sent
+/// and not landed, [`QUICK_DECLARED`]) and to which no send of title bytes
+/// numbered after them went. Those stay with the fetch on the one queue.
+/// The copy queue's list goes out under [`QUEUE_ORDER`], and the one queue
+/// waits for it there, so nothing sent later runs before it is done.
+fn fetch_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var("VICTORY_FETCH_QUEUE").is_ok_and(|v| v == "1"))
+}
+
+/// `VICTORY_FETCH_QUEUE_CHECK=1`: until [`QUICK_CHECKS`] pieces have been
+/// compared, the pieces of a landing that go to the copy queue are fetched
+/// on the one queue as well, merged from there, and the two fetches' bytes
+/// compared.
+fn fetch_queue_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| fetch_queue() && std::env::var("VICTORY_FETCH_QUEUE_CHECK").is_ok_and(|v| v == "1"))
+}
+
+const QUICK_CHECKS: u64 = 20_000;
+
+/// [`fetch_queue`]: the card copies' pieces declared written by each flight
+/// sent and not yet landed, by its place in [`QUEUE_ORDER`]: (copy, first
+/// piece, end). Noted under that lock as the flight goes to the queue.
+static QUICK_DECLARED: Mutex<std::collections::BTreeMap<u64, Vec<(usize, u32, u32)>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the last frame-rate line, of [`fetch_queue`]: pieces fetched on
+/// the copy queue and their bytes; pieces kept on the one queue because a
+/// newer flight declares them, because a newer send went to them; landings
+/// that used the copy queue; microseconds waited for it; and of all time:
+/// pieces compared, alike, different.
+static QUICK_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// The copy queue of [`fetch_queue`], its list, fence, event, last value
+/// signalled, and the buffer the pieces come down to (buffer, mapping,
+/// bytes).
+struct QuickFetch {
+    queue: ID3D12CommandQueue,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    sent: u64,
+    buffer: Option<(ID3D12Resource, usize, u64)>,
+}
+
+/// [`fetch_queue`]: submissions waited for at once (not flights) on the
+/// card now. A copy-queue fetch is made only while there are none.
+static SYNC_IN_AIR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One of [`SYNC_IN_AIR`], until its wait is over.
+struct InAir;
+
+impl Drop for InAir {
+    fn drop(&mut self) {
+        SYNC_IN_AIR.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A piece a landing fetches: its copy, offsets in it, where in the fetch
+/// buffer, and (copy, piece number).
+type FetchPiece = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64, (usize, u32));
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2770,6 +2845,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// [`fetch_queue`]'s copy queue, made at its first use.
+    quick: Option<QuickFetch>,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -2946,6 +3023,23 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    if fetch_queue() {
+        let q: Vec<f64> = QUICK_STATS[..6].iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "fetches on the copy queue per frame (VICTORY_FETCH_QUEUE=1): {:.1} pieces {:.1} MB in {:.1} landings, {:.1} ms \
+             waited for them; kept on the one queue: {:.1} pieces a newer flight declares, {:.1} a newer send went to; \
+             compared {} (alike {}, different {})",
+            q[0],
+            q[1] / (1 << 20) as f64,
+            q[4],
+            q[5] / 1000.0,
+            q[2],
+            q[3],
+            QUICK_STATS[6].load(Ordering::Relaxed),
+            QUICK_STATS[7].load(Ordering::Relaxed),
+            QUICK_STATS[8].load(Ordering::Relaxed),
         );
     }
     #[cfg(feature = "diagnostics")]
@@ -3815,6 +3909,149 @@ impl Host {
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
+    /// [`fetch_queue`]'s copy queue and what it needs.
+    fn make_quick_fetch(&self) -> Option<QuickFetch> {
+        // SAFETY: plain objects of our own.
+        let made = unsafe {
+            (|| -> windows::core::Result<QuickFetch> {
+                let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })?;
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList =
+                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.Close()?;
+                let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                let event = CreateEventW(None, false, false, None)?;
+                Ok(QuickFetch {
+                    queue,
+                    allocator,
+                    list,
+                    fence,
+                    event,
+                    sent: 0,
+                    buffer: None,
+                })
+            })()
+        };
+        match made {
+            Ok(quick) => {
+                name(&quick.queue, || "fetches of landed flights' pieces".into());
+                Some(quick)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no copy queue for fetches (VICTORY_FETCH_QUEUE=1)");
+                None
+            }
+        }
+    }
+
+    /// [`fetch_queue`]: of `pieces` (the landing's fetch), those no flight
+    /// sent after the landed ones (`floor`, their last place in the order)
+    /// may change are fetched on the copy queue, waited for, and returned
+    /// with the mapping of where they came down; `pieces` keeps the others
+    /// (with `checking`, all). None if none went.
+    fn quick_fetch(
+        &self,
+        fetch: &mut Option<RelayFetch>,
+        pieces: &mut Vec<FetchPiece>,
+        floor: u64,
+        checking: bool,
+    ) -> Option<(Vec<FetchPiece>, usize)> {
+        if pieces.is_empty() {
+            return None;
+        }
+        if fetch.is_none() {
+            *fetch = self.make_relay_fetch();
+        }
+        let f = fetch.as_mut()?;
+        if f.quick.is_none() {
+            f.quick = self.make_quick_fetch();
+        }
+        let q = f.quick.as_mut()?;
+        // The order of the queue is held from the look at what newer
+        // flights declare until the one queue waits for the copy: a flight
+        // sent after the look runs after the copy.
+        let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        if SYNC_IN_AIR.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let mut quick: Vec<FetchPiece> = Vec::new();
+        {
+            let declared = QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+            let newer: Vec<&(usize, u32, u32)> = declared.range(floor + 1..).flat_map(|(_, v)| v.iter()).collect();
+            let (mut by_flight, mut by_send) = (0u64, 0u64);
+            pieces.retain(|p| {
+                let (shadow, lo, hi, _, (copy, piece)) = p;
+                if newer.iter().any(|&&(c, a, b)| c == *copy && a <= *piece && *piece < b) {
+                    by_flight += 1;
+                    return true;
+                }
+                if shadow.sent_after(*lo, *hi, floor) {
+                    by_send += 1;
+                    return true;
+                }
+                quick.push(p.clone());
+                checking
+            });
+            QUICK_STATS[2].fetch_add(by_flight, Ordering::Relaxed);
+            QUICK_STATS[3].fetch_add(by_send, Ordering::Relaxed);
+        }
+        if quick.is_empty() {
+            return None;
+        }
+        let mut total = 0u64;
+        for p in &mut quick {
+            p.3 = total;
+            total += (p.2 - p.1) as u64;
+        }
+        if q.buffer.as_ref().is_none_or(|b| b.2 < total) {
+            let size = total.next_multiple_of(16 << 20);
+            q.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        }
+        let (buffer, data, _) = q.buffer.clone()?;
+        q.sent += 1;
+        let waiting = std::time::Instant::now();
+        // SAFETY: the list's last run was waited for by this thread; live
+        // buffers (the copies are held by the plans); the fences and the
+        // event are ours. The landed flights have run, and nothing that
+        // may write these pieces is on the card or goes to it before the
+        // one queue's wait below.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                q.allocator.Reset()?;
+                q.list.Reset(&q.allocator, None)?;
+                for (shadow, lo, hi, at, _) in &quick {
+                    q.list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                q.list.Close()?;
+                q.queue.ExecuteCommandLists(&[Some(q.list.cast::<ID3D12CommandList>()?)]);
+                q.queue.Signal(&q.fence, q.sent)?;
+                self.queue.Wait(&q.fence, q.sent)?;
+                Ok(())
+            })()
+        };
+        drop(order);
+        if let Err(e) = ran {
+            fail(format_args!("pieces could not be fetched on the copy queue ({e}, VICTORY_FETCH_QUEUE=1)"));
+        }
+        // SAFETY: our fence and event.
+        unsafe {
+            if q.fence.GetCompletedValue() < q.sent {
+                if let Err(e) = q.fence.SetEventOnCompletion(q.sent, q.event) {
+                    fail(format_args!("the copy queue's fetch could not be waited for ({e})"));
+                }
+                WaitForSingleObject(q.event, INFINITE);
+            }
+        }
+        QUICK_STATS[0].fetch_add(quick.len() as u64, Ordering::Relaxed);
+        QUICK_STATS[1].fetch_add(total, Ordering::Relaxed);
+        QUICK_STATS[4].fetch_add(1, Ordering::Relaxed);
+        QUICK_STATS[5].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Some((quick, data))
+    }
+
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         let list = self.make_prelude()?;
         // SAFETY: plain objects of our own.
@@ -3827,6 +4064,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                quick: None,
             })
         }
     }
@@ -3858,7 +4096,7 @@ impl Host {
             }
         };
         // To fetch: (copy, from, to, where in the fetch, piece).
-        let mut pieces: Vec<(Arc<Shadow>, usize, usize, u64, (usize, u32))> = Vec::new();
+        let mut pieces: Vec<FetchPiece> = Vec::new();
         // Pushed down in the flight (`CARD_PUSH`): (copy, from, to, where
         // in the ring, the flight's place in the order, piece).
         let mut pushed: Vec<(Arc<Shadow>, usize, usize, usize, u64, (usize, u32))> = Vec::new();
@@ -3959,6 +4197,30 @@ impl Host {
         // With pushes, sends after the place of the last of these flights
         // may still matter to the merge of a later flight's pushed pieces.
         let floor = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+        // `VICTORY_FETCH_QUEUE=1`: the pieces no newer flight may change
+        // come down on the copy queue, now; with the check they are
+        // fetched below as well and compared there.
+        let mut compare: std::collections::HashMap<(usize, usize, usize), Vec<u8>> = std::collections::HashMap::new();
+        if fetch_queue() && ring.is_none() && floor > 0 && plans.iter().all(|p| p.sent_as > 0) {
+            let checking = fetch_queue_check() && QUICK_STATS[6].load(Ordering::Relaxed) < QUICK_CHECKS;
+            if let Some((quick, data)) = self.quick_fetch(fetch, &mut pieces, floor, checking) {
+                for (shadow, lo, hi, at, _) in &quick {
+                    // SAFETY: the mapping of the copy queue's fetch; its
+                    // copy has run (waited for in `quick_fetch`).
+                    let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                    if checking {
+                        compare.insert((std::sync::Arc::as_ptr(shadow) as usize, *lo, *hi), gpu.to_vec());
+                        continue;
+                    }
+                    // As of the landed flights: every send numbered up to
+                    // `floor` ran before they did, none above went to it.
+                    written += shadow.card_merge_relay(*lo, gpu, floor, &mut title);
+                }
+            }
+        }
+        if fetch_queue() {
+            QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).retain(|&n, _| n > floor);
+        }
         if pieces.is_empty() {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             if ring.is_some() {
@@ -4030,6 +4292,21 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            if let Some(quick) = compare.get(&(std::sync::Arc::as_ptr(shadow) as usize, *lo, *hi)) {
+                let same = quick.as_slice() == gpu;
+                QUICK_STATS[6].fetch_add(1, Ordering::Relaxed);
+                QUICK_STATS[if same { 7 } else { 8 }].fetch_add(1, Ordering::Relaxed);
+                if !same {
+                    let first = quick.iter().zip(gpu).position(|(a, b)| a != b);
+                    tracing::warn!(
+                        copy = format_args!("{:#x}", std::sync::Arc::as_ptr(shadow) as usize),
+                        lo,
+                        hi,
+                        ?first,
+                        "a piece fetched on the copy queue differs from the one queue's fetch"
+                    );
+                }
+            }
             written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
             if ring.is_some() {
                 newer.insert(*piece, after);
@@ -4701,6 +4978,14 @@ impl Host {
                 *order += 1;
                 if let Some(card) = card.as_mut() {
                     card.sent_as = *order;
+                    if fetch_queue() {
+                        let pieces = card
+                            .ranges
+                            .iter()
+                            .map(|r| (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first, r.span.first + r.span.pieces))
+                            .collect();
+                        QUICK_DECLARED.lock().unwrap_or_else(|e| e.into_inner()).insert(*order, pieces);
+                    }
                 }
             }
             self.card_sent();
@@ -4739,6 +5024,13 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            // [`fetch_queue`]: noted under the order of the queue, so that a
+            // copy-queue fetch never runs beside a submission it cannot see.
+            let _in_air = fetch_queue().then(|| {
+                let _order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                SYNC_IN_AIR.fetch_add(1, Ordering::AcqRel);
+                InAir
+            });
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);

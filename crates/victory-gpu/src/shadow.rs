@@ -2630,6 +2630,15 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether a send of title bytes numbered above `order` went to the
+    /// card side's offsets `[lo, hi)`: it may not have run yet.
+    pub(crate) fn sent_after(&self, lo: usize, hi: usize, order: u64) -> bool {
+        self.card.as_ref().is_some_and(|card| {
+            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.iter().any(|&(a, b, n)| n > order && a < hi && b > lo)
+        })
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {

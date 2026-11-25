@@ -214,6 +214,18 @@ fn group_charge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_GROUP_CHARGE").is_none_or(|v| v != "0"))
 }
 
+/// The most groups per axis of any dispatch or mesh record the clamp
+/// passes on ([`SOURCE`]: `min(asked, 65535u)`; mesh records also at most
+/// 1 in y and z). Others may rely on it as an upper bound of the group ids
+/// of clamped indirect dispatches; kept in step with the shader by a test.
+#[allow(dead_code, reason = "a bound for store extents of indirect dispatches")]
+pub(crate) const MAX_GROUPS_PER_AXIS: u32 = 65535;
+
+/// The most groups of one clamped indirect dispatch in all (x * y * z;
+/// [`SOURCE`]'s `GROUPS`); a record asking for more runs empty.
+#[allow(dead_code, reason = "a bound for store extents of indirect dispatches")]
+pub(crate) const MAX_DISPATCH_GROUPS: u32 = 1 << 20;
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -733,20 +745,108 @@ void main() {
         }
     }
 
-    /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
-    /// what was hashed last and leaves the hashes: a piece a shader changed
-    /// and a later one changed back then looks untouched, which is right
-    /// only if the piece was fetched after both. Told 2 (submissions sent
-    /// ahead with the relay, whose pieces are fetched flight by flight) it
-    /// stores the hash it made: each compare flags what changed since the
-    /// compare before it, also a change back.
+    #[test]
+    fn clamp_bounds_match_the_shader() {
+        assert_eq!(MAX_GROUPS_PER_AXIS, 65535);
+        assert!(SOURCE.contains("uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));"));
+        assert!(SOURCE.contains("g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));"));
+        assert_eq!(MAX_DISPATCH_GROUPS, 1 << 20);
+        assert!(SOURCE.contains("static const uint GROUPS = 1u << 20;"));
+    }
+
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same of the compare with a group per piece
+    /// (`crate::host::CARD_COMPARE_WIDE`).
+    #[test]
+    fn warp_wide_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    /// The compare with a group per piece flags the same pieces as the
+    /// one with a thread per piece, for changes of one byte anywhere in a
+    /// piece (its first and last bytes too) and for two 16-byte runs of a
+    /// piece swapped, near each other and 4 KiB apart (one thread of the
+    /// group reads both of those). Four pieces, the copy starting 48 bytes
+    /// into the first (`skew`), so the first and last are cut short.
+    #[test]
+    fn warp_wide_and_narrow_card_compares_flag_the_same_pieces() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        const SKEW: u32 = 48;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251 + i / 4093) as u8).collect();
+        let shaders = [
+            (compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("narrow"), false),
+            (compile_cs(&warp.device, crate::host::CARD_COMPARE_WIDE).expect("wide"), true),
+        ];
+        let run = |warp: &mut WarpHarness, c: &Clamp, wide: bool, mode: u32| -> [u32; 4] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&c.root);
+                warp.list.SetPipelineState(&c.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2, 3].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        let reset = || {
+            // SAFETY: the mapping holds `size` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        };
+        // (what changes, the pieces it lies in). Piece p of the copy
+        // starts at p * 64 KiB - SKEW.
+        let piece_at = |p: usize| p * PIECE - SKEW as usize;
+        type Change = Box<dyn Fn(*mut u8)>;
+        let flip = |at: usize| -> Change { Box::new(move |base: *mut u8| unsafe { *base.add(at) ^= 0x10 }) };
+        let swap = |a: usize, b: usize| -> Change {
+            Box::new(move |base: *mut u8| unsafe { std::ptr::swap_nonoverlapping(base.add(a), base.add(b), 16) })
+        };
+        let cases: Vec<(Change, [u32; 4])> = vec![
+            (flip(0), [1, 0, 0, 0]),
+            (flip(piece_at(1) - 1), [1, 0, 0, 0]),
+            (flip(piece_at(1)), [0, 1, 0, 0]),
+            (flip(piece_at(2) + 12_345), [0, 0, 1, 0]),
+            (flip(size - SKEW as usize - 1), [0, 0, 0, 1]),
+            (swap(piece_at(1) + 1024, piece_at(1) + 1040), [0, 1, 0, 0]),
+            (swap(piece_at(2) + 4096, piece_at(2) + 8192), [0, 0, 1, 0]),
+        ];
+        for (n, (change, expected)) in cases.iter().enumerate() {
+            for (c, wide) in &shaders {
+                reset();
+                assert_eq!(run(&mut warp, c, *wide, 0), [7; 4]);
+                assert_eq!(run(&mut warp, c, *wide, 1), [0; 4], "case {n}, wide {wide}: nothing changed yet");
+                change(now_ptr);
+                assert_eq!(run(&mut warp, c, *wide, 1), *expected, "case {n}, wide {wide}");
+            }
+        }
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, wide: bool) {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -772,7 +872,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.

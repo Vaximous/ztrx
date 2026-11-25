@@ -2492,6 +2492,17 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether the submitting thread resets landed lists itself at the end of
+/// a submission ([`Host::execute_late`]; `VICTORY_LAND_HERE=1`, as before)
+/// rather than leaving them to the helper thread ([`late_helper`]). What
+/// they let go of is released there: the driver's freeing of allocations
+/// and their card addresses was 4-5% of the submitting thread in the world
+/// (run fxprof3).
+fn land_here() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_HERE").is_some_and(|v| v == "1"))
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4174,7 +4185,14 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        if land_here() {
+            land();
+        } else if !line().landed.is_empty() {
+            // Resetting landed lists lets go of what they held (upload
+            // buffers, staging copies): the helper thread does it.
+            line().poke = true;
+            LINE_MOVED.notify_one();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

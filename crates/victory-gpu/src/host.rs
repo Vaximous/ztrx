@@ -2120,7 +2120,9 @@ mod relay_tests {
 }
 
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 128; 32 settled the flights three times a
+/// (`VICTORY_LATE_WAIT_LISTS`, 512; at 128 the world waited about 70 ms a
+/// frame for lists to land, and with 512 and 65,536 merged runs (run
+/// fxall3m) 185 ms a frame against 204; 32 settled the flights three times a
 /// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
@@ -2129,7 +2131,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512).max(1)
     })
 }
 
@@ -2364,12 +2366,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 
 /// At most this many changed runs of title bytes go up to copies in the
 /// card's memory beside flights' writes in one submission
-/// (`VICTORY_MERGE_RUNS`, default 4096; it was 512, which left about one
+/// (`VICTORY_MERGE_RUNS`, default 65,536: 4,096 still settled 0.7 times a
+/// frame, 21 ms of waiting, run fxall3; it was 512, which left about one
 /// settle a frame for "title memory changed under shader writes" once
 /// constants were read from such copies). Each is a small copy of its own.
 fn merge_runs() -> usize {
     static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(65536))
 }
 
 /// With flights in the air, after the submission's write-watch asking:

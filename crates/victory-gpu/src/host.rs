@@ -1234,6 +1234,11 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame-rate line: the most work one list's clamps charged
+/// to its budget, and the lists that reached the budget (their later
+/// indirect records ran empty).
+static BUDGET_SPENT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -6205,6 +6210,13 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                // The work the list's clamps charged: at the budget, later
+                // records of the list ran empty.
+                let spent = words.read_volatile();
+                BUDGET_SPENT[0].fetch_max(u64::from(spent), Ordering::Relaxed);
+                if spent >= crate::indirect::BUDGET {
+                    BUDGET_SPENT[1].fetch_add(1, Ordering::Relaxed);
+                }
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
                 }
@@ -6967,6 +6979,13 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+        {
+            let (most, out) = (BUDGET_SPENT[0].swap(0, Ordering::Relaxed), BUDGET_SPENT[1].swap(0, Ordering::Relaxed));
+            tracing::info!(
+                "indirect clamps' budget: the most one list charged {:.1}% of it, {out} lists reached it (their later records ran empty)",
+                most as f64 * 100.0 / f64::from(crate::indirect::BUDGET)
+            );
+        }
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"

@@ -237,6 +237,10 @@ fn group_charge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_GROUP_CHARGE").is_none_or(|v| v != "0"))
 }
 
+/// The work an indirect list's records may ask in all ([`SOURCE`]'s
+/// `BUDGET`): records past it run empty.
+pub(crate) const BUDGET: u32 = 1 << 27;
+
 /// The most groups per axis of any dispatch or mesh record the clamp
 /// passes on ([`SOURCE`]: `min(asked, 65535u)`; mesh records also at most
 /// 1 in y and z). Others may rely on it as an upper bound of the group ids
@@ -1031,6 +1035,8 @@ void main() {
         assert!(SOURCE.contains("uint3 g = min(asked, uint3(65535u, 65535u, 65535u));"));
         assert!(SOURCE.contains("g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));"));
         assert_eq!(MAX_DISPATCH_GROUPS, 1 << 20);
+        assert_eq!(BUDGET, 1 << 27);
+        assert!(SOURCE.contains("static const uint BUDGET = 1u << 27;"));
         assert!(SOURCE.contains("static const uint GROUPS = 1u << 20;"));
     }
 
